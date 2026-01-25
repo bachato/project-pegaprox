@@ -105,28 +105,28 @@ mkdir -p "$INSTALL_DIR/images"
 echo -e "${GREEN}✓ Directory structure created at $INSTALL_DIR${NC}"
 
 # ============================================================================
-# Step 4: Install Python Dependencies
+# Step 4: Create Virtual Environment & Install Python Dependencies
 # ============================================================================
-echo -e "\n${YELLOW}[4/6] Installing Python dependencies...${NC}"
+echo -e "\n${YELLOW}[4/6] Setting up Python virtual environment...${NC}"
 
-pip3 install --break-system-packages -q \
-    flask>=2.3.0 \
-    flask-cors>=4.0.0 \
-    flask-sock>=0.6.0 \
-    requests>=2.28.0 \
-    urllib3>=1.26.0 \
-    cryptography>=41.0.0 \
-    pyopenssl>=23.0.0 \
-    argon2-cffi>=23.0.0 \
-    paramiko>=3.0.0 \
-    websockets>=11.0 \
-    websocket-client>=1.6.0 \
-    gevent>=23.0.0 \
-    gevent-websocket>=0.10.0 \
-    pyotp>=2.9.0 \
-    "qrcode[pil]>=7.4.0"
+# Create virtual environment
+python3 -m venv "$INSTALL_DIR/venv"
+echo -e "${GREEN}✓ Virtual environment created${NC}"
 
-echo -e "${GREEN}✓ Python dependencies installed${NC}"
+# Copy requirements.txt to install directory
+if [ -f "requirements.txt" ]; then
+    cp requirements.txt "$INSTALL_DIR/"
+    echo -e "${GREEN}✓ Requirements file copied${NC}"
+else
+    echo -e "${RED}Error: requirements.txt not found in current directory${NC}"
+    exit 1
+fi
+
+# Install dependencies in virtual environment
+echo -e "${YELLOW}Installing Python dependencies...${NC}"
+"$INSTALL_DIR/venv/bin/pip" install -q -r "$INSTALL_DIR/requirements.txt"
+
+echo -e "${GREEN}✓ Python dependencies installed in virtual environment${NC}"
 
 # ============================================================================
 # Step 5: Copy Files (placeholder - user copies manually)
@@ -143,7 +143,7 @@ Copy your files here:
 
 Start manually:
   cd $INSTALL_DIR
-  python3 $PYTHON_FILE
+  ./venv/bin/python3 $PYTHON_FILE
 
 Or use the systemd service:
   systemctl start pegaprox
@@ -168,7 +168,7 @@ Type=simple
 User=$SERVICE_USER
 Group=$SERVICE_GROUP
 WorkingDirectory=$INSTALL_DIR
-ExecStart=/usr/bin/python3 $INSTALL_DIR/$PYTHON_FILE
+ExecStart=$INSTALL_DIR/venv/bin/python3 $INSTALL_DIR/$PYTHON_FILE
 Restart=always
 RestartSec=5
 Environment=PEGAPROX_PORT=$PEGAPROX_PORT
@@ -215,10 +215,10 @@ echo -e "${BLUE}╚════════════════════�
 echo -e "\n${YELLOW}Next steps:${NC}"
 echo -e "  1. Copy your files to $INSTALL_DIR:"
 echo -e "     ${BLUE}cp $PYTHON_FILE $INSTALL_DIR/${NC}"
-echo -e "     ${BLUE}cp index.html $INSTALL_DIR/web/${NC}"
+echo -e "     ${BLUE}cp web/index.html $INSTALL_DIR/web/${NC}"
 echo ""
 echo -e "  2. (Optional) Download static files for offline mode:"
-echo -e "     ${BLUE}cd $INSTALL_DIR && python3 $PYTHON_FILE --download-static${NC}"
+echo -e "     ${BLUE}sudo -u pegaprox bash -c \"cd $INSTALL_DIR && ./venv/bin/python3 $PYTHON_FILE --download-static\"${NC}"
 echo ""
 echo -e "  3. Start PegaProx:"
 echo -e "     ${BLUE}systemctl start pegaprox${NC}"
