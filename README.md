@@ -121,6 +121,15 @@ After starting PegaProx, open your browser and navigate to:
 https://your-server-ip:5000
 ```
 
+Please use the following default credentials for the first login:
+
+```
+Username: pegaprox
+Password: admin
+```
+
+Afterwards, please proceed with the following steps:
+
 1. **First Login**: Create your admin account on the setup page
 2. **Add Cluster**: Go to Settings → Clusters → Add your Proxmox credentials
 3. **Done!** Start managing your VMs
