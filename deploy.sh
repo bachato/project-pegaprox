@@ -41,14 +41,16 @@ for arg in "$@"; do
         --skip-user) SKIP_USER=true ;;
         --skip-service) SKIP_SERVICE=true ;;
         --port=*) PEGAPROX_PORT="${arg#*=}" ;;
+        --install-dir=*) INSTALL_DIR="${arg#*=}" ;;
         --help|-h)
             echo "Usage: ./deploy.sh [options]"
             echo ""
             echo "Options:"
-            echo "  --skip-user      Don't create pegaprox user"
-            echo "  --skip-service   Don't create systemd service"
-            echo "  --port=PORT      Set default port (default: 5000)"
-            echo "  --help, -h       Show this help"
+            echo "  --skip-user         Don't create pegaprox user"
+            echo "  --skip-service      Don't create systemd service"
+            echo "  --port=PORT         Set default port (default: 5000)"
+            echo "  --install-dir=DIR   Set installation directory (default: /opt/PegaProx)"
+            echo "  --help, -h          Show this help"
             exit 0
             ;;
     esac
@@ -82,7 +84,7 @@ if [ "$SKIP_USER" = false ]; then
     if id "$SERVICE_USER" &>/dev/null; then
         echo -e "${GREEN}✓ User '$SERVICE_USER' already exists${NC}"
     else
-        useradd --system --no-create-home --shell /bin/false "$SERVICE_USER"
+        useradd --system --no-create-home --shell /sbin/nologin "$SERVICE_USER"
         echo -e "${GREEN}✓ User '$SERVICE_USER' created${NC}"
     fi
 else
