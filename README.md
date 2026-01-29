@@ -72,29 +72,17 @@ PegaProx is a powerful web-based management interface for Proxmox VE clusters. M
 
 ## ⚡ Quick Start
 
-### Option 1: Semi Automated Installation
+### Option 1: Automated Installation
 
 ```bash
-# Download the project
-git clone https://github.com/PegaProx/project-pegaprox.git
-cd project-pegaprox
+# Download the deployment script
+curl -O https://raw.githubusercontent.com/PegaProx/project-pegaprox/refs/heads/main/deploy.sh
+
+# Give the deployment script permission
+chmod +x deploy.sh
 
 # Run the deployment script
 sudo ./deploy.sh
-
-# Copy the application files
-sudo cp pegaprox_multi_cluster.py /opt/PegaProx/
-sudo cp web/index.html /opt/PegaProx/web/
-
-# Fix permissions
-sudo chown -R pegaprox:pegaprox /opt/PegaProx
-
-# (Optional) Download static files for offline mode
-sudo -u pegaprox bash -c "cd /opt/PegaProx && ./venv/bin/python3 pegaprox_multi_cluster.py --download-static"
-
-# Start the service
-sudo systemctl start pegaprox
-sudo systemctl enable pegaprox
 
 ```
 
