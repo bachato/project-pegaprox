@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 PegaProx Server - Cluster Management Backend for Proxmox VE
-Version: 0.6.2 Beta
+Version: 0.6.3 Beta
 
 Copyright (C) 2025-2026 PegaProx Team
 
@@ -58,6 +58,8 @@ TODO: CODE SPLITTING before v1.0!! 30k lines in one file is insane - NS
       -> split into: api/, core/, models/, utils/, migrations/
       -> MK will hate me for this but its necessary
 DONE: general API rate limiting - LW jan 2026 (env: PEGAPROX_API_RATE_LIMIT)
+DONE: disk bus type editing - MK jan 2026 (finally!)
+DONE: EFI/TPM management in UI - LW jan 2026
 
 ═══════════════════════════════════════════════════════════════════════════════
 """
@@ -265,7 +267,7 @@ app = Flask(__name__)
 # =============================================================================
 # VERSION INFO
 # =============================================================================
-PEGAPROX_VERSION = "Beta 0.6.2"
+PEGAPROX_VERSION = "Beta 0.6.3"
 PEGAPROX_BUILD = "2026.01.25"  # Year.Month.Day of release
 
 # ============================================
@@ -853,6 +855,20 @@ class PegaProxDB:
             )
         ''')
         
+        # Balancing excluded VMs table - MK Jan 2026
+        # VMs that should not be automatically migrated during load balancing
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS balancing_excluded_vms (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                cluster_id TEXT NOT NULL,
+                vmid INTEGER NOT NULL,
+                reason TEXT,
+                created_by TEXT,
+                created_at TEXT,
+                UNIQUE(cluster_id, vmid)
+            )
+        ''')
+        
         # Migration history table
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS migration_history (
@@ -911,6 +927,27 @@ class PegaProxDB:
                 last_run TEXT,
                 created_by TEXT,
                 created_at TEXT
+            )
+        ''')
+        
+        # Update schedules table - MK Jan 2026
+        # For automatic rolling updates
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS update_schedules (
+                cluster_id TEXT PRIMARY KEY,
+                enabled INTEGER DEFAULT 0,
+                schedule_type TEXT DEFAULT 'recurring',
+                day TEXT DEFAULT 'sunday',
+                time TEXT DEFAULT '03:00',
+                include_reboot INTEGER DEFAULT 1,
+                skip_evacuation INTEGER DEFAULT 0,
+                skip_up_to_date INTEGER DEFAULT 1,
+                evacuation_timeout INTEGER DEFAULT 1800,
+                last_run TEXT,
+                next_run TEXT,
+                created_by TEXT,
+                created_at TEXT,
+                updated_at TEXT
             )
         ''')
         
@@ -1104,6 +1141,47 @@ class PegaProxDB:
                     logging.error(f"Failed to add hmac_signature column: {e}")
         except Exception as e:
             logging.error(f"Error checking audit_log schema: {e}")
+        
+        # MK: Migration - create balancing_excluded_vms table if not exists
+        try:
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS balancing_excluded_vms (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    cluster_id TEXT NOT NULL,
+                    vmid INTEGER NOT NULL,
+                    reason TEXT,
+                    created_by TEXT,
+                    created_at TEXT,
+                    UNIQUE(cluster_id, vmid)
+                )
+            ''')
+            logging.info("Ensured balancing_excluded_vms table exists")
+        except Exception as e:
+            logging.error(f"Error creating balancing_excluded_vms table: {e}")
+        
+        # MK: Migration - create update_schedules table if not exists
+        try:
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS update_schedules (
+                    cluster_id TEXT PRIMARY KEY,
+                    enabled INTEGER DEFAULT 0,
+                    schedule_type TEXT DEFAULT 'recurring',
+                    day TEXT DEFAULT 'sunday',
+                    time TEXT DEFAULT '03:00',
+                    include_reboot INTEGER DEFAULT 1,
+                    skip_evacuation INTEGER DEFAULT 0,
+                    skip_up_to_date INTEGER DEFAULT 1,
+                    evacuation_timeout INTEGER DEFAULT 1800,
+                    last_run TEXT,
+                    next_run TEXT,
+                    created_by TEXT,
+                    created_at TEXT,
+                    updated_at TEXT
+                )
+            ''')
+            logging.info("Ensured update_schedules table exists")
+        except Exception as e:
+            logging.error(f"Error creating update_schedules table: {e}")
         
         conn.commit()
         logging.info("DB schema initialized")
@@ -2024,6 +2102,7 @@ class PegaProxDB:
                 'ssh_key': self._decrypt(row['ssh_key_encrypted'] or ''),
                 'ssh_port': row['ssh_port'] or 22,
                 'ha_settings': json.loads(row['ha_settings'] or '{}'),
+                'excluded_nodes': json.loads(row['excluded_nodes'] or '[]'),
             }
         
         return clusters
@@ -2090,6 +2169,7 @@ class PegaProxDB:
             'ssh_key': decrypted_ssh_key,
             'ssh_port': row['ssh_port'] or 22,
             'ha_settings': json.loads(row['ha_settings'] or '{}'),
+            'excluded_nodes': json.loads(row['excluded_nodes'] or '[]'),
         }
     
     def save_cluster(self, cluster_id: str, data: dict):
@@ -2103,8 +2183,8 @@ class PegaProxDB:
              migration_threshold, check_interval, auto_migrate, 
              balance_containers, balance_local_disks, dry_run, enabled, 
              ha_enabled, fallback_hosts, ssh_user, ssh_key_encrypted, 
-             ssh_port, ha_settings, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 
+             ssh_port, ha_settings, excluded_nodes, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 
                     COALESCE((SELECT created_at FROM clusters WHERE id = ?), ?), ?)
         ''', (
             cluster_id,
@@ -2126,6 +2206,7 @@ class PegaProxDB:
             self._encrypt(data.get('ssh_key', '')),
             data.get('ssh_port', 22),
             json.dumps(data.get('ha_settings', {})),
+            json.dumps(data.get('excluded_nodes', [])),
             cluster_id, now, now
         ))
         self.conn.commit()
@@ -4148,6 +4229,8 @@ class PegaProxManager:
     def ticket(self) -> str:
         return self._ticket
     
+    # LW: All API methods go through these wrappers for consistent error handling
+    # MK: Jan 2026 - Fixed timeout handling, was marking cluster offline too eagerly
     def _api_get(self, url, **kwargs):
         kwargs.setdefault('timeout', self.api_timeout)
         try:
@@ -4157,10 +4240,14 @@ class PegaProxManager:
             self.is_connected = True
             self.last_successful_request = datetime.now()
             self.connection_error = None
-            self._consecutive_failures = 0  # NS: reset failure counter
+            self._consecutive_failures = 0  # reset failure counter on success
             return response
-        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
-            # MK: only mark disconnected after multiple failures to avoid flapping
+        except requests.exceptions.Timeout as e:
+            # MK: Timeout != offline. Proxmox might just be slow (happens a lot with ZFS)
+            self.connection_error = f"Request timed out: {e}"
+            raise
+        except requests.exceptions.ConnectionError as e:
+            # LW: Only mark disconnected after 3 consecutive failures to avoid flapping
             self._consecutive_failures += 1
             if self._consecutive_failures >= 3:
                 self.is_connected = False
@@ -4177,7 +4264,11 @@ class PegaProxManager:
             self.connection_error = None
             self._consecutive_failures = 0
             return resp
-        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
+        except requests.exceptions.Timeout as e:
+            # MK: Timeout does NOT mean cluster is offline
+            self.connection_error = f"Request timed out: {e}"
+            raise
+        except requests.exceptions.ConnectionError as e:
             self._consecutive_failures += 1
             if self._consecutive_failures >= 3:
                 self.is_connected = False
@@ -4192,10 +4283,19 @@ class PegaProxManager:
             self.is_connected = True
             self.last_successful_request = datetime.now()
             self.connection_error = None
+            self._consecutive_failures = 0
             return response
-        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
-            self.is_connected = False
-            self.connection_error = str(e)
+        except requests.exceptions.Timeout as e:
+            # MK: Timeout does NOT mean cluster is offline - operation might have succeeded
+            self.connection_error = f"Request timed out: {e}"
+            self.logger.warning(f"[WARN] API PUT timeout (not marking offline): {e}")
+            raise
+        except requests.exceptions.ConnectionError as e:
+            # Real connection error - only mark offline after multiple failures
+            self._consecutive_failures += 1
+            if self._consecutive_failures >= 3:
+                self.is_connected = False
+                self.connection_error = str(e)
             raise
     
     def _api_delete(self, url, **kwargs):
@@ -4207,10 +4307,19 @@ class PegaProxManager:
             self.is_connected = True
             self.last_successful_request = datetime.now()
             self.connection_error = None
+            self._consecutive_failures = 0
             return r
-        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
-            self.is_connected = False
-            self.connection_error = str(e)
+        except requests.exceptions.Timeout as e:
+            # MK: Timeout does NOT mean cluster is offline
+            self.connection_error = f"Request timed out: {e}"
+            self.logger.warning(f"[WARN] API DELETE timeout (not marking offline): {e}")
+            raise
+        except requests.exceptions.ConnectionError as e:
+            # Real connection error - only mark offline after multiple failures
+            self._consecutive_failures += 1
+            if self._consecutive_failures >= 3:
+                self.is_connected = False
+                self.connection_error = str(e)
             raise
         
     def connect_to_proxmox(self) -> bool:
@@ -4653,13 +4762,24 @@ class PegaProxManager:
         if not vms:
             return None
         
+        # MK: Get excluded VMs for this cluster
+        excluded_vmids = self.get_balancing_excluded_vms()
+        if excluded_vmids:
+            self.logger.info(f"VMs excluded from balancing: {excluded_vmids}")
+        
         # Filter VMs on source node that are running
         candidates = [
             vm for vm in vms 
             if vm.get('node') == source_node and 
             vm.get('status') == 'running' and
-            vm.get('type') in ['qemu', 'lxc']
+            vm.get('type') in ['qemu', 'lxc'] and
+            vm.get('vmid') not in excluded_vmids  # MK: Skip excluded VMs
         ]
+        
+        # Log if any VMs were excluded
+        excluded_on_node = [vm for vm in vms if vm.get('node') == source_node and vm.get('vmid') in excluded_vmids]
+        if excluded_on_node:
+            self.logger.info(f"Skipping {len(excluded_on_node)} excluded VM(s) on {source_node}: {[vm.get('vmid') for vm in excluded_on_node]}")
         
         # Filter out containers if balance_containers is disabled
         if not getattr(self.config, 'balance_containers', False):
@@ -4911,7 +5031,13 @@ class PegaProxManager:
         self.logger.error(f"Task {task_id} timed out after {timeout} seconds")
         return False
     
-    def enter_maintenance_mode(self, node_name: str) -> MaintenanceTask:
+    def enter_maintenance_mode(self, node_name: str, skip_evacuation: bool = False) -> MaintenanceTask:
+        """Enter maintenance mode for a node
+        
+        Args:
+            node_name: Name of the node
+            skip_evacuation: If True, skip VM evacuation (NOT RECOMMENDED - use only for non-reboot updates)
+        """
         with self.maintenance_lock:
             if node_name in self.nodes_in_maintenance:
                 return self.nodes_in_maintenance[node_name]
@@ -4921,10 +5047,17 @@ class PegaProxManager:
         
         self.logger.info(f"[MAINT] Entering maintenance mode for node: {node_name}")
         
-        # Start evacuation in background thread
-        t = threading.Thread(target=self._evacuate_node, args=(node_name, task))
-        t.daemon = True
-        t.start()
+        if skip_evacuation:
+            # MK: Skip evacuation - for non-reboot updates where user accepts the risk
+            self.logger.warning(f"[MAINT] Skipping VM evacuation for {node_name} - VMs may be affected if update fails!")
+            task.status = 'completed'
+            task.total_vms = 0
+            task.migrated_vms = 0
+        else:
+            # Start evacuation in background thread
+            t = threading.Thread(target=self._evacuate_node, args=(node_name, task))
+            t.daemon = True
+            t.start()
         
         return task
     
@@ -5724,6 +5857,92 @@ class PegaProxManager:
         except Exception as e:
             self.logger.debug(f"[HA] Error checking VM storage: {e}")
             return 'unknown'
+    
+    def get_balancing_excluded_vms(self) -> List[int]:
+        """Get list of VMIDs excluded from load balancing for this cluster
+        
+        MK: VMs can be excluded from balancing in the VM config.
+        This is useful for VMs with GPU passthrough, local-only storage,
+        or other reasons why they shouldn't be migrated automatically.
+        """
+        try:
+            db = get_db()
+            cursor = db.conn.cursor()
+            cursor.execute(
+                'SELECT vmid FROM balancing_excluded_vms WHERE cluster_id = ?',
+                (self.id,)
+            )
+            return [row['vmid'] for row in cursor.fetchall()]
+        except Exception as e:
+            self.logger.error(f"Error getting excluded VMs: {e}")
+            return []
+    
+    def set_vm_balancing_excluded(self, vmid: int, excluded: bool, reason: str = None, user: str = 'system') -> bool:
+        """Set whether a VM should be excluded from load balancing
+        
+        LW: Added Jan 2026 for pinned VMs - some people run HA or manually placed VMs
+        MK: Uses INSERT OR REPLACE for older SQLite compat (upsert syntax is 3.24+)
+        
+        Returns True on success, False on error.
+        """
+        try:
+            db = get_db()
+            cursor = db.conn.cursor()
+            
+            # MK: Ensure table exists (migration for existing databases)
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS balancing_excluded_vms (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    cluster_id TEXT NOT NULL,
+                    vmid INTEGER NOT NULL,
+                    reason TEXT,
+                    created_by TEXT,
+                    created_at TEXT,
+                    UNIQUE(cluster_id, vmid)
+                )
+            ''')
+            
+            if excluded:
+                # MK: Use INSERT OR REPLACE for SQLite compatibility
+                cursor.execute('''
+                    INSERT OR REPLACE INTO balancing_excluded_vms (cluster_id, vmid, reason, created_by, created_at)
+                    VALUES (?, ?, ?, ?, ?)
+                ''', (self.id, vmid, reason, user, datetime.now().isoformat()))
+                self.logger.info(f"VM {vmid} excluded from balancing (reason: {reason})")
+            else:
+                cursor.execute(
+                    'DELETE FROM balancing_excluded_vms WHERE cluster_id = ? AND vmid = ?',
+                    (self.id, vmid)
+                )
+                self.logger.info(f"VM {vmid} removed from balancing exclusion")
+            
+            db.conn.commit()
+            return True
+        except Exception as e:
+            self.logger.error(f"Error setting VM balancing exclusion: {e}")
+            return False
+    
+    def is_vm_balancing_excluded(self, vmid: int) -> dict:
+        """Check if a VM is excluded from balancing and get the reason"""
+        try:
+            db = get_db()
+            cursor = db.conn.cursor()
+            cursor.execute(
+                'SELECT vmid, reason, created_by, created_at FROM balancing_excluded_vms WHERE cluster_id = ? AND vmid = ?',
+                (self.id, vmid)
+            )
+            row = cursor.fetchone()
+            if row:
+                return {
+                    'excluded': True,
+                    'reason': row['reason'],
+                    'created_by': row['created_by'],
+                    'created_at': row['created_at']
+                }
+            return {'excluded': False}
+        except Exception as e:
+            self.logger.error(f"Error checking VM balancing exclusion: {e}")
+            return {'excluded': False}
     
     def check_vm_storage_type(self, node: str, vmid: int, vm_type: str) -> str:
         # public wrapper for _ha_check_vm_storage
@@ -9599,6 +9818,21 @@ echo "AGENT_INSTALLED_OK"
             if response.status_code == 200:
                 task_data = response.json()
                 self.logger.info(f"[OK] {vm_type}/{vmid} deleted, task: {task_data.get('data')}")
+                
+                # MK: Cleanup - remove VM from balancing exclusion list
+                try:
+                    db = get_db()
+                    cursor = db.conn.cursor()
+                    cursor.execute(
+                        'DELETE FROM balancing_excluded_vms WHERE cluster_id = ? AND vmid = ?',
+                        (self.id, vmid)
+                    )
+                    if cursor.rowcount > 0:
+                        self.logger.info(f"Removed VM {vmid} from balancing exclusion list")
+                    db.conn.commit()
+                except Exception as cleanup_err:
+                    self.logger.warning(f"Failed to cleanup balancing exclusion for VM {vmid}: {cleanup_err}")
+                
                 return {'success': True, 'task': task_data.get('data')}
             else:
                 error_msg = response.text
@@ -10435,12 +10669,142 @@ echo "AGENT_INSTALLED_OK"
                 parsed['node'] = node
                 parsed['type'] = vm_type
                 
+                # MK: Add lock info - important for UI to show locked state
+                lock_reason = config.get('lock')
+                if lock_reason:
+                    lock_descriptions = {
+                        'migrate': 'Migration in progress',
+                        'backup': 'Backup in progress', 
+                        'snapshot': 'Snapshot operation in progress',
+                        'rollback': 'Snapshot rollback in progress',
+                        'clone': 'Clone operation in progress',
+                        'create': 'VM creation in progress',
+                        'disk': 'Disk operation in progress',
+                        'suspended': 'VM suspended to disk',
+                        'suspending': 'VM is being suspended',
+                        'copy': 'Copy operation in progress',
+                    }
+                    parsed['lock'] = {
+                        'locked': True,
+                        'reason': lock_reason,
+                        'description': lock_descriptions.get(lock_reason, f'Locked: {lock_reason}'),
+                        'unlock_command': f"qm unlock {vmid}" if vm_type == 'qemu' else f"pct unlock {vmid}"
+                    }
+                else:
+                    parsed['lock'] = {'locked': False}
+                
                 return {'success': True, 'config': parsed}
             else:
                 return {'success': False, 'error': response.text}
                 
         except Exception as e:
             self.logger.error(f"[ERROR] Get VM config error: {e}")
+            return {'success': False, 'error': str(e)}
+    
+    def unlock_vm(self, node: str, vmid: int, vm_type: str) -> Dict[str, Any]:
+        """Unlock a VM/CT by removing the lock from its config
+        
+        Lock reasons in Proxmox:
+        - migrate: VM is being migrated
+        - backup: VM is being backed up
+        - snapshot: Snapshot operation in progress
+        - rollback: Snapshot rollback in progress
+        - clone: VM is being cloned
+        - create: VM is being created
+        - disk: Disk operation in progress
+        - suspended: VM is suspended to disk
+        
+        Use with caution - unlocking during an active operation can cause issues!
+        """
+        if not self.is_connected:
+            if not self.connect_to_proxmox():
+                return {'success': False, 'error': 'Could not connect to Proxmox'}
+        
+        try:
+            host = self.current_host or self.config.host
+            
+            # First get current config to see lock reason
+            if vm_type == 'qemu':
+                config_url = f"https://{host}:8006/api2/json/nodes/{node}/qemu/{vmid}/config"
+            else:
+                config_url = f"https://{host}:8006/api2/json/nodes/{node}/lxc/{vmid}/config"
+            
+            config_response = self._api_get(config_url)
+            if config_response.status_code != 200:
+                return {'success': False, 'error': 'Could not get VM config'}
+            
+            config = config_response.json().get('data', {})
+            lock_reason = config.get('lock')
+            
+            if not lock_reason:
+                return {'success': True, 'message': 'VM is not locked', 'was_locked': False}
+            
+            self.logger.info(f"Unlocking {vm_type}/{vmid} on {node} (lock reason: {lock_reason})")
+            
+            # Remove the lock by setting delete=lock
+            response = self._api_put(config_url, data={'delete': 'lock'})
+            
+            if response.status_code == 200:
+                self.logger.info(f"[OK] Unlocked {vm_type}/{vmid} (was: {lock_reason})")
+                return {
+                    'success': True, 
+                    'message': f'VM unlocked successfully',
+                    'was_locked': True,
+                    'lock_reason': lock_reason
+                }
+            else:
+                error = response.text
+                self.logger.error(f"[ERROR] Failed to unlock {vm_type}/{vmid}: {error}")
+                return {'success': False, 'error': error}
+                
+        except Exception as e:
+            self.logger.error(f"[ERROR] Unlock VM error: {e}")
+            return {'success': False, 'error': str(e)}
+    
+    def get_vm_lock_status(self, node: str, vmid: int, vm_type: str) -> Dict[str, Any]:
+        """Get lock status of a VM/CT"""
+        if not self.is_connected:
+            if not self.connect_to_proxmox():
+                return {'success': False, 'error': 'Could not connect to Proxmox'}
+        
+        try:
+            host = self.current_host or self.config.host
+            
+            if vm_type == 'qemu':
+                config_url = f"https://{host}:8006/api2/json/nodes/{node}/qemu/{vmid}/config"
+            else:
+                config_url = f"https://{host}:8006/api2/json/nodes/{node}/lxc/{vmid}/config"
+            
+            response = self._api_get(config_url)
+            
+            if response.status_code == 200:
+                config = response.json().get('data', {})
+                lock_reason = config.get('lock')
+                
+                # Map lock reasons to human-readable descriptions
+                lock_descriptions = {
+                    'migrate': 'Migration in progress',
+                    'backup': 'Backup in progress',
+                    'snapshot': 'Snapshot operation in progress',
+                    'rollback': 'Snapshot rollback in progress',
+                    'clone': 'Clone operation in progress',
+                    'create': 'VM creation in progress',
+                    'disk': 'Disk operation in progress',
+                    'suspended': 'VM suspended to disk',
+                    'suspending': 'VM is being suspended',
+                    'copy': 'Copy operation in progress',
+                }
+                
+                return {
+                    'success': True,
+                    'locked': bool(lock_reason),
+                    'lock_reason': lock_reason,
+                    'lock_description': lock_descriptions.get(lock_reason, f'Locked: {lock_reason}') if lock_reason else None
+                }
+            else:
+                return {'success': False, 'error': response.text}
+                
+        except Exception as e:
             return {'success': False, 'error': str(e)}
     
     def get_vm_rrd(self, node: str, vmid: int, vm_type: str, timeframe: str = 'day') -> Dict[str, Any]:
@@ -10523,7 +10887,8 @@ echo "AGENT_INSTALLED_OK"
             'hardware': {},
             'disks': [],
             'networks': [],
-            'options': {}
+            'options': {},
+            'unused_disks': []  # MK: Track unused/detached disks
         }
         
         if vm_type == 'qemu':
@@ -10573,6 +10938,20 @@ echo "AGENT_INSTALLED_OK"
                             'id': key,
                             'value': value,
                             **self._parse_disk_string(value)
+                        })
+                
+                # MK: Unused disks - these are detached but not deleted
+                if key.startswith('unused'):
+                    if isinstance(value, str):
+                        # Parse unused disk: "local-lvm:vm-100-disk-1" or similar
+                        parts = value.split(':')
+                        storage = parts[0] if len(parts) > 0 else ''
+                        volume = parts[1] if len(parts) > 1 else value
+                        parsed['unused_disks'].append({
+                            'id': key,
+                            'value': value,
+                            'storage': storage,
+                            'volume': volume,
                         })
                 
                 # Networks: net0, net1, etc.
@@ -10626,6 +11005,19 @@ echo "AGENT_INSTALLED_OK"
                         'value': value,
                         **self._parse_lxc_storage_string(value)
                     })
+                
+                # MK: Unused disks for LXC too
+                if key.startswith('unused'):
+                    if isinstance(value, str):
+                        parts = value.split(':')
+                        storage = parts[0] if len(parts) > 0 else ''
+                        volume = parts[1] if len(parts) > 1 else value
+                        parsed['unused_disks'].append({
+                            'id': key,
+                            'value': value,
+                            'storage': storage,
+                            'volume': volume,
+                        })
                 
                 # Networks: net0, net1, etc.
                 if key.startswith('net'):
@@ -10868,7 +11260,11 @@ echo "AGENT_INSTALLED_OK"
             return []
     
     def add_disk(self, node: str, vmid: int, vm_type: str, disk_config: Dict) -> Dict[str, Any]:
+        """Add a new disk to VM or container
         
+        LW: This was a pain to get right - Proxmox disk strings are weird
+        MK: Jan 2026 - Added bus type detection for iothread/ssd support
+        """
         if not self.is_connected:
             if not self.connect_to_proxmox():
                 return {'success': False, 'error': 'Could not connect to Proxmox'}
@@ -10878,18 +11274,27 @@ echo "AGENT_INSTALLED_OK"
             size = disk_config.get('size', '32G')
             disk_id = disk_config.get('disk_id', 'scsi1')
             
+            # MK: Determine bus type from disk_id (e.g., "scsi0" -> "scsi")
+            bus_type = ''.join(c for c in disk_id if c.isalpha())
+            # LW: iothread only works with virtio-scsi controller
+            supports_iothread = bus_type in ['scsi', 'virtio']
+            # MK: ssd emulation supported for scsi, virtio, sata (NOT ide - tried it, breaks)
+            supports_ssd = bus_type in ['scsi', 'virtio', 'sata']
+            
             if vm_type == 'qemu':
                 url = f"https://{self.host}:8006/api2/json/nodes/{node}/qemu/{vmid}/config"
                 
                 # Build disk string
                 disk_str = f"{storage}:{size}"
                 
-                # Add optional parameters
+                # Add optional parameters (only if supported by bus type)
                 if disk_config.get('cache'):
                     disk_str += f",cache={disk_config['cache']}"
-                if disk_config.get('iothread'):
+                # MK: Only add iothread for scsi/virtio
+                if disk_config.get('iothread') and supports_iothread:
                     disk_str += ",iothread=1"
-                if disk_config.get('ssd'):
+                # MK: Only add ssd for scsi/virtio/sata (not ide)
+                if disk_config.get('ssd') and supports_ssd:
                     disk_str += ",ssd=1"
                 if disk_config.get('discard'):
                     disk_str += ",discard=on"
@@ -11319,18 +11724,68 @@ echo "AGENT_INSTALLED_OK"
         
         MK: q35 is recommended for modern systems (PCIe native)
         i440fx is the legacy fallback for older guests
+        Updated Jan 2026 to include all versions from Proxmox 8.x
         """
         return [
             {'value': '', 'label': 'Default'},
-            {'value': 'q35', 'label': 'q35 (PCIe, recommended)'},
-            {'value': 'i440fx', 'label': 'i440fx (Legacy PCI)'},
-            {'value': 'pc', 'label': 'pc (Standard i440fx alias)'},
-            # LW: Version-specific types for specific compatibility needs
-            {'value': 'pc-q35-8.1', 'label': 'q35 v8.1'},
-            {'value': 'pc-q35-8.0', 'label': 'q35 v8.0'},
-            {'value': 'pc-q35-7.2', 'label': 'q35 v7.2'},
-            {'value': 'pc-i440fx-8.1', 'label': 'i440fx v8.1'},
-            {'value': 'pc-i440fx-8.0', 'label': 'i440fx v8.0'},
+            # q35 versions (modern, PCIe native)
+            {'value': 'q35', 'label': 'q35 (Latest)'},
+            {'value': 'pc-q35-10.1', 'label': 'q35 10.1'},
+            {'value': 'pc-q35-10.0+pve1', 'label': 'q35 10.0+pve1'},
+            {'value': 'pc-q35-10.0', 'label': 'q35 10.0'},
+            {'value': 'pc-q35-9.2+pve1', 'label': 'q35 9.2+pve1'},
+            {'value': 'pc-q35-9.2', 'label': 'q35 9.2'},
+            {'value': 'pc-q35-9.1', 'label': 'q35 9.1'},
+            {'value': 'pc-q35-9.0', 'label': 'q35 9.0'},
+            {'value': 'pc-q35-8.2', 'label': 'q35 8.2'},
+            {'value': 'pc-q35-8.1', 'label': 'q35 8.1'},
+            {'value': 'pc-q35-8.0', 'label': 'q35 8.0'},
+            {'value': 'pc-q35-7.2', 'label': 'q35 7.2'},
+            {'value': 'pc-q35-7.1', 'label': 'q35 7.1'},
+            {'value': 'pc-q35-7.0', 'label': 'q35 7.0'},
+            {'value': 'pc-q35-6.2', 'label': 'q35 6.2'},
+            {'value': 'pc-q35-6.1', 'label': 'q35 6.1'},
+            {'value': 'pc-q35-6.0', 'label': 'q35 6.0'},
+            {'value': 'pc-q35-5.2', 'label': 'q35 5.2'},
+            {'value': 'pc-q35-5.1', 'label': 'q35 5.1'},
+            {'value': 'pc-q35-5.0', 'label': 'q35 5.0'},
+            {'value': 'pc-q35-4.2', 'label': 'q35 4.2'},
+            {'value': 'pc-q35-4.1', 'label': 'q35 4.1'},
+            {'value': 'pc-q35-4.0', 'label': 'q35 4.0'},
+            {'value': 'pc-q35-3.1', 'label': 'q35 3.1'},
+            {'value': 'pc-q35-3.0', 'label': 'q35 3.0'},
+            {'value': 'pc-q35-2.12', 'label': 'q35 2.12'},
+            {'value': 'pc-q35-2.11', 'label': 'q35 2.11'},
+            {'value': 'pc-q35-2.10', 'label': 'q35 2.10'},
+            # i440fx versions (legacy PCI)
+            {'value': 'i440fx', 'label': 'i440fx (Latest)'},
+            {'value': 'pc-i440fx-10.1', 'label': 'i440fx 10.1'},
+            {'value': 'pc-i440fx-10.0+pve1', 'label': 'i440fx 10.0+pve1'},
+            {'value': 'pc-i440fx-10.0', 'label': 'i440fx 10.0'},
+            {'value': 'pc-i440fx-9.2+pve1', 'label': 'i440fx 9.2+pve1'},
+            {'value': 'pc-i440fx-9.2', 'label': 'i440fx 9.2'},
+            {'value': 'pc-i440fx-9.1', 'label': 'i440fx 9.1'},
+            {'value': 'pc-i440fx-9.0', 'label': 'i440fx 9.0'},
+            {'value': 'pc-i440fx-8.2', 'label': 'i440fx 8.2'},
+            {'value': 'pc-i440fx-8.1', 'label': 'i440fx 8.1'},
+            {'value': 'pc-i440fx-8.0', 'label': 'i440fx 8.0'},
+            {'value': 'pc-i440fx-7.2', 'label': 'i440fx 7.2'},
+            {'value': 'pc-i440fx-7.1', 'label': 'i440fx 7.1'},
+            {'value': 'pc-i440fx-7.0', 'label': 'i440fx 7.0'},
+            {'value': 'pc-i440fx-6.2', 'label': 'i440fx 6.2'},
+            {'value': 'pc-i440fx-6.1', 'label': 'i440fx 6.1'},
+            {'value': 'pc-i440fx-6.0', 'label': 'i440fx 6.0'},
+            {'value': 'pc-i440fx-5.2', 'label': 'i440fx 5.2'},
+            {'value': 'pc-i440fx-5.1', 'label': 'i440fx 5.1'},
+            {'value': 'pc-i440fx-5.0', 'label': 'i440fx 5.0'},
+            {'value': 'pc-i440fx-4.2', 'label': 'i440fx 4.2'},
+            {'value': 'pc-i440fx-4.1', 'label': 'i440fx 4.1'},
+            {'value': 'pc-i440fx-4.0', 'label': 'i440fx 4.0'},
+            {'value': 'pc-i440fx-3.1', 'label': 'i440fx 3.1'},
+            {'value': 'pc-i440fx-3.0', 'label': 'i440fx 3.0'},
+            {'value': 'pc-i440fx-2.12', 'label': 'i440fx 2.12'},
+            {'value': 'pc-i440fx-2.11', 'label': 'i440fx 2.11'},
+            {'value': 'pc-i440fx-2.10', 'label': 'i440fx 2.10'},
         ]
     
     # ==================== NODE MANAGEMENT METHODS ====================
@@ -12459,6 +12914,7 @@ def save_config():
                     'ssh_key': getattr(manager.config, 'ssh_key', ''),
                     'ssh_port': getattr(manager.config, 'ssh_port', 22),
                     'ha_settings': getattr(manager.config, 'ha_settings', {}),
+                    'excluded_nodes': getattr(manager.config, 'excluded_nodes', []),
                 }
                 
                 db.save_cluster(cluster_id, cluster_data)
@@ -14808,11 +15264,19 @@ def check_schedules():
             if modified:
                 save_schedules(schedules)
             
+            # MK: Check for scheduled rolling updates
+            try:
+                check_scheduled_updates()
+            except Exception as e:
+                logging.error(f"[SCHEDULER] Scheduled updates check error: {e}")
+            
             # Daily cleanup tasks at 03:00
             if current_time == '03:00':
                 try:
                     # Cleanup soft-deleted scripts after 20 days
                     cleanup_deleted_scripts()
+                    # MK: Cleanup orphaned excluded VMs (VMs that no longer exist)
+                    cleanup_orphaned_excluded_vms()
                     logging.info("[SCHEDULER] Daily cleanup completed")
                 except Exception as e:
                     logging.error(f"[SCHEDULER] Daily cleanup error: {e}")
@@ -14832,6 +15296,8 @@ def execute_scheduled_action(action):
     
     LW: This is basically the same as the manual action endpoints
     but called from the scheduler
+    
+    MK: Added rolling_update for automatic node updates
     """
     cluster_id = action.get('cluster_id')
     vmid = action.get('vmid')
@@ -14850,6 +15316,11 @@ def execute_scheduled_action(action):
         return
     
     try:
+        # MK: Handle rolling_update action type separately
+        if action_type == 'rolling_update':
+            execute_scheduled_rolling_update(mgr, cluster_id, action)
+            return
+        
         # Find the node where the VM is running
         resources = mgr.get_vm_resources()
         vm = next((r for r in resources if r.get('vmid') == vmid), None)
@@ -14890,6 +15361,145 @@ def execute_scheduled_action(action):
         
     except Exception as e:
         logging.error(f"[SCHEDULER] Failed to execute {action_type}: {e}")
+
+
+def execute_scheduled_rolling_update(mgr, cluster_id: str, action: dict):
+    """Execute a scheduled rolling update on a cluster
+    
+    MK: This runs the same rolling update logic but triggered by scheduler
+    """
+    try:
+        # Get update config from action
+        config = action.get('config', {})
+        include_reboot = config.get('include_reboot', False)
+        skip_evacuation = config.get('skip_evacuation', False)
+        skip_up_to_date = config.get('skip_up_to_date', True)
+        evacuation_timeout = config.get('evacuation_timeout', 1800)
+        
+        logging.info(f"[SCHEDULER] Starting scheduled rolling update for cluster {cluster_id}")
+        logging.info(f"[SCHEDULER] Config: reboot={include_reboot}, skip_evacuation={skip_evacuation}")
+        
+        # Check if already running
+        if hasattr(mgr, '_rolling_update') and mgr._rolling_update and mgr._rolling_update.get('status') == 'running':
+            logging.warning(f"[SCHEDULER] Rolling update already in progress, skipping")
+            return
+        
+        # Get nodes
+        node_status = mgr.get_node_status()
+        nodes_to_update = list(node_status.keys()) if node_status else []
+        
+        if not nodes_to_update:
+            logging.warning(f"[SCHEDULER] No nodes available for update")
+            return
+        
+        # Initialize rolling update state
+        mgr._rolling_update = {
+            'status': 'running',
+            'started_at': time.strftime('%Y-%m-%d %H:%M:%S'),
+            'include_reboot': include_reboot,
+            'skip_up_to_date': skip_up_to_date,
+            'skip_evacuation': skip_evacuation,
+            'force_all': False,
+            'evacuation_timeout': evacuation_timeout,
+            'update_timeout': 900,
+            'reboot_timeout': 600,
+            'nodes': nodes_to_update,
+            'current_index': 0,
+            'current_node': nodes_to_update[0],
+            'current_step': 'starting',
+            'completed_nodes': [],
+            'skipped_nodes': [],
+            'failed_nodes': [],
+            'logs': [f"[{time.strftime('%H:%M:%S')}] Scheduled rolling update started"],
+            'scheduled': True  # Mark as scheduled
+        }
+        
+        # Run the update in a background thread
+        def run_scheduled_update():
+            try:
+                for idx, node_name in enumerate(nodes_to_update):
+                    if not hasattr(mgr, '_rolling_update') or mgr._rolling_update.get('status') != 'running':
+                        break
+                    
+                    mgr._rolling_update['current_index'] = idx
+                    mgr._rolling_update['current_node'] = node_name
+                    mgr._rolling_update['logs'].append(f"[{time.strftime('%H:%M:%S')}] Processing {node_name}")
+                    
+                    # Check for updates if skip_up_to_date
+                    if skip_up_to_date:
+                        try:
+                            mgr.refresh_node_apt(node_name)
+                            time.sleep(3)
+                            updates = mgr.get_node_apt_updates(node_name)
+                            if not updates:
+                                mgr._rolling_update['logs'].append(f"[{time.strftime('%H:%M:%S')}] ⏭ {node_name} up-to-date, skipping")
+                                mgr._rolling_update['skipped_nodes'].append(node_name)
+                                continue
+                        except Exception as e:
+                            logging.warning(f"[SCHEDULER] Could not check updates for {node_name}: {e}")
+                    
+                    # Enter maintenance mode
+                    mgr._rolling_update['current_step'] = 'maintenance'
+                    maintenance_task = mgr.enter_maintenance_mode(node_name, skip_evacuation=skip_evacuation)
+                    
+                    if not skip_evacuation:
+                        # Wait for evacuation
+                        waited = 0
+                        while waited < evacuation_timeout:
+                            if node_name in mgr.nodes_in_maintenance:
+                                task = mgr.nodes_in_maintenance[node_name]
+                                if task.status in ['completed', 'completed_with_errors']:
+                                    break
+                            time.sleep(5)
+                            waited += 5
+                    
+                    # Start update
+                    mgr._rolling_update['current_step'] = 'updating'
+                    update_task = mgr.start_node_update(node_name, reboot=include_reboot, force=True)
+                    
+                    if update_task:
+                        # Wait for update to complete
+                        max_wait = 1800 if include_reboot else 900
+                        waited = 0
+                        while waited < max_wait:
+                            if update_task.status in ['completed', 'failed']:
+                                break
+                            time.sleep(10)
+                            waited += 10
+                        
+                        if update_task.status == 'completed':
+                            mgr._rolling_update['logs'].append(f"[{time.strftime('%H:%M:%S')}] ✓ {node_name} updated successfully")
+                            mgr._rolling_update['completed_nodes'].append(node_name)
+                        else:
+                            mgr._rolling_update['logs'].append(f"[{time.strftime('%H:%M:%S')}] ✗ {node_name} update failed")
+                            mgr._rolling_update['failed_nodes'].append(node_name)
+                    
+                    # Exit maintenance mode
+                    mgr.exit_maintenance_mode(node_name)
+                
+                # Finished
+                mgr._rolling_update['status'] = 'completed'
+                mgr._rolling_update['logs'].append(f"[{time.strftime('%H:%M:%S')}] Scheduled rolling update completed")
+                
+                # Log audit
+                log_audit('scheduler', 'scheduled.rolling_update', 
+                         f"Scheduled rolling update completed: {len(mgr._rolling_update['completed_nodes'])} updated, "
+                         f"{len(mgr._rolling_update['skipped_nodes'])} skipped, "
+                         f"{len(mgr._rolling_update['failed_nodes'])} failed")
+                
+            except Exception as e:
+                logging.error(f"[SCHEDULER] Rolling update error: {e}")
+                if hasattr(mgr, '_rolling_update'):
+                    mgr._rolling_update['status'] = 'failed'
+                    mgr._rolling_update['logs'].append(f"[{time.strftime('%H:%M:%S')}] ERROR: {e}")
+        
+        update_thread = threading.Thread(target=run_scheduled_update, daemon=True)
+        update_thread.start()
+        
+        logging.info(f"[SCHEDULER] Rolling update thread started for {cluster_id}")
+        
+    except Exception as e:
+        logging.error(f"[SCHEDULER] Failed to start scheduled rolling update: {e}")
 
 
 def start_scheduler():
@@ -17928,15 +18538,18 @@ def perform_pegaprox_update():
             try:
                 logging.info("Installing Python packages from requirements.txt...")
                 
-                # NS: Try multiple methods for pip install
-                # 1. venv pip (no sudo needed)
-                # 2. system pip with sudo (for service accounts)
-                # 3. system pip with --user (fallback)
+                # MK: Multiple methods for pip install
+                # 1. venv pip (preferred)
+                # 2. sudo pip (if sudoers configured)
+                # 3. direct pip if running as root
+                # 4. pip with --user fallback
                 
                 venv_pip = os.path.join(current_dir, 'venv', 'bin', 'pip')
                 venv_pip_win = os.path.join(current_dir, 'venv', 'Scripts', 'pip.exe')
                 
                 pip_result = None
+                is_root = os.geteuid() == 0 if hasattr(os, 'geteuid') else False
+                has_sudo = shutil.which('sudo') is not None
                 
                 # Method 1: Try venv pip first (preferred)
                 if os.path.exists(venv_pip):
@@ -17960,33 +18573,40 @@ def perform_pegaprox_update():
                     if result.returncode == 0:
                         pip_result = "success (venv)"
                 
-                # Method 2: Try sudo pip (for service accounts)
+                # Method 2: System pip
                 if not pip_result:
                     system_pip = shutil.which('pip3') or shutil.which('pip')
                     if system_pip:
-                        logging.info("Trying sudo pip install...")
-                        result = subprocess.run(
-                            ['sudo', system_pip, 'install', '-r', requirements_path, '--quiet'],
-                            capture_output=True, text=True, timeout=120
-                        )
-                        if result.returncode == 0:
-                            pip_result = "success (sudo)"
-                            logging.info("Python packages installed successfully (sudo)")
-                        else:
-                            logging.warning(f"sudo pip failed: {result.stderr[:100]}")
-                            
-                            # Method 3: Fallback to --user install
-                            logging.info("Trying pip install --user...")
+                        pip_args = [system_pip, 'install', '-r', requirements_path, '--quiet', '--break-system-packages']
+                        
+                        if is_root:
+                            # Running as root - no sudo needed
+                            logging.info("Running as root, using pip directly...")
+                            result = subprocess.run(pip_args, capture_output=True, text=True, timeout=120)
+                        elif has_sudo:
+                            # Try sudo pip (works if sudoers is configured)
+                            logging.info("Trying sudo pip install...")
                             result = subprocess.run(
-                                [system_pip, 'install', '-r', requirements_path, '--user', '--quiet'],
+                                ['sudo', '-n'] + pip_args,  # -n = non-interactive (no password prompt)
                                 capture_output=True, text=True, timeout=120
                             )
-                            if result.returncode == 0:
-                                pip_result = "success (--user)"
-                                logging.info("Python packages installed successfully (--user)")
-                            else:
-                                pip_result = f"failed: {result.stderr[:100]}"
-                                logging.error(f"All pip methods failed")
+                            if result.returncode != 0:
+                                # Sudo failed, try --user
+                                logging.info("sudo pip failed, trying --user...")
+                                pip_args_user = [system_pip, 'install', '-r', requirements_path, '--user', '--quiet']
+                                result = subprocess.run(pip_args_user, capture_output=True, text=True, timeout=120)
+                        else:
+                            # No sudo, try --user
+                            logging.info("Trying pip install --user...")
+                            pip_args_user = [system_pip, 'install', '-r', requirements_path, '--user', '--quiet']
+                            result = subprocess.run(pip_args_user, capture_output=True, text=True, timeout=120)
+                        
+                        if result.returncode == 0:
+                            pip_result = "success"
+                            logging.info("Python packages installed successfully")
+                        else:
+                            pip_result = f"failed: {result.stderr[:100]}"
+                            logging.warning(f"pip install failed: {result.stderr[:200]}")
                     else:
                         pip_result = "skipped (pip not found)"
                         logging.warning("pip not found, skipping package installation")
@@ -18007,15 +18627,35 @@ def perform_pegaprox_update():
             time.sleep(restart_delay)
             logging.info("Restarting PegaProx server...")
             
-            # Try systemd first
+            is_root = os.geteuid() == 0 if hasattr(os, 'geteuid') else False
+            has_sudo = shutil.which('sudo') is not None
+            
+            # Try systemd first (if running as service)
             try:
                 result = subprocess.run(['systemctl', 'is-active', 'pegaprox'], 
                                        capture_output=True, text=True, timeout=5)
                 if result.returncode == 0:
-                    subprocess.run(['systemctl', 'restart', 'pegaprox'], timeout=30)
-                    return
-            except:
-                pass
+                    # Running as systemd service
+                    if is_root:
+                        subprocess.run(['systemctl', 'restart', 'pegaprox'], timeout=30)
+                        return
+                    elif has_sudo:
+                        # Try sudo restart (works if sudoers is configured)
+                        logging.info("Trying sudo systemctl restart...")
+                        result = subprocess.run(
+                            ['sudo', '-n', 'systemctl', 'restart', 'pegaprox'],
+                            capture_output=True, text=True, timeout=30
+                        )
+                        if result.returncode == 0:
+                            return
+                        else:
+                            logging.warning(f"sudo restart failed: {result.stderr}")
+                    
+                    # Fallback: just exit and let systemd restart us
+                    logging.info("Exiting for systemd restart (Restart=always)...")
+                    os._exit(0)
+            except Exception as e:
+                logging.warning(f"systemctl check failed: {e}")
             
             # Fallback: restart via Python
             try:
@@ -18115,12 +18755,26 @@ def rollback_pegaprox_update():
         # Schedule restart
         def restart_server():
             time.sleep(3)
+            is_root = os.geteuid() == 0 if hasattr(os, 'geteuid') else False
+            has_sudo = shutil.which('sudo') is not None
+            
             try:
                 result = subprocess.run(['systemctl', 'is-active', 'pegaprox'], 
                                        capture_output=True, text=True, timeout=5)
                 if result.returncode == 0:
-                    subprocess.run(['systemctl', 'restart', 'pegaprox'], timeout=30)
-                    return
+                    if is_root:
+                        subprocess.run(['systemctl', 'restart', 'pegaprox'], timeout=30)
+                        return
+                    elif has_sudo:
+                        result = subprocess.run(
+                            ['sudo', '-n', 'systemctl', 'restart', 'pegaprox'],
+                            capture_output=True, text=True, timeout=30
+                        )
+                        if result.returncode == 0:
+                            return
+                    # Fallback: exit for systemd restart
+                    logging.info("Exiting for systemd restart...")
+                    os._exit(0)
             except:
                 pass
             try:
@@ -18468,19 +19122,31 @@ def restart_server():
         def do_restart():
             time.sleep(1)  # Give time for response to be sent
             logging.info("Server restart initiated by admin")
-            # Try different restart methods
+            
+            is_root = os.geteuid() == 0 if hasattr(os, 'geteuid') else False
+            has_sudo = shutil.which('sudo') is not None
+            
             try:
-                # Method 1: If running as systemd service
-                # MK: Security fix - use subprocess.run instead of os.system
-                subprocess.run(['systemctl', 'restart', 'pegaprox'], 
-                              capture_output=True, timeout=30)
+                result = subprocess.run(['systemctl', 'is-active', 'pegaprox'],
+                                       capture_output=True, text=True, timeout=5)
+                if result.returncode == 0:
+                    if is_root:
+                        subprocess.run(['systemctl', 'restart', 'pegaprox'], 
+                                      capture_output=True, timeout=30)
+                        return
+                    elif has_sudo:
+                        result = subprocess.run(
+                            ['sudo', '-n', 'systemctl', 'restart', 'pegaprox'],
+                            capture_output=True, text=True, timeout=30
+                        )
+                        if result.returncode == 0:
+                            return
             except Exception:
                 pass
-            try:
-                # Method 2: Exit and let process manager restart
-                os._exit(0)
-            except Exception:
-                pass
+            
+            # Fallback: exit and let systemd restart
+            logging.info("Exiting for systemd restart...")
+            os._exit(0)
         
         restart_thread = threading.Thread(target=do_restart)
         restart_thread.daemon = True
@@ -19732,13 +20398,21 @@ def delete_cluster(cluster_id):
     mgr.stop()
     del cluster_managers[cluster_id]
     
-    # NS: Actually delete from database! 
-    # save_config() only saves existing clusters, doesn't remove deleted ones
-    # This was causing clusters to reappear after restart
+    # MK: Delete cluster and all related data from database
     try:
         db = get_db()
+        cursor = db.conn.cursor()
+        
+        # Delete cluster
         db.delete_cluster(cluster_id)
-        logging.info(f"Deleted cluster {cluster_id} from database")
+        
+        # Clean up related tables
+        cursor.execute('DELETE FROM vm_acls WHERE cluster_id = ?', (cluster_id,))
+        cursor.execute('DELETE FROM affinity_rules WHERE cluster_id = ?', (cluster_id,))
+        cursor.execute('DELETE FROM cluster_alerts WHERE cluster_id = ?', (cluster_id,))
+        db.conn.commit()
+        
+        logging.info(f"Deleted cluster {cluster_id} and related data from database")
     except Exception as e:
         logging.error(f"Failed to delete cluster from database: {e}")
     
@@ -20115,6 +20789,187 @@ def remove_excluded_node(cluster_id, node):
         'success': True,
         'excluded_nodes': excluded,
         'message': f'Node {node} re-included in balancing'
+    })
+
+
+# ============================================
+# Excluded VMs from Balancing API
+# MK: VMs that should not be auto-migrated
+# ============================================
+
+@app.route('/api/clusters/<cluster_id>/excluded-vms', methods=['GET'])
+@require_auth(perms=['cluster.view'])
+def get_excluded_vms(cluster_id):
+    """Get list of VMs excluded from load balancing"""
+    ok, err = check_cluster_access(cluster_id)
+    if not ok: return err
+    
+    if cluster_id not in cluster_managers:
+        return jsonify({'error': 'Cluster not found'}), 404
+    
+    mgr = cluster_managers[cluster_id]
+    
+    try:
+        db = get_db()
+        cursor = db.conn.cursor()
+        
+        # MK: Ensure table exists (migration for existing databases)
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS balancing_excluded_vms (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                cluster_id TEXT NOT NULL,
+                vmid INTEGER NOT NULL,
+                reason TEXT,
+                created_by TEXT,
+                created_at TEXT,
+                UNIQUE(cluster_id, vmid)
+            )
+        ''')
+        
+        cursor.execute(
+            'SELECT vmid, reason, created_by, created_at FROM balancing_excluded_vms WHERE cluster_id = ?',
+            (cluster_id,)
+        )
+        excluded = []
+        for row in cursor.fetchall():
+            excluded.append({
+                'vmid': row['vmid'],
+                'reason': row['reason'],
+                'created_by': row['created_by'],
+                'created_at': row['created_at']
+            })
+        
+        # Get VM names for display
+        vms = mgr.get_vm_resources() if mgr.is_connected else []
+        vm_names = {vm['vmid']: vm.get('name', f"VM {vm['vmid']}") for vm in vms}
+        
+        for ex in excluded:
+            ex['name'] = vm_names.get(ex['vmid'], f"VM {ex['vmid']}")
+        
+        return jsonify({
+            'excluded_vms': excluded,
+            'cluster_id': cluster_id
+        })
+    except Exception as e:
+        logging.error(f"Error getting excluded VMs: {e}")
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/clusters/<cluster_id>/excluded-vms/<int:vmid>', methods=['POST'])
+@require_auth(roles=[ROLE_ADMIN], perms=['cluster.config'])
+def add_excluded_vm(cluster_id, vmid):
+    """Add a VM to the exclusion list for load balancing"""
+    ok, err = check_cluster_access(cluster_id)
+    if not ok: return err
+    
+    if cluster_id not in cluster_managers:
+        return jsonify({'error': 'Cluster not found'}), 404
+    
+    mgr = cluster_managers[cluster_id]
+    data = request.json or {}
+    reason = data.get('reason', 'Manually excluded')
+    user = request.session.get('user', 'system')
+    
+    if mgr.set_vm_balancing_excluded(vmid, True, reason, user):
+        log_audit(user, 'cluster.vm_excluded', 
+                  f"VM {vmid} excluded from balancing for cluster {mgr.config.name} (reason: {reason})")
+        return jsonify({
+            'success': True,
+            'vmid': vmid,
+            'message': f'VM {vmid} excluded from balancing'
+        })
+    else:
+        return jsonify({'error': 'Failed to exclude VM'}), 500
+
+
+@app.route('/api/clusters/<cluster_id>/excluded-vms/<int:vmid>', methods=['DELETE'])
+@require_auth(roles=[ROLE_ADMIN], perms=['cluster.config'])
+def remove_excluded_vm(cluster_id, vmid):
+    """Remove a VM from the exclusion list"""
+    ok, err = check_cluster_access(cluster_id)
+    if not ok: return err
+    
+    if cluster_id not in cluster_managers:
+        return jsonify({'error': 'Cluster not found'}), 404
+    
+    mgr = cluster_managers[cluster_id]
+    user = request.session.get('user', 'system')
+    
+    if mgr.set_vm_balancing_excluded(vmid, False, user=user):
+        log_audit(user, 'cluster.vm_included', 
+                  f"VM {vmid} re-included in balancing for cluster {mgr.config.name}")
+        return jsonify({
+            'success': True,
+            'vmid': vmid,
+            'message': f'VM {vmid} re-included in balancing'
+        })
+    else:
+        return jsonify({'error': 'Failed to include VM'}), 500
+
+
+@app.route('/api/clusters/<cluster_id>/fallback-hosts', methods=['GET'])
+@require_auth(perms=['cluster.view'])
+def get_fallback_hosts(cluster_id):
+    """Get list of fallback hosts for HA"""
+    ok, err = check_cluster_access(cluster_id)
+    if not ok: return err
+    
+    if cluster_id not in cluster_managers:
+        return jsonify({'error': 'Cluster not found'}), 404
+    
+    mgr = cluster_managers[cluster_id]
+    fallback = getattr(mgr.config, 'fallback_hosts', []) or []
+    
+    return jsonify({
+        'fallback_hosts': fallback,
+        'cluster_id': cluster_id
+    })
+
+
+@app.route('/api/clusters/<cluster_id>/fallback-hosts', methods=['PUT'])
+@require_auth(roles=[ROLE_ADMIN], perms=['cluster.config'])
+def set_fallback_hosts(cluster_id):
+    """Set list of fallback hosts for HA
+    
+    Request body: { "fallback_hosts": ["192.168.1.2", "192.168.1.3"] }
+    """
+    ok, err = check_cluster_access(cluster_id)
+    if not ok: return err
+    
+    if cluster_id not in cluster_managers:
+        return jsonify({'error': 'Cluster not found'}), 404
+    
+    data = request.get_json() or {}
+    fallback_hosts = data.get('fallback_hosts', [])
+    
+    if not isinstance(fallback_hosts, list):
+        return jsonify({'error': 'fallback_hosts must be a list'}), 400
+    
+    fallback_hosts = [str(h) for h in fallback_hosts if h]
+    
+    mgr = cluster_managers[cluster_id]
+    mgr.config.fallback_hosts = fallback_hosts
+    
+    # Save to database
+    try:
+        db = get_db()
+        cursor = db.conn.cursor()
+        cursor.execute(
+            'UPDATE clusters SET fallback_hosts = ? WHERE id = ?',
+            (json.dumps(fallback_hosts), cluster_id)
+        )
+        db.conn.commit()
+    except Exception as e:
+        logging.error(f"Failed to save fallback_hosts: {e}")
+        return jsonify({'error': f'Database error: {str(e)}'}), 500
+    
+    log_audit(request.session['user'], 'cluster.fallback_hosts_changed', 
+              f"Cluster {mgr.config.name}: fallback hosts set to {fallback_hosts}")
+    
+    return jsonify({
+        'success': True,
+        'fallback_hosts': fallback_hosts,
+        'message': f'{len(fallback_hosts)} fallback host(s) configured'
     })
 
 
@@ -23972,14 +24827,23 @@ def set_maintenance_mode(cluster_id, node_name):
     mgr = cluster_managers[cluster_id]
     data = request.json or {}
     enable = data.get('enable', True)
+    skip_evacuation = data.get('skip_evacuation', False)  # MK: for non-reboot updates
     usr = getattr(request, 'session', {}).get('user', 'system')
     
     if enable:
-        task = mgr.enter_maintenance_mode(node_name)
-        log_audit(usr, 'node.maintenance_entered', f"Node {node_name} entered maintenance mode", cluster=mgr.config.name)
-        broadcast_action('maintenance_enter', 'node', node_name, {'status': 'evacuating'}, cluster_id, usr)
+        task = mgr.enter_maintenance_mode(node_name, skip_evacuation=skip_evacuation)
+        
+        if skip_evacuation:
+            log_audit(usr, 'node.maintenance_entered', f"Node {node_name} entered maintenance mode (skip_evacuation=True)", cluster=mgr.config.name)
+            broadcast_action('maintenance_enter', 'node', node_name, {'status': 'completed', 'skip_evacuation': True}, cluster_id, usr)
+        else:
+            log_audit(usr, 'node.maintenance_entered', f"Node {node_name} entered maintenance mode", cluster=mgr.config.name)
+            broadcast_action('maintenance_enter', 'node', node_name, {'status': 'evacuating'}, cluster_id, usr)
+        
         return jsonify({
             'message': f'Entering maintenance mode for {node_name}',
+            'skip_evacuation': skip_evacuation,
+            'warning': 'VMs not evacuated - they may be affected if update fails!' if skip_evacuation else None,
             'task': task.to_dict()
         })
     else:
@@ -24388,6 +25252,24 @@ def remove_node_from_cluster(cluster_id, node_name):
         # Clean up maintenance task
         if node_name in maintenance_tasks:
             del maintenance_tasks[node_name]
+        
+        # MK: Clean up excluded_nodes - remove the deleted node
+        excluded = getattr(mgr.config, 'excluded_nodes', []) or []
+        if node_name in excluded:
+            excluded.remove(node_name)
+            mgr.config.excluded_nodes = excluded
+            logging.info(f"Removed {node_name} from excluded_nodes")
+        
+        # MK: Clean up fallback_hosts - remove IPs of deleted node
+        fallback = getattr(mgr.config, 'fallback_hosts', []) or []
+        node_ip = mgr._get_node_ip(node_name) if hasattr(mgr, '_get_node_ip') else None
+        if node_ip and node_ip in fallback:
+            fallback.remove(node_ip)
+            mgr.config.fallback_hosts = fallback
+            logging.info(f"Removed {node_ip} from fallback_hosts")
+        
+        # Save changes to database
+        save_config()
         
         # Log the action
         user = getattr(request, 'session', {}).get('user', 'system')
@@ -24807,6 +25689,74 @@ def get_vm_config_api(cluster_id, node, vm_type, vmid):
     
     if result['success']:
         return jsonify(result['config'])
+    else:
+        return jsonify({'error': result['error']}), 500
+
+
+@app.route('/api/clusters/<cluster_id>/vms/<node>/<vm_type>/<int:vmid>/lock', methods=['GET'])
+@require_auth(perms=['vm.view'])
+def get_vm_lock_status_api(cluster_id, node, vm_type, vmid):
+    """Get lock status of a VM/CT"""
+    ok, err = check_cluster_access(cluster_id)
+    if not ok: return err
+    
+    if cluster_id not in cluster_managers:
+        return jsonify({'error': 'Cluster not found'}), 404
+    
+    mgr = cluster_managers[cluster_id]
+    
+    try:
+        result = mgr.get_vm_lock_status(node, vmid, vm_type)
+        
+        if result.get('success'):
+            return jsonify({
+                'locked': result.get('locked', False),
+                'lock_reason': result.get('lock_reason'),
+                'lock_description': result.get('lock_description'),
+                'unlock_command': f"qm unlock {vmid}" if vm_type == 'qemu' else f"pct unlock {vmid}"
+            })
+        else:
+            # MK: Return not-locked instead of error for better UX
+            # The VM config might not be accessible but that doesn't mean it's locked
+            logging.warning(f"Could not get lock status for {vm_type}/{vmid}: {result.get('error')}")
+            return jsonify({
+                'locked': False,
+                'lock_reason': None,
+                'lock_description': None,
+                'unlock_command': None,
+                'note': 'Could not determine lock status'
+            })
+    except Exception as e:
+        logging.error(f"Error getting lock status for {vm_type}/{vmid}: {e}")
+        return jsonify({
+            'locked': False,
+            'lock_reason': None,
+            'lock_description': None,
+            'unlock_command': None
+        })
+
+
+@app.route('/api/clusters/<cluster_id>/vms/<node>/<vm_type>/<int:vmid>/unlock', methods=['POST'])
+@require_auth(perms=['vm.power'])
+def unlock_vm_api(cluster_id, node, vm_type, vmid):
+    """Unlock a VM/CT - use with caution!"""
+    ok, err = check_cluster_access(cluster_id)
+    if not ok: return err
+    
+    if cluster_id not in cluster_managers:
+        return jsonify({'error': 'Cluster not found'}), 404
+    
+    mgr = cluster_managers[cluster_id]
+    result = mgr.unlock_vm(node, vmid, vm_type)
+    
+    if result['success']:
+        usr = getattr(request, 'session', {}).get('user', 'system')
+        log_audit(usr, 'vm.unlock', f"Unlocked {vm_type}/{vmid} on {node} (was: {result.get('lock_reason', 'unknown')})", cluster=mgr.config.name)
+        return jsonify({
+            'message': result['message'],
+            'was_locked': result.get('was_locked', False),
+            'lock_reason': result.get('lock_reason')
+        })
     else:
         return jsonify({'error': result['error']}), 500
 
@@ -25862,8 +26812,14 @@ def get_hardware_options():
             'cache_modes': [{'value': '', 'label': 'Default'}],
             'machine_types': [
                 {'value': '', 'label': 'Default'},
-                {'value': 'q35', 'label': 'q35 (PCIe, modern)'},
-                {'value': 'i440fx', 'label': 'i440fx (Legacy)'},
+                {'value': 'q35', 'label': 'q35 (Latest)'},
+                {'value': 'pc-q35-10.1', 'label': 'q35 10.1'},
+                {'value': 'pc-q35-9.2+pve1', 'label': 'q35 9.2+pve1'},
+                {'value': 'pc-q35-8.2', 'label': 'q35 8.2'},
+                {'value': 'i440fx', 'label': 'i440fx (Latest)'},
+                {'value': 'pc-i440fx-10.1', 'label': 'i440fx 10.1'},
+                {'value': 'pc-i440fx-9.2+pve1', 'label': 'i440fx 9.2+pve1'},
+                {'value': 'pc-i440fx-8.2', 'label': 'i440fx 8.2'},
             ]
         })
 
@@ -27329,7 +28285,9 @@ def cross_cluster_migrate_api():
     - Setting up SSH tunnel for migration traffic
     - Cleaning up tokens after migration
     
-    Took ages to debug the SSH tunnel stuff with paramiko...
+    Known issue: For large VMs (>50GB disk), online migration may fail with
+    "401 Unauthorized" during RAM sync due to Proxmox WebSocket ticket timeout.
+    Workaround: Use offline migration for large VMs.
     """
     data = request.json or {}
     
@@ -27356,6 +28314,34 @@ def cross_cluster_migrate_api():
     source_manager = cluster_managers[source_cluster_id]
     target_manager = cluster_managers[target_cluster_id]
     
+    # MK: Check VM disk size and warn about potential issues with online migration
+    warnings = []
+    try:
+        vm_info = source_manager.get_vm_config(source_node, vmid, vm_type)
+        if vm_info.get('success'):
+            config = vm_info.get('config', {})
+            total_disk_gb = 0
+            for key, value in config.items():
+                if key.startswith(('scsi', 'virtio', 'sata', 'ide')) and 'size' in str(value):
+                    # Extract size from disk config
+                    import re
+                    size_match = re.search(r'size=(\d+)([GMT])', str(value))
+                    if size_match:
+                        size_val = int(size_match.group(1))
+                        size_unit = size_match.group(2)
+                        if size_unit == 'G':
+                            total_disk_gb += size_val
+                        elif size_unit == 'T':
+                            total_disk_gb += size_val * 1024
+                        elif size_unit == 'M':
+                            total_disk_gb += size_val / 1024
+            
+            if total_disk_gb > 100 and online:
+                warnings.append(f"VM has {total_disk_gb:.0f}GB disk - migration may take a while. Ensure stable network connection between clusters.")
+                logging.info(f"[CROSS-MIGRATE] Large VM ({total_disk_gb}GB) - migration may take extended time")
+    except Exception as e:
+        logging.debug(f"Could not check VM size: {e}")
+    
     # Generate unique token name
     import time
     token_name = f"pegaprox-migrate-{int(time.time())}"
@@ -27377,6 +28363,7 @@ def cross_cluster_migrate_api():
             raise Exception(f'Could not get target fingerprint: {fp_result.get("error")}')
         
         # Step 3: Build target endpoint string
+        # MK: Format must be exact - Proxmox is picky about this
         # Format: apitoken=PVEAPIToken=<user>!<tokenname>=<secret>,host=<host>,fingerprint=<fp>
         target_endpoint = (
             f"apitoken=PVEAPIToken={target_token['token_id']}={target_token['token_value']},"
@@ -27385,7 +28372,7 @@ def cross_cluster_migrate_api():
         )
         
         logging.info(f"Starting remote migration of {vm_type}/{vmid} from {source_cluster_id} to {target_cluster_id}...")
-        logging.info(f"Target host: {fp_result['host']}, Token user: {target_token['token_id'].split('!')[0]}")
+        logging.info(f"Target host: {fp_result['host']}, Token user: {target_token['token_id'].split('!')[0]}, Online: {online}")
         
         # Step 4: Perform the migration
         result = source_manager.remote_migrate_vm(
@@ -27408,9 +28395,10 @@ def cross_cluster_migrate_api():
             task_upid = result.get('task')
             def cleanup_token_when_done():
                 import time
-                max_wait = 3600  # Maximum 1 hour
-                poll_interval = 10  # Check every 10 seconds
+                max_wait = 7200  # Maximum 2 hours (large VMs can take a long time!)
+                poll_interval = 15  # Check every 15 seconds
                 elapsed = 0
+                min_wait_before_assuming_done = 300  # MK: Wait at least 5 minutes before assuming task is done
                 
                 logging.info(f"[TOKEN-CLEANUP] Monitoring task {task_upid} for completion...")
                 
@@ -27432,15 +28420,39 @@ def cross_cluster_migrate_api():
                                     else:
                                         logging.warning(f"[TOKEN-CLEANUP] Migration task ended with status: {status}")
                                     
+                                    # MK: Wait a bit more after task completion to be safe
+                                    # The VM might still be syncing final state
+                                    time.sleep(30)
+                                    
                                     # Task finished - delete token
                                     target_manager.delete_api_token(token_name)
                                     logging.info(f"[TOKEN-CLEANUP] Deleted migration token: {token_name}")
                                     return
                                 break
                         
-                        # If task not found in recent tasks, it might have completed and scrolled out
-                        if not task_found and elapsed > 60:
-                            logging.info(f"[TOKEN-CLEANUP] Task no longer in task list, assuming completed")
+                        # MK: Fix for Issue #19 - Don't delete token too early!
+                        # If task not found, it might have completed and scrolled out of task list
+                        # BUT we need to wait much longer to be safe (was 60s, now 5 min minimum)
+                        if not task_found and elapsed > min_wait_before_assuming_done:
+                            # Double-check: Try to verify VM exists on target cluster
+                            try:
+                                # Check if VM exists on target (migration successful)
+                                target_vms = target_manager.get_vm_resources()
+                                vm_on_target = any(
+                                    v.get('vmid') == vmid or v.get('vmid') == target_vmid
+                                    for v in (target_vms or [])
+                                )
+                                if vm_on_target:
+                                    logging.info(f"[TOKEN-CLEANUP] VM found on target cluster, migration likely successful")
+                                else:
+                                    logging.info(f"[TOKEN-CLEANUP] VM not yet on target, waiting longer...")
+                                    time.sleep(poll_interval)
+                                    elapsed += poll_interval
+                                    continue
+                            except Exception as e:
+                                logging.warning(f"[TOKEN-CLEANUP] Could not verify VM on target: {e}")
+                            
+                            logging.info(f"[TOKEN-CLEANUP] Task no longer in task list after {elapsed}s, assuming completed")
                             target_manager.delete_api_token(token_name)
                             logging.info(f"[TOKEN-CLEANUP] Deleted migration token: {token_name}")
                             return
@@ -27452,22 +28464,33 @@ def cross_cluster_migrate_api():
                     elapsed += poll_interval
                 
                 # Timeout - delete token anyway
-                logging.warning(f"[TOKEN-CLEANUP] Timeout waiting for task, deleting token anyway")
+                logging.warning(f"[TOKEN-CLEANUP] Timeout after {max_wait}s waiting for task, deleting token anyway")
                 target_manager.delete_api_token(token_name)
                 logging.info(f"[TOKEN-CLEANUP] Deleted migration token: {token_name}")
             
             cleanup_thread = threading.Thread(target=cleanup_token_when_done, daemon=True)
             cleanup_thread.start()
             
-            return jsonify({
+            response = {
                 'message': f'Cross-cluster migration started: {vm_type}/{vmid} from {source_cluster_id} to {target_cluster_id}/{target_node}',
                 'task': result.get('task'),
+                'online': online,
                 'info': 'Temporary API token will be automatically cleaned up after migration completes.'
-            })
+            }
+            if warnings:
+                response['warnings'] = warnings
+            
+            return jsonify(response)
         else:
             # Migration failed - cleanup token immediately
+            error_msg = result.get('error', 'Cross-cluster migration failed')
+            
+            # MK: Add helpful hint for 401 errors
+            if '401' in error_msg or 'Unauthorized' in error_msg or 'Broken pipe' in error_msg:
+                error_msg += ". If this persists, check PegaProx version (token cleanup timing was fixed in 0.6.2)"
+            
             target_manager.delete_api_token(token_name)
-            return jsonify({'error': result.get('error', 'Cross-cluster migration failed')}), 500
+            return jsonify({'error': error_msg}), 500
             
     except Exception as e:
         # Cleanup token on any error
@@ -28821,6 +29844,66 @@ def cleanup_deleted_scripts():
         logging.error(f"Error cleaning up deleted scripts: {e}")
 
 
+def cleanup_orphaned_excluded_vms():
+    """Remove excluded VM entries for VMs that no longer exist
+    
+    MK: This runs daily to clean up stale entries from balancing_excluded_vms
+    when VMs are deleted through other means (e.g. directly in Proxmox UI)
+    """
+    try:
+        db = get_db()
+        cursor = db.conn.cursor()
+        
+        # Get all excluded VM entries
+        cursor.execute('SELECT cluster_id, vmid FROM balancing_excluded_vms')
+        excluded_entries = cursor.fetchall()
+        
+        if not excluded_entries:
+            return
+        
+        removed_count = 0
+        
+        for entry in excluded_entries:
+            cluster_id = entry['cluster_id']
+            vmid = entry['vmid']
+            
+            # Check if cluster still exists and is connected
+            if cluster_id not in cluster_managers:
+                # Cluster no longer exists, remove entry
+                cursor.execute(
+                    'DELETE FROM balancing_excluded_vms WHERE cluster_id = ? AND vmid = ?',
+                    (cluster_id, vmid)
+                )
+                removed_count += 1
+                continue
+            
+            mgr = cluster_managers[cluster_id]
+            if not mgr.is_connected:
+                continue  # Skip if we can't verify
+            
+            # Check if VM still exists
+            try:
+                vms = mgr.get_vm_resources()
+                vm_exists = any(vm.get('vmid') == vmid for vm in vms)
+                
+                if not vm_exists:
+                    cursor.execute(
+                        'DELETE FROM balancing_excluded_vms WHERE cluster_id = ? AND vmid = ?',
+                        (cluster_id, vmid)
+                    )
+                    removed_count += 1
+                    logging.info(f"Removed orphaned excluded VM entry: cluster={cluster_id}, vmid={vmid}")
+            except Exception as e:
+                logging.debug(f"Could not verify VM {vmid} in cluster {cluster_id}: {e}")
+        
+        if removed_count > 0:
+            db.conn.commit()
+            logging.info(f"[CLEANUP] Removed {removed_count} orphaned excluded VM entries")
+            
+    except Exception as e:
+        logging.error(f"Error cleaning up orphaned excluded VMs: {e}")
+
+
 @app.route('/api/clusters/<cluster_id>/scripts', methods=['POST'])
 @require_auth(perms=['admin.scripts'])
 def create_custom_script(cluster_id):
@@ -29863,6 +30946,7 @@ def start_rolling_update(cluster_id):
     node_order = data.get('node_order', None)
     skip_up_to_date = data.get('skip_up_to_date', True)
     force_all = data.get('force_all', False)
+    skip_evacuation = data.get('skip_evacuation', False)  # MK: Issue #22 - skip VM evacuation (NOT RECOMMENDED)
     
     # MK: Configurable timeouts (GitHub Issue fix)
     evacuation_timeout = data.get('evacuation_timeout', 1800)  # 30 minutes default (was 5 min!)
@@ -29903,6 +30987,7 @@ def start_rolling_update(cluster_id):
         'started_at': time.strftime('%Y-%m-%d %H:%M:%S'),
         'include_reboot': include_reboot,
         'skip_up_to_date': skip_up_to_date,
+        'skip_evacuation': skip_evacuation,  # MK: Issue #22
         'force_all': force_all,
         'evacuation_timeout': evacuation_timeout,
         'update_timeout': update_timeout,
@@ -29922,7 +31007,10 @@ def start_rolling_update(cluster_id):
         try:
             logging.info(f"[RollingUpdate] Starting rolling update for cluster, nodes: {nodes_to_update}")
             mgr._rolling_update['logs'].append(f"[{time.strftime('%H:%M:%S')}] Rolling update started")
-            mgr._rolling_update['logs'].append(f"[{time.strftime('%H:%M:%S')}] Settings: skip_up_to_date={skip_up_to_date}, evacuation_timeout={evacuation_timeout}s")
+            mgr._rolling_update['logs'].append(f"[{time.strftime('%H:%M:%S')}] Settings: skip_up_to_date={skip_up_to_date}, skip_evacuation={skip_evacuation}, evacuation_timeout={evacuation_timeout}s")
+            
+            if skip_evacuation:
+                mgr._rolling_update['logs'].append(f"[{time.strftime('%H:%M:%S')}] ⚠️ WARNING: VM evacuation disabled - VMs may be affected if update fails!")
             
             for idx, node_name in enumerate(nodes_to_update):
                 if not hasattr(mgr, '_rolling_update') or mgr._rolling_update.get('status') != 'running':
@@ -29959,44 +31047,54 @@ def start_rolling_update(cluster_id):
                             mgr._rolling_update['logs'].append(f"[{time.strftime('%H:%M:%S')}] Found {update_count} updates available on {node_name}")
                             logging.info(f"[RollingUpdate] Node {node_name} has {update_count} updates available")
                     
-                    # Step 1: Enable maintenance mode (evacuate VMs)
+                    # Step 1: Enable maintenance mode (evacuate VMs unless skip_evacuation is set)
                     mgr._rolling_update['current_step'] = 'maintenance'
-                    mgr._rolling_update['logs'].append(f"[{time.strftime('%H:%M:%S')}] Enabling maintenance mode on {node_name}")
-                    logging.info(f"[RollingUpdate] Enabling maintenance mode on {node_name}")
-                    maintenance_task = mgr.enter_maintenance_mode(node_name)
+                    if skip_evacuation:
+                        mgr._rolling_update['logs'].append(f"[{time.strftime('%H:%M:%S')}] Enabling maintenance mode on {node_name} (SKIP EVACUATION)")
+                        logging.info(f"[RollingUpdate] Enabling maintenance mode on {node_name} (skip_evacuation=True)")
+                    else:
+                        mgr._rolling_update['logs'].append(f"[{time.strftime('%H:%M:%S')}] Enabling maintenance mode on {node_name}")
+                        logging.info(f"[RollingUpdate] Enabling maintenance mode on {node_name}")
+                    
+                    maintenance_task = mgr.enter_maintenance_mode(node_name, skip_evacuation=skip_evacuation)
                     
                     if not maintenance_task:
                         logging.error(f"[RollingUpdate] Failed to start maintenance mode on {node_name}")
                         raise Exception(f"Failed to start maintenance mode")
                     
-                    # Wait for evacuation to complete
-                    mgr._rolling_update['current_step'] = 'evacuating'
-                    mgr._rolling_update['logs'].append(f"[{time.strftime('%H:%M:%S')}] Waiting for VM evacuation (timeout: {evacuation_timeout}s)...")
-                    waited = 0
-                    evacuation_completed = False
-                    last_progress_log = 0
-                    
-                    while waited < evacuation_timeout:
-                        # Check maintenance task status directly
-                        if node_name in mgr.nodes_in_maintenance:
-                            maintenance_task = mgr.nodes_in_maintenance[node_name]
-                            if maintenance_task.status in ['completed', 'completed_with_errors']:
-                                mgr._rolling_update['logs'].append(f"[{time.strftime('%H:%M:%S')}] ✓ Evacuation completed")
-                                evacuation_completed = True
-                                break
-                            else:
-                                # Log progress every 30 seconds
-                                if waited - last_progress_log >= 30:
-                                    if hasattr(maintenance_task, 'migrated_vms') and hasattr(maintenance_task, 'total_vms'):
-                                        mgr._rolling_update['logs'].append(f"[{time.strftime('%H:%M:%S')}] Evacuating: {maintenance_task.migrated_vms}/{maintenance_task.total_vms} VMs migrated ({waited}s elapsed)")
-                                    else:
-                                        mgr._rolling_update['logs'].append(f"[{time.strftime('%H:%M:%S')}] Evacuation in progress... ({waited}s elapsed)")
-                                    last_progress_log = waited
-                        time.sleep(5)
-                        waited += 5
-                    
-                    if not evacuation_completed:
-                        raise Exception(f"Evacuation timed out after {evacuation_timeout}s - consider increasing evacuation_timeout")
+                    # Wait for evacuation to complete (unless skipped)
+                    if skip_evacuation:
+                        mgr._rolling_update['current_step'] = 'updating'
+                        mgr._rolling_update['logs'].append(f"[{time.strftime('%H:%M:%S')}] ⚠️ Skipping VM evacuation - VMs remain on node")
+                        evacuation_completed = True
+                    else:
+                        mgr._rolling_update['current_step'] = 'evacuating'
+                        mgr._rolling_update['logs'].append(f"[{time.strftime('%H:%M:%S')}] Waiting for VM evacuation (timeout: {evacuation_timeout}s)...")
+                        waited = 0
+                        evacuation_completed = False
+                        last_progress_log = 0
+                        
+                        while waited < evacuation_timeout:
+                            # Check maintenance task status directly
+                            if node_name in mgr.nodes_in_maintenance:
+                                maintenance_task = mgr.nodes_in_maintenance[node_name]
+                                if maintenance_task.status in ['completed', 'completed_with_errors']:
+                                    mgr._rolling_update['logs'].append(f"[{time.strftime('%H:%M:%S')}] ✓ Evacuation completed")
+                                    evacuation_completed = True
+                                    break
+                                else:
+                                    # Log progress every 30 seconds
+                                    if waited - last_progress_log >= 30:
+                                        if hasattr(maintenance_task, 'migrated_vms') and hasattr(maintenance_task, 'total_vms'):
+                                            mgr._rolling_update['logs'].append(f"[{time.strftime('%H:%M:%S')}] Evacuating: {maintenance_task.migrated_vms}/{maintenance_task.total_vms} VMs migrated ({waited}s elapsed)")
+                                        else:
+                                            mgr._rolling_update['logs'].append(f"[{time.strftime('%H:%M:%S')}] Evacuation in progress... ({waited}s elapsed)")
+                                        last_progress_log = waited
+                            time.sleep(5)
+                            waited += 5
+                        
+                        if not evacuation_completed:
+                            raise Exception(f"Evacuation timed out after {evacuation_timeout}s - consider increasing evacuation_timeout")
                     
                     # Step 2: Run apt update/upgrade
                     mgr._rolling_update['current_step'] = 'updating'
@@ -30152,6 +31250,331 @@ def clear_rolling_update_status(cluster_id):
             return jsonify({'error': 'Cannot clear running update'}), 400
     
     return jsonify({'success': True, 'message': 'Nothing to clear'})
+
+
+# ============================================
+# Scheduled Updates API
+# MK: Automatic rolling update scheduling (SQLite storage)
+# ============================================
+
+def load_update_schedule(cluster_id: str) -> dict:
+    """Load update schedule for a cluster from SQLite"""
+    default = {
+        'enabled': False,
+        'schedule_type': 'recurring',
+        'day': 'sunday',
+        'time': '03:00',
+        'include_reboot': True,
+        'skip_evacuation': False,
+        'skip_up_to_date': True,
+        'evacuation_timeout': 1800,
+        'last_run': None,
+        'next_run': None
+    }
+    try:
+        db = get_db()
+        cursor = db.conn.cursor()
+        
+        # MK: Ensure table exists (migration for existing databases)
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS update_schedules (
+                cluster_id TEXT PRIMARY KEY,
+                enabled INTEGER DEFAULT 0,
+                schedule_type TEXT DEFAULT 'recurring',
+                day TEXT DEFAULT 'sunday',
+                time TEXT DEFAULT '03:00',
+                include_reboot INTEGER DEFAULT 1,
+                skip_evacuation INTEGER DEFAULT 0,
+                skip_up_to_date INTEGER DEFAULT 1,
+                evacuation_timeout INTEGER DEFAULT 1800,
+                last_run TEXT,
+                next_run TEXT,
+                created_by TEXT,
+                created_at TEXT,
+                updated_at TEXT
+            )
+        ''')
+        
+        cursor.execute('SELECT * FROM update_schedules WHERE cluster_id = ?', (cluster_id,))
+        row = cursor.fetchone()
+        if row:
+            return {
+                'enabled': bool(row['enabled']),
+                'schedule_type': row['schedule_type'] or 'recurring',
+                'day': row['day'] or 'sunday',
+                'time': row['time'] or '03:00',
+                'include_reboot': bool(row['include_reboot']),
+                'skip_evacuation': bool(row['skip_evacuation']),
+                'skip_up_to_date': bool(row['skip_up_to_date']),
+                'evacuation_timeout': row['evacuation_timeout'] or 1800,
+                'last_run': row['last_run'],
+                'next_run': row['next_run']
+            }
+    except Exception as e:
+        logging.error(f"Error loading update schedule: {e}")
+    return default
+
+
+def save_update_schedule(cluster_id: str, schedule: dict, user: str = 'system'):
+    """Save update schedule for a cluster to SQLite"""
+    try:
+        db = get_db()
+        cursor = db.conn.cursor()
+        now = datetime.now().isoformat()
+        
+        # MK: Use INSERT OR REPLACE for older SQLite compatibility
+        cursor.execute('''
+            INSERT OR REPLACE INTO update_schedules 
+            (cluster_id, enabled, schedule_type, day, time, include_reboot, skip_evacuation, 
+             skip_up_to_date, evacuation_timeout, last_run, next_run, created_by, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ''', (
+            cluster_id,
+            1 if schedule.get('enabled') else 0,
+            schedule.get('schedule_type', 'recurring'),
+            schedule.get('day', 'sunday'),
+            schedule.get('time', '03:00'),
+            1 if schedule.get('include_reboot', True) else 0,
+            1 if schedule.get('skip_evacuation', False) else 0,
+            1 if schedule.get('skip_up_to_date', True) else 0,
+            schedule.get('evacuation_timeout', 1800),
+            schedule.get('last_run'),
+            schedule.get('next_run'),
+            user,
+            now,
+            now
+        ))
+        db.conn.commit()
+    except Exception as e:
+        logging.error(f"Error saving update schedule: {e}")
+
+
+def update_schedule_last_run(cluster_id: str, last_run: str, next_run: str):
+    """Update last_run and next_run for a schedule"""
+    try:
+        db = get_db()
+        cursor = db.conn.cursor()
+        cursor.execute('''
+            UPDATE update_schedules SET last_run = ?, next_run = ?, updated_at = ?
+            WHERE cluster_id = ?
+        ''', (last_run, next_run, datetime.now().isoformat(), cluster_id))
+        db.conn.commit()
+    except Exception as e:
+        logging.error(f"Error updating schedule last_run: {e}")
+
+
+def load_all_update_schedules() -> dict:
+    """Load all enabled update schedules from SQLite"""
+    schedules = {}
+    try:
+        db = get_db()
+        cursor = db.conn.cursor()
+        cursor.execute('SELECT * FROM update_schedules WHERE enabled = 1')
+        for row in cursor.fetchall():
+            schedules[row['cluster_id']] = {
+                'enabled': bool(row['enabled']),
+                'schedule_type': row['schedule_type'] or 'recurring',
+                'day': row['day'] or 'sunday',
+                'time': row['time'] or '03:00',
+                'include_reboot': bool(row['include_reboot']),
+                'skip_evacuation': bool(row['skip_evacuation']),
+                'skip_up_to_date': bool(row['skip_up_to_date']),
+                'evacuation_timeout': row['evacuation_timeout'] or 1800,
+                'last_run': row['last_run'],
+                'next_run': row['next_run']
+            }
+    except Exception as e:
+        logging.error(f"Error loading all update schedules: {e}")
+    return schedules
+
+
+@app.route('/api/clusters/<cluster_id>/updates/schedule', methods=['GET'])
+@require_auth(perms=['cluster.view'])
+def get_update_schedule(cluster_id):
+    """Get the scheduled update configuration for a cluster"""
+    ok, err = check_cluster_access(cluster_id)
+    if not ok: return err
+    
+    schedule = load_update_schedule(cluster_id)
+    return jsonify(schedule)
+
+
+@app.route('/api/clusters/<cluster_id>/updates/schedule', methods=['POST'])
+@require_auth(roles=[ROLE_ADMIN])
+def set_update_schedule(cluster_id):
+    """Set the scheduled update configuration for a cluster"""
+    if cluster_id not in cluster_managers:
+        return jsonify({'error': 'Cluster not found'}), 404
+    
+    data = request.json or {}
+    usr = getattr(request, 'session', {}).get('user', 'system')
+    
+    schedule = {
+        'enabled': data.get('enabled', False),
+        'schedule_type': data.get('schedule_type', 'recurring'),
+        'day': data.get('day', 'sunday'),
+        'time': data.get('time', '03:00'),
+        'include_reboot': data.get('include_reboot', True),
+        'skip_evacuation': data.get('skip_evacuation', False),
+        'skip_up_to_date': data.get('skip_up_to_date', True),
+        'evacuation_timeout': data.get('evacuation_timeout', 1800),
+        'last_run': None,
+        'next_run': None
+    }
+    
+    # Calculate next run time
+    if schedule['enabled']:
+        schedule['next_run'] = calculate_next_update_run(schedule['day'], schedule['time'])
+    
+    save_update_schedule(cluster_id, schedule, usr)
+    
+    # Log audit
+    mgr = cluster_managers[cluster_id]
+    log_audit(usr, 'update.schedule', f"Update schedule {'enabled' if schedule['enabled'] else 'disabled'} for {mgr.config.name}", cluster=mgr.config.name)
+    
+    return jsonify({'success': True, 'schedule': schedule})
+
+
+@app.route('/api/clusters/<cluster_id>/updates/schedule', methods=['DELETE'])
+@require_auth(roles=[ROLE_ADMIN])
+def delete_update_schedule(cluster_id):
+    """Delete/disable the scheduled update for a cluster"""
+    if cluster_id not in cluster_managers:
+        return jsonify({'error': 'Cluster not found'}), 404
+    
+    try:
+        db = get_db()
+        cursor = db.conn.cursor()
+        cursor.execute('DELETE FROM update_schedules WHERE cluster_id = ?', (cluster_id,))
+        db.conn.commit()
+        
+        usr = getattr(request, 'session', {}).get('user', 'system')
+        mgr = cluster_managers[cluster_id]
+        log_audit(usr, 'update.schedule.deleted', f"Update schedule deleted for {mgr.config.name}", cluster=mgr.config.name)
+        
+        return jsonify({'success': True})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+def calculate_next_update_run(day: str, time_str: str) -> str:
+    """Calculate the next scheduled run time"""
+    try:
+        now = datetime.now()
+        hour, minute = map(int, time_str.split(':'))
+        
+        day_map = {
+            'monday': 0, 'tuesday': 1, 'wednesday': 2, 'thursday': 3,
+            'friday': 4, 'saturday': 5, 'sunday': 6, 'daily': -1
+        }
+        
+        target_day = day_map.get(day.lower(), -1)
+        
+        if target_day == -1:  # Daily
+            next_run = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+            if next_run <= now:
+                next_run += timedelta(days=1)
+        else:
+            days_ahead = target_day - now.weekday()
+            if days_ahead < 0:
+                days_ahead += 7
+            next_run = now + timedelta(days=days_ahead)
+            next_run = next_run.replace(hour=hour, minute=minute, second=0, microsecond=0)
+            if next_run <= now:
+                next_run += timedelta(days=7)
+        
+        return next_run.strftime('%Y-%m-%d %H:%M:%S')
+    except Exception as e:
+        logging.error(f"Error calculating next run: {e}")
+        return None
+
+
+def check_scheduled_updates():
+    """Check if any scheduled updates should run - called by scheduler"""
+    try:
+        schedules = load_all_update_schedules()
+        now = datetime.now()
+        
+        for cluster_id, schedule in schedules.items():
+            if not schedule.get('enabled'):
+                continue
+            
+            if cluster_id not in cluster_managers:
+                continue
+            
+            mgr = cluster_managers[cluster_id]
+            if not mgr.is_connected:
+                continue
+            
+            # Check schedule_type - 'once' schedules that already ran should be skipped
+            schedule_type = schedule.get('schedule_type', 'recurring')
+            if schedule_type == 'once' and schedule.get('last_run'):
+                continue
+            
+            # Check if it's time to run
+            day = schedule.get('day', 'sunday')
+            time_str = schedule.get('time', '03:00')
+            
+            try:
+                hour, minute = map(int, time_str.split(':'))
+            except:
+                continue
+            
+            day_map = {
+                'monday': 0, 'tuesday': 1, 'wednesday': 2, 'thursday': 3,
+                'friday': 4, 'saturday': 5, 'sunday': 6
+            }
+            
+            is_correct_day = (day == 'daily' or now.weekday() == day_map.get(day.lower(), -1))
+            is_correct_time = now.hour == hour and now.minute == minute
+            
+            if is_correct_day and is_correct_time:
+                # Check if already ran today (for recurring)
+                if schedule_type == 'recurring':
+                    last_run = schedule.get('last_run')
+                    if last_run:
+                        try:
+                            last_run_date = datetime.fromisoformat(last_run).date()
+                            if last_run_date == now.date():
+                                continue  # Already ran today
+                        except:
+                            pass
+                
+                # Check if rolling update already running
+                if hasattr(mgr, '_rolling_update') and mgr._rolling_update:
+                    if mgr._rolling_update.get('status') == 'running':
+                        continue
+                
+                logging.info(f"[SCHEDULER] Starting scheduled update for cluster {cluster_id} (type: {schedule_type})")
+                
+                # Execute the scheduled rolling update
+                action = {
+                    'cluster_id': cluster_id,
+                    'action': 'rolling_update',
+                    'config': {
+                        'include_reboot': schedule.get('include_reboot', True),
+                        'skip_evacuation': schedule.get('skip_evacuation', False),
+                        'skip_up_to_date': schedule.get('skip_up_to_date', True),
+                        'evacuation_timeout': schedule.get('evacuation_timeout', 1800)
+                    }
+                }
+                
+                execute_scheduled_rolling_update(mgr, cluster_id, action)
+                
+                # Update last run time
+                last_run_str = now.isoformat()
+                next_run_str = calculate_next_update_run(day, time_str) if schedule_type == 'recurring' else None
+                update_schedule_last_run(cluster_id, last_run_str, next_run_str)
+                
+                # Disable 'once' schedules after running
+                if schedule_type == 'once':
+                    schedule['enabled'] = False
+                    schedule['last_run'] = last_run_str
+                    save_update_schedule(cluster_id, schedule)
+                    logging.info(f"[SCHEDULER] One-time schedule disabled for {cluster_id}")
+                
+    except Exception as e:
+        logging.error(f"Error checking scheduled updates: {e}")
 
 
 # ============================================
