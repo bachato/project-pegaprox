@@ -1,4 +1,4 @@
-FROM alpine:latest
+FROM alpine:3.23.3
 LABEL org.label-schema.name="PegaProx"
 LABEL org.label-schema.description="PegaProx - A powerful datacenter management for Proxmox VE clusters."
 LABEL org.label-schema.vendor="PegaProx"
@@ -8,7 +8,7 @@ LABEL maintainer="support@pegaprox.com"
 
 ENV PEGAPROX_CONFIG_DIR=/app/pegaprox/config
 
-RUN apk add --no-cache python3 py3-pip \
+RUN apk add --no-cache python3=~3.12 py3-pip \
   && addgroup -S pegaprox \
   && adduser -S -G pegaprox -h /home/pegaprox pegaprox \
   && mkdir -p /app/conf /opt/venv \
