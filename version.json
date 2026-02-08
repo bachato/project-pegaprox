@@ -20,6 +20,7 @@
         "Added: Support Bundle generation for troubleshooting",
         "Added: API Token Management - create, list, and revoke Bearer tokens for programmatic access (scripts, CI/CD, monitoring)",
         "Added: Storage Rescan functionality",
+        "Added: Taskbar expand when new Task occurs can be disabled under my profile",
         "Fixed: SSE/Taskbar oscillation bug in 'All Clusters' view causing excessive re-renders",
         "Fixed: Node IP resolution now happens BEFORE pvecm delnode to prevent cleanup running on wrong node",
         "Fixed: Taskbar expand icon changed from ChevronUp to ChevronDown (thanks @gyptazy)",
