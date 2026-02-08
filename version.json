@@ -1,7 +1,7 @@
 {
-    "version": "0.6.4",
-    "build": "2026.02.01",
-    "release_date": "2026-02-01",
+    "version": "0.6.5",
+    "build": "2026.02.08",
+    "release_date": "2026-02-08",
     "min_python": "3.8",
     "download_url": "https://github.com/PegaProx/project-pegaprox/releases/latest",
     "update_files": [
@@ -11,20 +11,22 @@
     ],
     "changelog": [
         "Important: Due to high demand, PegaProx releases will now be weekly due to shortage of our capacity to handle support requests. Please wait patiently.",
-        "Added: SSH Rate Limiting for large clusters (15+ nodes) - prevents connection exhaustion during batch operations",
-        "Added: Two-tier SSH system - HA operations (fencing, heartbeat) always have priority over normal operations",
-        "Added: SSH retry logic with exponential backoff (3 attempts: immediate, 2s, 4s delay)",
-        "Added: Pool Permissions - grant users/groups access to Proxmox Resource Pools (requires manual refresh due to Proxmox API)",
-        "Added: Pool Manager - create, edit, delete pools and assign VMs directly from PegaProx",
-        "Added: Proxmox Native HA Settings in Datacenter Options",
-        "Added: Expanded Datacenter Options (bandwidth limits, tag settings, resource scheduling)",
-        "Added: More functions in Setup Wizard",
-        "Added: Dynamic password policy hints in all password forms (fetched from server settings)",
-        "Fixed: Password Policy Bug in Settings Modal (ReferenceError: settings is not defined)",
-        "Fixed: Theme save issue",
-        "Fixed: Bulk Migration Modal now fully translated (German/English)",
-        "Improved: SSH_MAX_CONCURRENT default increased to 25 (configurable via environment variable)",
-        "Improved: 1 second delay between nodes during batch deploy operations"
+        "Added: SDN (Software Defined Networking) Management - view and manage zones, vnets, subnets, controllers, IPAM, and DNS (GitHub Issue #38)",
+        "Added: Easy Setup Multipath support for ISCSI",
+        "Added: Remove Node from Cluster - runs pvecm delnode with automatic cleanup of stale config on removed node via SSH",
+        "Added: Move Node to another Cluster - automated 3-step flow: remove from source, cleanup, force join to target",
+        "Added: SSH multipath detection with credential fallbacks for cluster operations",
+        "Added: Node IP resolution via vmbr0 bridge interface - more reliable than hostname/DNS lookup in multi-network setups",
+        "Added: Support Bundle generation for troubleshooting",
+        "Added: API Token Management - create, list, and revoke Bearer tokens for programmatic access (scripts, CI/CD, monitoring)",
+        "Added: Storage Rescan functionality",
+        "Fixed: SSE/Taskbar oscillation bug in 'All Clusters' view causing excessive re-renders",
+        "Fixed: Node IP resolution now happens BEFORE pvecm delnode to prevent cleanup running on wrong node",
+        "Fixed: Taskbar expand icon changed from ChevronUp to ChevronDown (thanks @gyptazy)",
+        "Improved: Node removal buttons relocated from maintenance-start dialog to maintenance-completed section (logical flow)",
+        "Improved: Offline node check changed from blocker to warning (pvecm delnode runs on remaining online node, not target)",
+        "Improved: Force Join checkbox always visible with auto-check when old config detected",
+        "Improved: Cleanup scripts use killall -9 for reliable pmxcfs termination"
     ],
     "breaking_changes": []
 }

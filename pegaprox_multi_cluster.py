@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 PegaProx Server - Cluster Management Backend for Proxmox VE
-Version: 0.6.4 Beta
+Version: 0.6.5 Beta
 
 Copyright (C) 2025-2026 PegaProx Team
 
@@ -99,6 +99,7 @@ import ssl
 import base64
 import hashlib
 import hmac
+import secrets  # MK: Feb 2026 - for API token generation
 import multiprocessing
 import signal
 import gc
@@ -271,8 +272,8 @@ app = Flask(__name__)
 # =============================================================================
 # VERSION INFO
 # =============================================================================
-PEGAPROX_VERSION = "Beta 0.6.4"
-PEGAPROX_BUILD = "2026.02.01"  # Year.Month.Day of release
+PEGAPROX_VERSION = "Beta 0.6.5"
+PEGAPROX_BUILD = "2026.02.08"  # Year.Month.Day of release
 
 # ============================================
 # CORS Configuration (Security)
@@ -695,7 +696,8 @@ class PegaProxDB:
                 enabled INTEGER DEFAULT 1,
                 theme TEXT DEFAULT '',
                 language TEXT DEFAULT '',
-                ui_layout TEXT DEFAULT 'modern'
+                ui_layout TEXT DEFAULT 'modern',
+                taskbar_auto_expand INTEGER DEFAULT 1
             )
         ''')
         
@@ -730,6 +732,23 @@ class PegaProxDB:
         ''')
         cursor.execute('''
             CREATE INDEX IF NOT EXISTS idx_audit_user ON audit_log(user)
+        ''')
+        
+        # NS: Task-User mapping table for tracking who initiated tasks
+        # This persists across server restarts and is visible to all users
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS task_users (
+                upid TEXT PRIMARY KEY,
+                username TEXT NOT NULL,
+                cluster_id TEXT,
+                created_at TEXT NOT NULL
+            )
+        ''')
+        
+        # Cleanup old task_users entries (older than 24 hours)
+        cursor.execute('''
+            DELETE FROM task_users 
+            WHERE datetime(created_at) < datetime('now', '-24 hours')
         ''')
         
         # Alerts table
@@ -1055,6 +1074,29 @@ class PegaProxDB:
         cursor.execute('''
             CREATE INDEX IF NOT EXISTS idx_pool_perms_pool ON pool_permissions(cluster_id, pool_id)
         ''')
+        # LW: Feb 2026 - API Tokens for programmatic access without sessions
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS api_tokens (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                token_hash TEXT NOT NULL UNIQUE,
+                token_prefix TEXT NOT NULL,
+                username TEXT NOT NULL,
+                name TEXT NOT NULL,
+                role TEXT DEFAULT 'viewer',
+                permissions TEXT DEFAULT '[]',
+                expires_at TEXT,
+                last_used_at TEXT,
+                last_used_ip TEXT,
+                created_at TEXT NOT NULL,
+                revoked INTEGER DEFAULT 0
+            )
+        ''')
+        cursor.execute('''
+            CREATE INDEX IF NOT EXISTS idx_api_tokens_hash ON api_tokens(token_hash)
+        ''')
+        cursor.execute('''
+            CREATE INDEX IF NOT EXISTS idx_api_tokens_user ON api_tokens(username)
+        ''')
         
         # Schema migrations for existing databases
         # Add password_salt column if it doesn't exist (for databases created before this fix)
@@ -1117,6 +1159,15 @@ class PegaProxDB:
                     logging.info("Added totp_pending_secret_encrypted column to users table")
                 except Exception as e:
                     logging.error(f"Failed to add totp_pending_secret_encrypted column: {e}")
+            
+            # NS: Add taskbar_auto_expand column for user preferences - Feb 2026
+            if 'taskbar_auto_expand' not in columns:
+                logging.info("Adding taskbar_auto_expand column to users table...")
+                try:
+                    cursor.execute("ALTER TABLE users ADD COLUMN taskbar_auto_expand INTEGER DEFAULT 1")
+                    logging.info("Added taskbar_auto_expand column to users table")
+                except Exception as e:
+                    logging.error(f"Failed to add taskbar_auto_expand column: {e}")
                     
         except Exception as e:
             logging.error(f"Error checking users schema: {e}")
@@ -2291,6 +2342,11 @@ class PegaProxDB:
                 'totp_enabled': bool(row_dict.get('totp_enabled', 0)),
                 'force_password_change': bool(row_dict.get('force_password_change', 0)),
                 'enabled': bool(row_dict.get('enabled', 1)),
+                # NS: User preferences - these were missing!
+                'theme': row_dict.get('theme', ''),
+                'language': row_dict.get('language', ''),
+                'ui_layout': row_dict.get('ui_layout', 'modern'),
+                'taskbar_auto_expand': bool(row_dict.get('taskbar_auto_expand', 1)),
             }
         
         return users
@@ -2332,6 +2388,7 @@ class PegaProxDB:
             'theme': row_dict.get('theme', ''),
             'language': row_dict.get('language', ''),
             'ui_layout': row_dict.get('ui_layout', 'modern'),
+            'taskbar_auto_expand': bool(row_dict.get('taskbar_auto_expand', 1)),  # NS: Feb 2026
         }
     
     def save_user(self, username: str, data: dict):
@@ -2344,10 +2401,10 @@ class PegaProxDB:
             (username, password_salt, password_hash, role, permissions, tenant, 
              created_at, last_login, password_expiry, 
              totp_secret_encrypted, totp_pending_secret_encrypted, totp_enabled, force_password_change,
-             enabled, theme, language, ui_layout)
+             enabled, theme, language, ui_layout, taskbar_auto_expand)
             VALUES (?, ?, ?, ?, ?, ?, 
                     COALESCE((SELECT created_at FROM users WHERE username = ?), ?), 
-                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ''', (
             username,
             data.get('password_salt', ''),
@@ -2365,7 +2422,8 @@ class PegaProxDB:
             1 if data.get('enabled', True) else 0,
             data.get('theme', ''),
             data.get('language', ''),
-            data.get('ui_layout', 'modern')
+            data.get('ui_layout', 'modern'),
+            1 if data.get('taskbar_auto_expand', True) else 0  # NS: Feb 2026
         ))
         self.conn.commit()
     
@@ -3278,6 +3336,99 @@ def _ssh_track_connection(conn_type: str, delta: int):
 # MK: this is in-memory, will be lost on restart
 # TODO: persist to redis or file?
 active_sessions = {}  # session_id -> {user, created_at, last_activity, role}
+
+# NS: Track PegaProx user who initiated each task (UPID -> username)
+# This allows us to show who triggered a task in the UI, not just the Proxmox user (root@pam)
+# Now persisted to database so it survives restarts and is visible to all users
+task_pegaprox_users_cache = {}  # In-memory cache for fast lookups
+task_pegaprox_users_lock = threading.Lock()
+TASK_USER_CACHE_TTL = 86400  # Keep for 24 hours (in DB, will be cleaned on startup)
+
+def register_task_user(upid: str, username: str, cluster_id: str = None):
+    """Register which PegaProx user initiated a task - persists to database"""
+    if not upid or not username:
+        return
+    
+    # Update in-memory cache
+    with task_pegaprox_users_lock:
+        task_pegaprox_users_cache[upid] = {'user': username, 'timestamp': time.time()}
+    
+    # Persist to database
+    try:
+        db = get_db()
+        cursor = db.conn.cursor()
+        cursor.execute('''
+            INSERT OR REPLACE INTO task_users (upid, username, cluster_id, created_at)
+            VALUES (?, ?, ?, ?)
+        ''', (upid, username, cluster_id, datetime.now().isoformat()))
+        db.conn.commit()
+    except Exception as e:
+        logging.debug(f"Failed to persist task user to DB: {e}")
+
+def get_task_user(upid: str) -> str:
+    """Get PegaProx user who initiated a task - checks cache first, then database"""
+    if not upid:
+        return None
+    
+    # Check in-memory cache first (fast path)
+    with task_pegaprox_users_lock:
+        data = task_pegaprox_users_cache.get(upid)
+        if data:
+            return data.get('user')
+    
+    # Check database (slow path, but persists across restarts)
+    try:
+        db = get_db()
+        cursor = db.conn.cursor()
+        cursor.execute('SELECT username FROM task_users WHERE upid = ?', (upid,))
+        row = cursor.fetchone()
+        if row:
+            username = row[0]
+            # Update cache for future lookups
+            with task_pegaprox_users_lock:
+                task_pegaprox_users_cache[upid] = {'user': username, 'timestamp': time.time()}
+            return username
+    except Exception as e:
+        logging.debug(f"Failed to get task user from DB: {e}")
+    
+    return None
+
+
+def push_immediate_update(cluster_id: str, delay: float = 0.3):
+    """
+    NS: Push immediate SSE update for faster UI feedback
+    
+    Called after VM actions (start, stop, migrate, clone, delete, etc.)
+    to immediately broadcast updated resources and tasks.
+    
+    Args:
+        cluster_id: Cluster to update
+        delay: Seconds to wait for Proxmox to update (default 0.3s)
+    """
+    def _push():
+        time.sleep(delay)
+        try:
+            if cluster_id not in cluster_managers:
+                return
+            manager = cluster_managers[cluster_id]
+            if not manager.is_connected:
+                return
+            
+            # Push resources
+            # NS: Fixed - was calling get_all_resources() which doesn't exist
+            resources = manager.get_vm_resources()
+            if resources:
+                broadcast_sse('resources', resources, cluster_id)
+            
+            # Push tasks
+            tasks = manager.get_tasks(limit=50)
+            if tasks:
+                broadcast_sse('tasks', tasks, cluster_id)
+                
+        except Exception as e:
+            logging.debug(f"[SSE] Immediate push failed for {cluster_id}: {e}")
+    
+    threading.Thread(target=_push, daemon=True).start()
 
 # Global audit log (in-memory cache, persisted to file)
 audit_log = []
@@ -4677,6 +4828,46 @@ class PegaProxManager:
                 self.is_connected = False
                 self.connection_error = str(e)
             raise
+    
+    def api_request(self, method: str, endpoint: str, data: dict = None):
+        """Generic API request wrapper - NS Jan 2026
+        
+        Convenience method that routes to the appropriate _api_* method.
+        Used by cluster join/discovery features.
+        
+        Args:
+            method: HTTP method (GET, POST, PUT, DELETE)
+            endpoint: API endpoint (e.g., '/nodes', '/cluster/config/join')
+            data: Optional data for POST/PUT requests
+            
+        Returns:
+            Parsed JSON response data or None on error
+        """
+        host = self.current_host or self.config.host
+        url = f'https://{host}:8006/api2/json{endpoint}'
+        
+        try:
+            if method.upper() == 'GET':
+                r = self._api_get(url, verify=self._ssl_verify)
+            elif method.upper() == 'POST':
+                r = self._api_post(url, json=data, verify=self._ssl_verify)
+            elif method.upper() == 'PUT':
+                r = self._api_put(url, json=data, verify=self._ssl_verify)
+            elif method.upper() == 'DELETE':
+                r = self._api_delete(url, verify=self._ssl_verify)
+            else:
+                self.logger.error(f"Unknown HTTP method: {method}")
+                return None
+            
+            if r.status_code == 200:
+                return r.json().get('data')
+            else:
+                self.logger.warning(f"API request failed: {method} {endpoint} -> {r.status_code}")
+                return None
+                
+        except Exception as e:
+            self.logger.error(f"API request error: {method} {endpoint} -> {e}")
+            return None
         
     def connect_to_proxmox(self) -> bool:
         # connect with fallback
@@ -5211,6 +5402,13 @@ class PegaProxManager:
         """
         if exclude_nodes is None:
             exclude_nodes = []
+        
+        # NS: GitHub #40 - Exclude rebooting nodes
+        if hasattr(self, '_rolling_update') and self._rolling_update:
+            rebooting = self._rolling_update.get('rebooting_nodes', [])
+            if rebooting:
+                exclude_nodes = list(set(exclude_nodes + rebooting))
+                self.logger.debug(f"Excluding rebooting nodes: {rebooting}")
         
         # LW: Also exclude nodes configured in cluster settings
         config_excluded = getattr(self.config, 'excluded_nodes', []) or []
@@ -9073,9 +9271,14 @@ echo "AGENT_INSTALLED_OK"
                         'status': task.get('status', 'running'),
                         'starttime': task.get('starttime'),
                         'endtime': task.get('endtime'),
-                        'user': task.get('user', ''),
+                        'user': task.get('user', ''),  # Proxmox user (e.g. root@pam)
                         'id': task.get('id', ''),
                     }
+                    
+                    # NS: Add PegaProx user who initiated this task (if known)
+                    pegaprox_user = get_task_user(task_info['upid'])
+                    if pegaprox_user:
+                        task_info['pegaprox_user'] = pegaprox_user
                     
                     # Parse VMID from ID if present
                     if task_info['id']:
@@ -9085,7 +9288,7 @@ echo "AGENT_INSTALLED_OK"
                             task_info['vmid'] = task_info['id']
                     
                     # Get exit status for completed tasks
-                    if task.get('status') and task['status'] != 'running':
+                    if getattr(task, 'status', None) and task['status'] != 'running':
                         task_info['exitstatus'] = task.get('exitstatus', '')
                         # Mark as failed if exit status indicates error
                         if task_info['exitstatus'] and 'error' in task_info['exitstatus'].lower():
@@ -9308,95 +9511,161 @@ echo "AGENT_INSTALLED_OK"
             return {'success': False, 'error': str(e)}
     
     def _get_node_ip(self, node_name: str) -> Optional[str]:
-        # get node IP
+        """Get the best IP address for a node.
+        
+        NS: Feb 2026 - Improved logic for multi-network setups:
+        
+        Priority order:
+        1. vmbr0 (or vmbr*) IP in same subnet as primary cluster connection
+        2. Any interface IP in same subnet as primary cluster connection  
+        3. Corosync link IP in same subnet as primary
+        4. Any Corosync link IP
+        5. Any public IP
+        6. Any private IP
+        
+        This ensures we always try to use the Management network (vmbr0) first,
+        which is where the user connected from.
+        """
         try:
-            # First try to get from Proxmox API
             if not self.is_connected:
                 if not self.connect_to_proxmox():
                     return None
             
             host = self.current_host or self.config.host
+            primary_parts = self.config.host.split('.')
+            
+            def is_same_subnet(ip):
+                """Check if IP is in same /24 subnet as primary connection"""
+                parts = ip.split('.')
+                return (len(parts) >= 3 and len(primary_parts) >= 3 and
+                       parts[0] == primary_parts[0] and
+                       parts[1] == primary_parts[1] and
+                       parts[2] == primary_parts[2])
+            
+            def is_private(ip):
+                """Check if IP is private"""
+                return (ip.startswith('10.') or 
+                       ip.startswith('192.168.') or 
+                       ip.startswith('172.16.') or ip.startswith('172.17.') or
+                       ip.startswith('172.18.') or ip.startswith('172.19.') or
+                       ip.startswith('172.20.') or ip.startswith('172.21.') or
+                       ip.startswith('172.22.') or ip.startswith('172.23.') or
+                       ip.startswith('172.24.') or ip.startswith('172.25.') or
+                       ip.startswith('172.26.') or ip.startswith('172.27.') or
+                       ip.startswith('172.28.') or ip.startswith('172.29.') or
+                       ip.startswith('172.30.') or ip.startswith('172.31.'))
+            
+            # === STEP 1: Get network interfaces from node ===
             url = f"https://{host}:8006/api2/json/nodes/{node_name}/network"
             response = self._api_get(url)
             
+            vmbr_same_subnet = []    # Priority 1: vmbr* in same subnet
+            other_same_subnet = []   # Priority 2: any interface in same subnet
+            vmbr_any = []            # Priority 5: vmbr* with any IP
+            public_ips = []          # Priority 6: public IPs
+            private_ips = []         # Priority 7: private IPs
+            
             if response.status_code == 200:
-                networks = response.json()['data']
-                
-                # Get primary host IP parts for subnet matching
-                primary_parts = self.config.host.split('.')
-                
-                candidate_ips = []
+                networks = response.json().get('data', [])
                 
                 for net in networks:
-                    if net.get('type') in ['bridge', 'eth', 'bond', 'vmbr']:
-                        addr = net.get('address')
-                        if not addr:
-                            continue
-                        
-                        # Skip localhost
-                        if addr.startswith('127.'):
-                            continue
-                        
-                        # check it's a private IP
-                        is_private = (
-                            addr.startswith('10.') or 
-                            addr.startswith('192.168.') or 
-                            addr.startswith('172.16.') or
-                            addr.startswith('172.17.') or
-                            addr.startswith('172.18.') or
-                            addr.startswith('172.19.') or
-                            addr.startswith('172.20.') or
-                            addr.startswith('172.21.') or
-                            addr.startswith('172.22.') or
-                            addr.startswith('172.23.') or
-                            addr.startswith('172.24.') or
-                            addr.startswith('172.25.') or
-                            addr.startswith('172.26.') or
-                            addr.startswith('172.27.') or
-                            addr.startswith('172.28.') or
-                            addr.startswith('172.29.') or
-                            addr.startswith('172.30.') or
-                            addr.startswith('172.31.')
-                        )
-                        
-                        # check same subnet as primary (first 3 octets)
-                        addr_parts = addr.split('.')
-                        same_subnet = (len(addr_parts) >= 3 and len(primary_parts) >= 3 and
-                                      addr_parts[0] == primary_parts[0] and
-                                      addr_parts[1] == primary_parts[1] and
-                                      addr_parts[2] == primary_parts[2])
-                        
-                        # Priority: 1) Same subnet as primary, 2) Public IP, 3) Private IP
-                        if same_subnet:
-                            candidate_ips.insert(0, (addr, 'same_subnet'))
-                        elif not is_private:
-                            candidate_ips.append((addr, 'public'))
+                    addr = net.get('address')
+                    if not addr or addr.startswith('127.'):
+                        continue
+                    
+                    net_type = net.get('type', '')
+                    iface = net.get('iface', '')
+                    is_vmbr = iface.startswith('vmbr') or net_type == 'bridge'
+                    
+                    if is_same_subnet(addr):
+                        if is_vmbr:
+                            vmbr_same_subnet.append((addr, iface))
                         else:
-                            candidate_ips.append((addr, 'private'))
-                
-                # Sort by priority: same_subnet > public > private
-                priority = {'same_subnet': 0, 'public': 1, 'private': 2}
-                candidate_ips.sort(key=lambda x: priority.get(x[1], 3))
-                
-                if candidate_ips:
-                    best_ip = candidate_ips[0][0]
-                    ip_type = candidate_ips[0][1]
-                    self.logger.info(f"Found IP for {node_name}: {best_ip} ({ip_type})")
-                    return best_ip
+                            other_same_subnet.append((addr, iface))
+                    elif is_vmbr:
+                        vmbr_any.append((addr, iface))
+                    elif not is_private(addr):
+                        public_ips.append((addr, iface))
+                    else:
+                        private_ips.append((addr, iface))
             
-            # Fallback: if node_name is the cluster host, use that
+            # Check priority 1: vmbr in same subnet (BEST - this is what user wants)
+            if vmbr_same_subnet:
+                best = vmbr_same_subnet[0]
+                self.logger.info(f"Found IP for {node_name}: {best[0]} (vmbr same_subnet via {best[1]})")
+                return best[0]
+            
+            # Check priority 2: any interface in same subnet
+            if other_same_subnet:
+                best = other_same_subnet[0]
+                self.logger.info(f"Found IP for {node_name}: {best[0]} (same_subnet via {best[1]})")
+                return best[0]
+            
+            # === STEP 2: Try Corosync links as fallback ===
+            try:
+                cluster_nodes_url = f"https://{host}:8006/api2/json/cluster/config/nodes"
+                cluster_response = self._api_get(cluster_nodes_url)
+                
+                if cluster_response.status_code == 200:
+                    cluster_nodes = cluster_response.json().get('data', [])
+                    
+                    for node in cluster_nodes:
+                        if node.get('name') == node_name:
+                            corosync_same_subnet = []
+                            corosync_other = []
+                            
+                            for key, value in node.items():
+                                if key.startswith('link') and value:
+                                    link_ip = value.split(',')[0].strip()
+                                    if link_ip and not link_ip.startswith('127.'):
+                                        if is_same_subnet(link_ip):
+                                            corosync_same_subnet.append((link_ip, key))
+                                        else:
+                                            corosync_other.append((link_ip, key))
+                            
+                            # Priority 3: Corosync link in same subnet
+                            if corosync_same_subnet:
+                                best = corosync_same_subnet[0]
+                                self.logger.info(f"Found IP for {node_name}: {best[0]} (corosync {best[1]} same_subnet)")
+                                return best[0]
+                            
+                            # Priority 4: Any Corosync link
+                            if corosync_other:
+                                best = corosync_other[0]
+                                self.logger.info(f"Found IP for {node_name}: {best[0]} (corosync {best[1]})")
+                                return best[0]
+            except Exception as e:
+                self.logger.debug(f"Could not get corosync config: {e}")
+            
+            # Priority 5: vmbr with any IP
+            if vmbr_any:
+                best = vmbr_any[0]
+                self.logger.info(f"Found IP for {node_name}: {best[0]} (vmbr via {best[1]})")
+                return best[0]
+            
+            # Priority 6: Public IP
+            if public_ips:
+                best = public_ips[0]
+                self.logger.info(f"Found IP for {node_name}: {best[0]} (public via {best[1]})")
+                return best[0]
+            
+            # Priority 7: Private IP
+            if private_ips:
+                best = private_ips[0]
+                self.logger.info(f"Found IP for {node_name}: {best[0]} (private via {best[1]})")
+                return best[0]
+            
+            # === STEP 3: Fallbacks ===
             if node_name in self.config.host:
                 return self.config.host
             
-            # Try to resolve hostname
             try:
                 ip = socket.gethostbyname(node_name)
-                self.logger.info(f"Resolved {node_name} to {ip}")
+                self.logger.info(f"Resolved {node_name} to {ip} (DNS)")
                 return ip
             except socket.gaierror:
                 pass
             
-            # Last resort: assume it's the same as cluster host if single node
             self.logger.warning(f"Could not determine IP for {node_name}, using cluster host")
             return self.config.host
             
@@ -10490,13 +10759,15 @@ echo "AGENT_INSTALLED_OK"
             
             # CD-ROM / ISO
             boot_order = []
-            if disk_type == 'scsi':
+            
+            # MK: Only add disk to boot order if it was actually created
+            if disk_type == 'scsi' and 'scsi0' in data:
                 boot_order.append('scsi0')
-            elif disk_type == 'virtio':
+            elif disk_type == 'virtio' and 'virtio0' in data:
                 boot_order.append('virtio0')
-            elif disk_type == 'ide':
+            elif disk_type == 'ide' and 'ide0' in data:
                 boot_order.append('ide0')
-            elif disk_type == 'sata':
+            elif disk_type == 'sata' and 'sata0' in data:
                 boot_order.append('sata0')
             
             if vm_config.get('iso'):
@@ -11688,7 +11959,11 @@ echo "AGENT_INSTALLED_OK"
         return result
     
     def update_vm_config(self, node: str, vmid: int, vm_type: str, config_updates: Dict) -> Dict[str, Any]:
+        """Update VM configuration with boot order validation.
         
+        NS: Feb 2026 - Added automatic boot order sanitization to prevent
+        'device does not exist' errors when updating config.
+        """
         if not self.is_connected:
             if not self.connect_to_proxmox():
                 return {'success': False, 'error': 'Could not connect to Proxmox'}
@@ -11698,6 +11973,33 @@ echo "AGENT_INSTALLED_OK"
                 url = f"https://{self.host}:8006/api2/json/nodes/{node}/qemu/{vmid}/config"
             else:
                 url = f"https://{self.host}:8006/api2/json/nodes/{node}/lxc/{vmid}/config"
+            
+            # NS: If boot order is being updated, validate it against current config
+            if 'boot' in config_updates:
+                boot_val = config_updates.get('boot', '')
+                if boot_val and 'order=' in boot_val:
+                    # Get current VM config to validate boot devices
+                    current_config = self.get_vm_config(node, vmid, vm_type)
+                    if current_config.get('success'):
+                        config = current_config.get('config', {})
+                        # Parse and validate boot order
+                        order_str = boot_val.split('order=')[1].split(';')[0] if 'order=' in boot_val else ''
+                        if order_str:
+                            devices = [d.strip() for d in order_str.split(';') if d.strip()]
+                            valid_devices = []
+                            for dev in devices:
+                                # Check if device exists in config
+                                if dev in config or dev == 'net0':  # net0 is always valid
+                                    valid_devices.append(dev)
+                                else:
+                                    self.logger.warning(f"Boot order device '{dev}' not found in VM config, removing")
+                            
+                            if valid_devices:
+                                config_updates['boot'] = 'order=' + ';'.join(valid_devices)
+                            else:
+                                # No valid boot devices - remove boot order from update
+                                del config_updates['boot']
+                                self.logger.warning(f"No valid boot devices found, skipping boot order update")
             
             self.logger.info(f"Updating {vm_type}/{vmid} config: {config_updates}")
             
@@ -11715,6 +12017,79 @@ echo "AGENT_INSTALLED_OK"
             self.logger.error(f"[ERROR] Update config error: {e}")
             return {'success': False, 'error': str(e)}
     
+    def sanitize_boot_order(self, node: str, vmid: int, vm_type: str) -> Dict[str, Any]:
+        """Sanitize boot order by removing non-existent devices.
+        
+        NS: Feb 2026 - Fixes 'invalid bootorder: device does not exist' errors
+        by removing devices from boot order that no longer exist in the VM config.
+        """
+        if not self.is_connected:
+            if not self.connect_to_proxmox():
+                return {'success': False, 'error': 'Could not connect to Proxmox'}
+        
+        try:
+            # Get current config
+            config_result = self.get_vm_config(node, vmid, vm_type)
+            if not config_result.get('success'):
+                return {'success': False, 'error': 'Could not get VM config'}
+            
+            config = config_result.get('config', {})
+            boot_val = config.get('boot', '')
+            
+            if not boot_val or 'order=' not in boot_val:
+                return {'success': True, 'message': 'No boot order to sanitize', 'changed': False}
+            
+            # Parse boot order
+            order_part = boot_val.split('order=')[1].split(';')[0] if 'order=' in boot_val else ''
+            if not order_part:
+                return {'success': True, 'message': 'Empty boot order', 'changed': False}
+            
+            devices = [d.strip() for d in boot_val.split('order=')[1].split(';') if d.strip()]
+            valid_devices = []
+            removed_devices = []
+            
+            for dev in devices:
+                # Check if device exists in config (net0 is always valid for QEMU)
+                if dev in config or (dev == 'net0' and vm_type == 'qemu'):
+                    valid_devices.append(dev)
+                else:
+                    removed_devices.append(dev)
+                    self.logger.info(f"Boot order: removing non-existent device '{dev}' from VM {vmid}")
+            
+            if not removed_devices:
+                return {'success': True, 'message': 'Boot order is valid', 'changed': False}
+            
+            # Update boot order
+            if valid_devices:
+                new_boot = 'order=' + ';'.join(valid_devices)
+            else:
+                # No valid devices - default to net0 for QEMU
+                new_boot = 'order=net0' if vm_type == 'qemu' else ''
+            
+            # Apply update
+            if vm_type == 'qemu':
+                url = f"https://{self.host}:8006/api2/json/nodes/{node}/qemu/{vmid}/config"
+            else:
+                url = f"https://{self.host}:8006/api2/json/nodes/{node}/lxc/{vmid}/config"
+            
+            response = self._api_put(url, data={'boot': new_boot})
+            
+            if response.status_code == 200:
+                self.logger.info(f"[OK] Sanitized boot order for {vm_type}/{vmid}: removed {removed_devices}")
+                return {
+                    'success': True, 
+                    'message': f'Removed invalid devices: {", ".join(removed_devices)}',
+                    'changed': True,
+                    'removed': removed_devices,
+                    'new_boot_order': new_boot
+                }
+            else:
+                return {'success': False, 'error': response.text}
+                
+        except Exception as e:
+            self.logger.error(f"[ERROR] Sanitize boot order error: {e}")
+            return {'success': False, 'error': str(e)}
+
     def resize_vm_disk(self, node: str, vmid: int, vm_type: str, disk: str, size: str) -> Dict[str, Any]:
         
         if not self.is_connected:
@@ -11757,24 +12132,122 @@ echo "AGENT_INSTALLED_OK"
             return []
     
     def get_network_list(self, node: str) -> List[Dict]:
+        """Get available networks/bridges for a node, including SDN VNets
         
+        NS: Feb 2026 - Added SDN VNet support (GitHub Issue #38)
+        SDN VNets are cluster-wide virtual networks that appear as bridges
+        """
         if not self.is_connected:
             if not self.connect_to_proxmox():
                 return []
         
         try:
             host = self.current_host or self.config.host
+            result = []
+            found_bridges = set()
+            
+            # 1. Get local bridges from node
             url = f"https://{host}:8006/api2/json/nodes/{node}/network"
             response = self._api_get(url)
             
             if response.status_code == 200:
                 networks = response.json()['data']
-                # Filter to just bridges
-                return [n for n in networks if n.get('type') == 'bridge']
+                # Filter to just bridges and OVS bridges
+                for n in networks:
+                    if n.get('type') in ['bridge', 'OVSBridge', 'OVSIntPort']:
+                        n['source'] = 'local'
+                        result.append(n)
+                        if n.get('iface'):
+                            found_bridges.add(n['iface'])
+            
+            # 2. Get SDN VNets (cluster-wide)
+            # NS: Feb 2026 - Improved SDN support for GitHub Issue #38
+            try:
+                sdn_url = f"https://{host}:8006/api2/json/cluster/sdn/vnets"
+                sdn_response = self._api_get(sdn_url)
+                
+                if sdn_response.status_code == 200:
+                    vnets = sdn_response.json().get('data', [])
+                    logging.info(f"Found {len(vnets)} SDN VNets")
+                    for vnet in vnets:
+                        vnet_name = vnet.get('vnet', '')
+                        if vnet_name and vnet_name not in found_bridges:
+                            result.append({
+                                'iface': vnet_name,
+                                'type': 'sdn_vnet',
+                                'source': 'sdn',
+                                'zone': vnet.get('zone', ''),
+                                'alias': vnet.get('alias', ''),
+                                'tag': vnet.get('tag'),
+                                'vlanaware': vnet.get('vlanaware'),
+                                'comments': f"SDN: {vnet.get('zone', '')}",
+                                'active': True,
+                            })
+                            found_bridges.add(vnet_name)
+                elif sdn_response.status_code == 501:
+                    logging.debug("SDN not enabled on this cluster")
+                else:
+                    logging.warning(f"SDN VNets API returned {sdn_response.status_code}")
+            except Exception as e:
+                logging.debug(f"SDN VNets not available: {e}")
+            
+            # 3. Get SDN Zones and update VNet info
+            try:
+                zones_url = f"https://{host}:8006/api2/json/cluster/sdn/zones"
+                zones_response = self._api_get(zones_url)
+                
+                if zones_response.status_code == 200:
+                    zones = zones_response.json().get('data', [])
+                    zone_map = {z.get('zone', ''): z for z in zones}
+                    
+                    for item in result:
+                        if item.get('source') == 'sdn' and item.get('zone') in zone_map:
+                            zone_info = zone_map[item['zone']]
+                            item['zone_type'] = zone_info.get('type', '')
+            except Exception as e:
+                logging.debug(f"SDN Zones not available: {e}")
+            
+            # 4. Discover networks from running VMs (catches SDN VNets not in API)
+            try:
+                vms_url = f"https://{host}:8006/api2/json/nodes/{node}/qemu"
+                vms_response = self._api_get(vms_url)
+                
+                if vms_response.status_code == 200:
+                    vms = vms_response.json().get('data', [])
+                    
+                    for vm in vms[:15]:  # Check first 15 VMs
+                        vmid = vm.get('vmid')
+                        if vmid:
+                            config_url = f"https://{host}:8006/api2/json/nodes/{node}/qemu/{vmid}/config"
+                            config_response = self._api_get(config_url)
+                            
+                            if config_response.status_code == 200:
+                                config = config_response.json().get('data', {})
+                                for key, value in config.items():
+                                    if key.startswith('net') and isinstance(value, str):
+                                        for part in value.split(','):
+                                            if part.startswith('bridge='):
+                                                bridge_name = part.split('=')[1]
+                                                if bridge_name and bridge_name not in found_bridges:
+                                                    logging.info(f"Discovered network '{bridge_name}' from VM {vmid}")
+                                                    result.append({
+                                                        'iface': bridge_name,
+                                                        'type': 'sdn_vnet',
+                                                        'source': 'sdn',
+                                                        'zone': '',
+                                                        'comments': 'SDN (discovered)',
+                                                        'active': True,
+                                                    })
+                                                    found_bridges.add(bridge_name)
+                                                break
+            except Exception as e:
+                logging.debug(f"Could not scan VMs for networks: {e}")
+            
+            return result
+        except Exception as e:
+            logging.error(f"Error getting network list: {e}")
             return []
-        except:
-            return []
-    
+
     def get_iso_list(self, node: str, storage: str = None) -> List[Dict]:
         
         if not self.is_connected:
@@ -11926,25 +12399,59 @@ echo "AGENT_INSTALLED_OK"
         If delete_data=True: Detach AND delete the volume physically
         
         MK: Fixed - after detach, disk becomes 'unused0' etc., so we need to delete that
+        NS: Feb 2026 - Now auto-cleans boot order BEFORE removing disk to prevent errors
         """
         if not self.is_connected:
             if not self.connect_to_proxmox():
                 return {'success': False, 'error': 'Could not connect to Proxmox'}
         
         try:
-            # MK: First get the current disk config to know the volume path
+            # NS: FIRST get current config and clean boot order if needed
+            config_result = self.get_vm_config(node, vmid, vm_type)
             volume_path = None
-            if delete_data:
-                config_result = self.get_vm_config(node, vmid, vm_type)
-                if config_result.get('success'):
-                    # MK: Structure is config_result['config']['raw'] - that's where disk IDs are
-                    parsed_config = config_result.get('config', {})
-                    raw_config = parsed_config.get('raw', {})
+            
+            if config_result.get('success'):
+                parsed_config = config_result.get('config', {})
+                raw_config = parsed_config.get('raw', {})
+                
+                # Check if disk is in boot order and remove it BEFORE deleting the disk
+                old_boot = raw_config.get('boot', '')
+                if old_boot and disk_id in old_boot and 'order=' in old_boot:
+                    try:
+                        # Parse boot order (format: order=scsi0;ide2;net0)
+                        order_part = old_boot.split('order=')[1]
+                        # Handle potential trailing options after boot order
+                        if ' ' in order_part:
+                            order_part = order_part.split(' ')[0]
+                        parts = [p.strip() for p in order_part.split(';') if p.strip()]
+                        new_parts = [p for p in parts if p != disk_id]
+                        
+                        if new_parts != parts:  # Boot order changed
+                            if new_parts:
+                                new_boot = 'order=' + ';'.join(new_parts)
+                            else:
+                                new_boot = 'order=net0' if vm_type == 'qemu' else ''
+                            
+                            # Update boot order BEFORE removing disk
+                            if vm_type == 'qemu':
+                                boot_url = f"https://{self.host}:8006/api2/json/nodes/{node}/qemu/{vmid}/config"
+                            else:
+                                boot_url = f"https://{self.host}:8006/api2/json/nodes/{node}/lxc/{vmid}/config"
+                            
+                            boot_response = self._api_put(boot_url, data={'boot': new_boot})
+                            if boot_response.status_code == 200:
+                                self.logger.info(f"[DISK] Updated boot order before removing {disk_id}: {new_boot}")
+                            else:
+                                self.logger.warning(f"[DISK] Failed to update boot order: {boot_response.text}")
+                    except Exception as e:
+                        self.logger.warning(f"[DISK] Error updating boot order: {e}")
+                
+                # Get volume path for delete_data
+                if delete_data:
                     disk_config = raw_config.get(disk_id, '')
                     self.logger.info(f"[DEBUG] delete_data=True, disk_id={disk_id}, disk_config={disk_config}")
-                    # Parse volume path from disk config (e.g., "local-lvm:vm-100-disk-0,size=32G")
                     if disk_config and ':' in str(disk_config):
-                        volume_path = disk_config.split(',')[0]  # Get storage:volume part
+                        volume_path = disk_config.split(',')[0]
                         self.logger.info(f"[DEBUG] volume_path={volume_path}")
             
             if vm_type == 'qemu':
@@ -11952,7 +12459,7 @@ echo "AGENT_INSTALLED_OK"
             else:
                 url = f"https://{self.host}:8006/api2/json/nodes/{node}/lxc/{vmid}/config"
             
-            # First detach the disk from VM config
+            # Now detach the disk from VM config
             data = {'delete': disk_id}
             response = self._api_put(url, data=data)
             
@@ -14088,11 +14595,210 @@ def invalidate_all_user_sessions(username: str, except_session: str = None):
     return sessions_removed
 
 
+# =============================================================================
+# MK: Feb 2026 - API Token Authentication
+# Allows programmatic access without session cookies. Tokens are stored as
+# SHA-256 hashes in the DB. The actual token is only shown once at creation.
+# Format: pgx_<prefix>_<random> (e.g. pgx_ab12_8f3k...)
+# =============================================================================
+
+def generate_api_token() -> tuple:
+    """Generate a new API token. Returns (token_string, token_hash, prefix)"""
+    # NS: Token format: pgx_<4char_prefix>_<32char_random>
+    prefix = secrets.token_hex(2)  # 4 hex chars
+    random_part = secrets.token_urlsafe(32)
+    token = f"pgx_{prefix}_{random_part}"
+    token_hash = hashlib.sha256(token.encode()).hexdigest()
+    return token, token_hash, prefix
+
+
+def create_api_token(username: str, token_name: str, role: str = None, 
+                     permissions: list = None, expires_days: int = None) -> dict:
+    """Create a new API token for a user
+    
+    LW: Token is only returned once - we only store the hash
+    MK: Permissions inherit from user role if not specified
+    """
+    ensure_api_tokens_table()
+    users = load_users()
+    user = users.get(username)
+    if not user:
+        return {'error': 'User not found'}
+    
+    # Default to user's own role if not specified
+    if not role:
+        role = user.get('role', ROLE_VIEWER)
+    
+    # NS: Don't allow creating tokens with higher privileges than the user
+    role_hierarchy = {ROLE_ADMIN: 3, ROLE_USER: 2, ROLE_VIEWER: 1}
+    user_level = role_hierarchy.get(user.get('role', ROLE_VIEWER), 1)
+    token_level = role_hierarchy.get(role, 1)
+    if token_level > user_level:
+        return {'error': 'Cannot create token with higher privileges than your own role'}
+    
+    token, token_hash, prefix = generate_api_token()
+    
+    expires_at = None
+    if expires_days:
+        expires_at = (datetime.now() + timedelta(days=expires_days)).isoformat()
+    
+    try:
+        db = get_db()
+        cursor = db.conn.cursor()
+        cursor.execute('''
+            INSERT INTO api_tokens (token_hash, token_prefix, username, name, role, permissions, expires_at, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        ''', (token_hash, prefix, username, token_name, role, 
+              json.dumps(permissions or []), expires_at, datetime.now().isoformat()))
+        db.conn.commit()
+        
+        token_id = cursor.lastrowid
+        logging.info(f"[APIToken] Created token '{token_name}' (pgx_{prefix}_...) for user '{username}' role={role}")
+        
+        return {
+            'success': True,
+            'token': token,  # Only returned once!
+            'token_id': token_id,
+            'prefix': prefix,
+            'name': token_name,
+            'role': role,
+            'expires_at': expires_at
+        }
+    except Exception as e:
+        logging.error(f"[APIToken] Failed to create token: {e}")
+        return {'error': str(e)}
+
+
+def validate_api_token(token: str) -> dict:
+    """Validate an API token and return user info if valid
+    
+    MK: Returns same structure as validate_session for compatibility with require_auth
+    """
+    if not token or not token.startswith('pgx_'):
+        return None
+    
+    ensure_api_tokens_table()
+    token_hash = hashlib.sha256(token.encode()).hexdigest()
+    
+    try:
+        db = get_db()
+        cursor = db.conn.cursor()
+        cursor.execute('''
+            SELECT id, username, name, role, permissions, expires_at, revoked
+            FROM api_tokens WHERE token_hash = ?
+        ''', (token_hash,))
+        row = cursor.fetchone()
+        
+        if not row:
+            return None
+        
+        row_dict = dict(row)
+        
+        # LW: Check if revoked
+        if row_dict.get('revoked'):
+            return None
+        
+        # Check expiry
+        if row_dict.get('expires_at'):
+            expires = datetime.fromisoformat(row_dict['expires_at'])
+            if datetime.now() > expires:
+                return None
+        
+        # Update last used timestamp
+        cursor.execute('''
+            UPDATE api_tokens SET last_used_at = ?, last_used_ip = ? WHERE id = ?
+        ''', (datetime.now().isoformat(), request.remote_addr, row_dict['id']))
+        db.conn.commit()
+        
+        # Return session-compatible dict
+        return {
+            'user': row_dict['username'],
+            'role': row_dict['role'],
+            'login_time': row_dict.get('created_at', 0),
+            'last_activity': time.time(),
+            'api_token': True,  # NS: Flag to identify token auth vs session auth
+            'token_name': row_dict['name'],
+            'token_id': row_dict['id']
+        }
+    except Exception as e:
+        logging.error(f"[APIToken] Validation error: {e}")
+        return None
+
+
+def ensure_api_tokens_table():
+    """Ensure the api_tokens table exists (for upgrades without restart)"""
+    try:
+        db = get_db()
+        cursor = db.conn.cursor()
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS api_tokens (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                token_hash TEXT NOT NULL UNIQUE,
+                token_prefix TEXT NOT NULL,
+                username TEXT NOT NULL,
+                name TEXT NOT NULL,
+                role TEXT DEFAULT 'viewer',
+                permissions TEXT DEFAULT '[]',
+                expires_at TEXT,
+                last_used_at TEXT,
+                last_used_ip TEXT,
+                created_at TEXT NOT NULL,
+                revoked INTEGER DEFAULT 0
+            )
+        ''')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_api_tokens_hash ON api_tokens(token_hash)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_api_tokens_user ON api_tokens(username)')
+        db.conn.commit()
+    except Exception as e:
+        logging.error(f"[APIToken] Table creation error: {e}")
+
+
+def list_user_tokens(username: str) -> list:
+    """List all API tokens for a user (without the actual token hash)"""
+    ensure_api_tokens_table()
+    try:
+        db = get_db()
+        cursor = db.conn.cursor()
+        cursor.execute('''
+            SELECT id, token_prefix, name, role, permissions, expires_at, 
+                   last_used_at, last_used_ip, created_at, revoked
+            FROM api_tokens WHERE username = ? ORDER BY created_at DESC
+        ''', (username,))
+        return [dict(row) for row in cursor.fetchall()]
+    except Exception as e:
+        logging.error(f"[APIToken] List error: {e}")
+        return []
+
+
+def revoke_api_token(token_id: int, username: str) -> bool:
+    """Revoke an API token
+    
+    LW: Soft delete - we keep the record for audit trail
+    """
+    try:
+        db = get_db()
+        cursor = db.conn.cursor()
+        # NS: Only allow revoking own tokens unless admin
+        cursor.execute('''
+            UPDATE api_tokens SET revoked = 1 WHERE id = ? AND username = ?
+        ''', (token_id, username))
+        db.conn.commit()
+        
+        if cursor.rowcount > 0:
+            logging.info(f"[APIToken] Revoked token id={token_id} for user '{username}'")
+            return True
+        return False
+    except Exception as e:
+        logging.error(f"[APIToken] Revoke error: {e}")
+        return False
+
+
 def require_auth(roles: list = None, perms: list = None):
     """
     Decorator to require authentication for API endpoints.
     
     MK: This is the main auth guard - use on all protected routes.
+    LW: Feb 2026 - Now also accepts API tokens via Authorization: Bearer pgx_...
     
     Args:
         roles: Optional list of allowed roles. If None, any authenticated user is allowed.
@@ -14108,10 +14814,19 @@ def require_auth(roles: list = None, perms: list = None):
         from functools import wraps
         @wraps(f)
         def decorated_function(*args, **kwargs):
-            # Get session from header or cookie
-            session_id = request.headers.get('X-Session-ID') or request.cookies.get('session_id')
+            session = None
             
-            session = validate_session(session_id)
+            # MK: Feb 2026 - Check API token first (Authorization: Bearer pgx_...)
+            auth_header = request.headers.get('Authorization', '')
+            if auth_header.startswith('Bearer pgx_'):
+                token = auth_header[7:]  # Strip 'Bearer '
+                session = validate_api_token(token)
+            
+            # Fall back to session auth (X-Session-ID header or cookie)
+            if not session:
+                session_id = request.headers.get('X-Session-ID') or request.cookies.get('session_id')
+                session = validate_session(session_id)
+            
             if not session:
                 return jsonify({'error': 'Unauthorized', 'code': 'AUTH_REQUIRED'}), 401
             
@@ -14464,6 +15179,14 @@ def auth_login():
     if origin:
         add_allowed_origin(origin)
     
+    # NS: Get default theme for response
+    settings = load_server_settings()
+    default_theme = settings.get('default_theme', 'proxmoxDark')
+    
+    # NS: Debug log for theme sync issues
+    user_theme = user.get('theme', '') or default_theme
+    logging.info(f"[LOGIN] User {username} theme from DB: '{user.get('theme', '')}', using: '{user_theme}'")
+    
     response = jsonify({
         'success': True,
         'user': {
@@ -14472,11 +15195,13 @@ def auth_login():
             'display_name': user.get('display_name', username),
             'email': user.get('email', ''),
             'totp_enabled': user.get('totp_enabled', False),
-            'theme': user.get('theme', ''),
+            'theme': user_theme,  # NS: Use default if empty
             'language': user.get('language', ''),
-            'ui_layout': user.get('ui_layout', 'modern')
+            'ui_layout': user.get('ui_layout', 'modern'),
+            'taskbar_auto_expand': user.get('taskbar_auto_expand', True)  # NS: Feb 2026
         },
         'session_id': session_id,
+        'default_theme': default_theme,  # NS: Include for frontend fallback
         # NS: Security warning if using default password
         'security_warning': 'DEFAULT_PASSWORD' if (user['role'] == ROLE_ADMIN and password == 'admin') else None
     })
@@ -14572,6 +15297,10 @@ def auth_check():
     # Get default theme from settings
     default_theme = settings.get('default_theme', 'proxmoxDark')
     
+    # NS: Debug log for theme sync issues
+    user_theme = user.get('theme', '') or default_theme
+    logging.debug(f"[AUTH_CHECK] User {session['user']} theme from DB: '{user.get('theme', '')}', using: '{user_theme}'")
+    
     return jsonify({
         'authenticated': True,
         'session_id': session_id,  # MK: Return session_id for WebSocket auth
@@ -14580,9 +15309,10 @@ def auth_check():
             'role': session['role'],
             'display_name': user.get('display_name', session['user']),
             'email': user.get('email', ''),
-            'theme': user.get('theme', '') or default_theme,
+            'theme': user_theme,
             'language': user.get('language', ''),
-            'ui_layout': user.get('ui_layout', 'modern')
+            'ui_layout': user.get('ui_layout', 'modern'),
+            'taskbar_auto_expand': user.get('taskbar_auto_expand', True)  # NS: Feb 2026
         },
         'password_expiry': password_expiry,
         'default_theme': default_theme
@@ -14724,7 +15454,7 @@ def get_cluster_creds_internal(cluster_id):
     return jsonify({
         'host': cluster_host,
         'user': mgr.config.user,
-        'password': mgr.config.password,
+        'password': mgr.config.pass_,
         'node_ips': node_ips
     })
 
@@ -14946,10 +15676,121 @@ def get_2fa_status():
 # Per-user settings (theme, language)
 # =====================================================
 
+# =============================================================================
+# NS: Feb 2026 - API Token Management Endpoints
+# MK: Users can create tokens for CI/CD, scripts, monitoring integrations
+# LW: Admins can see all tokens, users can only manage their own
+# =============================================================================
+
+@app.route('/api/auth/tokens', methods=['GET'])
+@require_auth()
+def list_api_tokens():
+    """List API tokens for current user (or all users for admin)"""
+    ensure_api_tokens_table()
+    username = request.session['user']
+    role = request.session.get('role', ROLE_VIEWER)
+    
+    # MK: Admin can see all tokens if ?all=true
+    if role == ROLE_ADMIN and request.args.get('all') == 'true':
+        try:
+            db = get_db()
+            cursor = db.conn.cursor()
+            cursor.execute('''
+                SELECT id, token_prefix, username, name, role, permissions, expires_at,
+                       last_used_at, last_used_ip, created_at, revoked
+                FROM api_tokens ORDER BY created_at DESC
+            ''')
+            tokens = [dict(row) for row in cursor.fetchall()]
+            return jsonify({'tokens': tokens})
+        except Exception as e:
+            return jsonify({'error': str(e)}), 500
+    
+    tokens = list_user_tokens(username)
+    return jsonify({'tokens': tokens})
+
+
+@app.route('/api/auth/tokens', methods=['POST'])
+@require_auth()
+def create_api_token_endpoint():
+    """Create a new API token for the current user"""
+    username = request.session['user']
+    data = request.get_json() or {}
+    
+    token_name = data.get('name', '').strip()
+    if not token_name:
+        return jsonify({'error': 'Token name is required'}), 400
+    
+    if len(token_name) > 64:
+        return jsonify({'error': 'Token name too long (max 64 chars)'}), 400
+    
+    # LW: Check for duplicate names
+    existing = list_user_tokens(username)
+    active_names = [t['name'] for t in existing if not t.get('revoked')]
+    if token_name in active_names:
+        return jsonify({'error': f'Token name "{token_name}" already exists'}), 400
+    
+    # NS: Max 10 active tokens per user
+    active_count = sum(1 for t in existing if not t.get('revoked'))
+    if active_count >= 1:
+        return jsonify({'error': 'You already have an active token. Revoke it first to create a new one.'}), 400
+    
+    role = data.get('role')
+    expires_days = data.get('expires_days')
+    
+    if expires_days is not None:
+        try:
+            expires_days = int(expires_days)
+            if expires_days < 1 or expires_days > 365:
+                return jsonify({'error': 'Expiry must be between 1 and 365 days'}), 400
+        except (ValueError, TypeError):
+            return jsonify({'error': 'Invalid expires_days value'}), 400
+    
+    result = create_api_token(username, token_name, role=role, expires_days=expires_days)
+    
+    if 'error' in result:
+        return jsonify(result), 400
+    
+    # MK: Audit log
+    log_audit(username, 'token.created', f"API token '{token_name}' created")
+    
+    return jsonify(result)
+
+
+@app.route('/api/auth/tokens/<int:token_id>', methods=['DELETE'])
+@require_auth()
+def revoke_api_token_endpoint(token_id):
+    """Revoke an API token"""
+    username = request.session['user']
+    role = request.session.get('role', ROLE_VIEWER)
+    
+    # LW: Admin can revoke any token
+    if role == ROLE_ADMIN:
+        try:
+            db = get_db()
+            cursor = db.conn.cursor()
+            cursor.execute('SELECT username, name FROM api_tokens WHERE id = ?', (token_id,))
+            row = cursor.fetchone()
+            if row:
+                cursor.execute('UPDATE api_tokens SET revoked = 1 WHERE id = ?', (token_id,))
+                db.conn.commit()
+                token_owner = dict(row)['username']
+                token_name = dict(row)['name']
+                log_audit(username, 'token.revoked', f"Revoked API token '{token_name}' (user: {token_owner})")
+                return jsonify({'success': True})
+            return jsonify({'error': 'Token not found'}), 404
+        except Exception as e:
+            return jsonify({'error': str(e)}), 500
+    
+    if revoke_api_token(token_id, username):
+        log_audit(username, 'token.revoked', f"Revoked API token id={token_id}")
+        return jsonify({'success': True})
+    return jsonify({'error': 'Token not found or not owned by you'}), 404
+
+
 @app.route('/api/user/preferences', methods=['GET'])
 @require_auth()
 def get_user_preferences():
-    """Get current user's preferences (theme, language, ui_layout)"""
+    """Get current user's preferences (theme, language, ui_layout, taskbar_auto_expand)"""
     username = request.session['user']
     users_db = load_users()
     
@@ -14964,6 +15805,7 @@ def get_user_preferences():
         'theme': user.get('theme', '') or default_theme,
         'language': user.get('language', ''),
         'ui_layout': user.get('ui_layout', 'modern'),
+        'taskbar_auto_expand': user.get('taskbar_auto_expand', True),  # NS: Default true for backward compat
         'default_theme': default_theme
     })
 
@@ -15020,11 +15862,15 @@ def update_user_preferences():
         else:
             return jsonify({'error': f'Invalid layout: {layout}'}), 400
     
+    # NS: TaskBar auto-expand preference - Feb 2026
+    if 'taskbar_auto_expand' in data:
+        user['taskbar_auto_expand'] = bool(data['taskbar_auto_expand'])
+    
     # Save only this user, not all users
     db = get_db()
     db.save_user(username, user)
     
-    logging.info(f"User '{username}' updated preferences: theme={user.get('theme')}, language={user.get('language')}, ui_layout={user.get('ui_layout')}")
+    logging.info(f"User '{username}' updated preferences: theme={user.get('theme')}, language={user.get('language')}, ui_layout={user.get('ui_layout')}, taskbar_auto_expand={user.get('taskbar_auto_expand')}")
     log_audit(username, 'user.preferences_updated', f"Updated preferences: theme={user.get('theme')}, layout={user.get('ui_layout')}")
     
     settings = load_server_settings()
@@ -15035,6 +15881,7 @@ def update_user_preferences():
         'theme': user.get('theme', '') or default_theme,
         'language': user.get('language', ''),
         'ui_layout': user.get('ui_layout', 'modern'),
+        'taskbar_auto_expand': user.get('taskbar_auto_expand', True),
         'default_theme': default_theme
     })
 
@@ -16050,6 +16897,7 @@ def execute_scheduled_rolling_update(mgr, cluster_id: str, action: dict):
         skip_evacuation = config.get('skip_evacuation', False)
         skip_up_to_date = config.get('skip_up_to_date', True)
         evacuation_timeout = config.get('evacuation_timeout', 1800)
+        wait_for_reboot = config.get('wait_for_reboot', True)
         
         logging.info(f"[SCHEDULER] Starting scheduled rolling update for cluster {cluster_id}")
         logging.info(f"[SCHEDULER] Config: reboot={include_reboot}, skip_evacuation={skip_evacuation}")
@@ -16069,87 +16917,91 @@ def execute_scheduled_rolling_update(mgr, cluster_id: str, action: dict):
         
         # Initialize rolling update state
         mgr._rolling_update = {
-            'status': 'running',
-            'started_at': time.strftime('%Y-%m-%d %H:%M:%S'),
-            'include_reboot': include_reboot,
-            'skip_up_to_date': skip_up_to_date,
-            'skip_evacuation': skip_evacuation,
-            'force_all': False,
-            'evacuation_timeout': evacuation_timeout,
-            'update_timeout': 900,
-            'reboot_timeout': 600,
-            'nodes': nodes_to_update,
-            'current_index': 0,
-            'current_node': nodes_to_update[0],
-            'current_step': 'starting',
-            'completed_nodes': [],
-            'skipped_nodes': [],
-            'failed_nodes': [],
-            'logs': [f"[{time.strftime('%H:%M:%S')}] Scheduled rolling update started"],
-            'scheduled': True  # Mark as scheduled
+            'status': 'running', 'started_at': time.strftime('%Y-%m-%d %H:%M:%S'),
+            'include_reboot': include_reboot, 'skip_up_to_date': skip_up_to_date,
+            'skip_evacuation': skip_evacuation, 'wait_for_reboot': wait_for_reboot,
+            'pause_on_evacuation_error': False, 'force_all': False,
+            'evacuation_timeout': evacuation_timeout, 'update_timeout': 900, 'reboot_timeout': 600,
+            'nodes': nodes_to_update, 'current_index': 0, 'current_node': nodes_to_update[0],
+            'current_step': 'starting', 'completed_nodes': [], 'skipped_nodes': [],
+            'failed_nodes': [], 'rebooting_nodes': [], 'paused_reason': None, 'paused_details': None,
+            'logs': [f"[{time.strftime('%H:%M:%S')}] Scheduled rolling update started"], 'scheduled': True
         }
         
-        # Run the update in a background thread
         def run_scheduled_update():
             try:
                 for idx, node_name in enumerate(nodes_to_update):
                     if not hasattr(mgr, '_rolling_update') or mgr._rolling_update.get('status') != 'running':
                         break
-                    
                     mgr._rolling_update['current_index'] = idx
                     mgr._rolling_update['current_node'] = node_name
                     mgr._rolling_update['logs'].append(f"[{time.strftime('%H:%M:%S')}] Processing {node_name}")
-                    
-                    # Check for updates if skip_up_to_date
                     if skip_up_to_date:
                         try:
-                            mgr.refresh_node_apt(node_name)
-                            time.sleep(3)
-                            updates = mgr.get_node_apt_updates(node_name)
-                            if not updates:
-                                mgr._rolling_update['logs'].append(f"[{time.strftime('%H:%M:%S')}] ⏭ {node_name} up-to-date, skipping")
-                                mgr._rolling_update['skipped_nodes'].append(node_name)
-                                continue
+                            mgr.refresh_node_apt(node_name); time.sleep(3)
+                            if not mgr.get_node_apt_updates(node_name):
+                                mgr._rolling_update['logs'].append(f"[{time.strftime('%H:%M:%S')}] {node_name} up-to-date, skipping")
+                                mgr._rolling_update['skipped_nodes'].append(node_name); continue
                         except Exception as e:
-                            logging.warning(f"[SCHEDULER] Could not check updates for {node_name}: {e}")
-                    
-                    # Enter maintenance mode
+                            logging.warning(f"[SCHEDULER] Check failed for {node_name}: {e}")
                     mgr._rolling_update['current_step'] = 'maintenance'
-                    maintenance_task = mgr.enter_maintenance_mode(node_name, skip_evacuation=skip_evacuation)
-                    
+                    mgr.enter_maintenance_mode(node_name, skip_evacuation=skip_evacuation)
                     if not skip_evacuation:
-                        # Wait for evacuation
-                        waited = 0
+                        mgr._rolling_update['current_step'] = 'evacuating'
+                        waited = 0; evacuation_ok = False
                         while waited < evacuation_timeout:
                             if node_name in mgr.nodes_in_maintenance:
                                 task = mgr.nodes_in_maintenance[node_name]
-                                if task.status in ['completed', 'completed_with_errors']:
-                                    break
-                            time.sleep(5)
-                            waited += 5
-                    
-                    # Start update
+                                if task.status == 'completed':
+                                    evacuation_ok = True; break
+                                elif task.status == 'completed_with_errors':
+                                    fv = getattr(task, 'failed_vms', [])
+                                    mgr._rolling_update['logs'].append(f"[{time.strftime('%H:%M:%S')}] ⚠️ Evacuation: {getattr(task,'migrated_vms',0)}/{getattr(task,'total_vms',0)} migrated, {len(fv)} failed - continuing")
+                                    evacuation_ok = True; break
+                                elif task.status == 'failed': break
+                            time.sleep(5); waited += 5
+                        if not evacuation_ok:
+                            mgr._rolling_update['logs'].append(f"[{time.strftime('%H:%M:%S')}] ✗ Evacuation failed on {node_name}, skipping")
+                            mgr._rolling_update['failed_nodes'].append({'node': node_name, 'error': 'Evacuation failed'})
+                            mgr.exit_maintenance_mode(node_name); continue
                     mgr._rolling_update['current_step'] = 'updating'
                     update_task = mgr.start_node_update(node_name, reboot=include_reboot, force=True)
-                    
                     if update_task:
-                        # Wait for update to complete
-                        max_wait = 1800 if include_reboot else 900
                         waited = 0
-                        while waited < max_wait:
-                            if update_task.status in ['completed', 'failed']:
-                                break
-                            time.sleep(10)
-                            waited += 10
-                        
+                        while waited < (1800 if include_reboot else 900):
+                            if update_task.status in ['completed', 'failed']: break
+                            time.sleep(10); waited += 10
                         if update_task.status == 'completed':
-                            mgr._rolling_update['logs'].append(f"[{time.strftime('%H:%M:%S')}] ✓ {node_name} updated successfully")
+                            mgr._rolling_update['logs'].append(f"[{time.strftime('%H:%M:%S')}] ✓ {node_name} updated")
                             mgr._rolling_update['completed_nodes'].append(node_name)
+                            if include_reboot:
+                                mgr._rolling_update['current_step'] = 'rebooting'
+                                mgr._rolling_update['rebooting_nodes'].append(node_name)
+                                if wait_for_reboot:
+                                    mgr._rolling_update['logs'].append(f"[{time.strftime('%H:%M:%S')}] Waiting for {node_name} to reboot...")
+                                    ow = 0
+                                    while ow < 120:
+                                        try:
+                                            ns = mgr.get_node_status()
+                                            if node_name not in ns or ns[node_name].get('status') != 'online': break
+                                        except: break
+                                        time.sleep(5); ow += 5
+                                    rw = 0
+                                    while rw < 600:
+                                        try:
+                                            ns = mgr.get_node_status()
+                                            if node_name in ns and ns[node_name].get('status') == 'online':
+                                                mgr._rolling_update['logs'].append(f"[{time.strftime('%H:%M:%S')}] ✓ {node_name} back online")
+                                                if node_name in mgr._rolling_update['rebooting_nodes']:
+                                                    mgr._rolling_update['rebooting_nodes'].remove(node_name)
+                                                time.sleep(10); break
+                                        except: pass
+                                        time.sleep(10); rw += 10
+                                else:
+                                    mgr._rolling_update['logs'].append(f"[{time.strftime('%H:%M:%S')}] {node_name} rebooting (wait_for_reboot=False)")
                         else:
                             mgr._rolling_update['logs'].append(f"[{time.strftime('%H:%M:%S')}] ✗ {node_name} update failed")
-                            mgr._rolling_update['failed_nodes'].append(node_name)
-                    
-                    # Exit maintenance mode
+                            mgr._rolling_update['failed_nodes'].append({'node': node_name, 'error': 'Update failed'})
                     mgr.exit_maintenance_mode(node_name)
                 
                 # Finished
@@ -21509,6 +22361,278 @@ def get_status():
         'ssh': get_ssh_connection_stats()  # NS: Jan 2026 - SSH connection pool stats
     })
 
+
+@app.route('/api/support-bundle', methods=['GET'])
+@require_auth(roles=[ROLE_ADMIN])
+def generate_support_bundle():
+    """Generate a support bundle with logs and system info for troubleshooting
+    
+    NS: Feb 2026 - Like VMware's support bundle feature
+    Collects all relevant diagnostic information into a ZIP file
+    Sensitive data (passwords, tokens, secrets) are automatically redacted
+    """
+    import zipfile
+    import io
+    import platform
+    import socket
+    
+    try:
+        username = request.session.get('user', 'unknown')
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        bundle_prefix = f"pegaprox_support_{timestamp}"
+        
+        log_audit(username, 'support.bundle_generated', 'Generated support bundle for troubleshooting')
+        
+        # Create in-memory ZIP file
+        zip_buffer = io.BytesIO()
+        
+        with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zf:
+            
+            # 1. System Information
+            try:
+                import flask as flask_module
+                flask_ver = flask_module.__version__
+            except:
+                flask_ver = 'unknown'
+            
+            system_info = {
+                'generated_at': datetime.now().isoformat(),
+                'pegaprox_version': PEGAPROX_VERSION,
+                'pegaprox_build': PEGAPROX_BUILD,
+                'python_version': platform.python_version(),
+                'platform': platform.platform(),
+                'hostname': socket.gethostname(),
+                'architecture': platform.machine(),
+                'processor': platform.processor(),
+                'encryption_available': ENCRYPTION_AVAILABLE,
+                'encryption_enabled': ENCRYPTION_AVAILABLE and os.path.exists(KEY_FILE),
+                'totp_available': TOTP_AVAILABLE,
+                'gevent_available': GEVENT_AVAILABLE,
+                'flask_version': flask_ver,
+            }
+            zf.writestr(f"{bundle_prefix}/system_info.json", json.dumps(system_info, indent=2))
+            
+            # 2. Cluster Status (sanitized)
+            cluster_status = []
+            for cluster_id, mgr in cluster_managers.items():
+                cluster_status.append({
+                    'id': cluster_id,
+                    'name': mgr.config.name,
+                    'host': mgr.config.host,
+                    'status': 'running' if mgr.running else 'stopped',
+                    'connected': mgr.is_connected,
+                    'connection_error': mgr.connection_error,
+                    'ha_enabled': mgr.config.ha_enabled,
+                    'auto_migrate': mgr.config.auto_migrate,
+                    'dry_run': mgr.config.dry_run,
+                    'last_run': mgr.last_run.isoformat() if mgr.last_run else None,
+                    'current_host': getattr(mgr, 'current_host', None),
+                    'fallback_hosts_count': len(mgr.config.fallback_hosts) if mgr.config.fallback_hosts else 0,
+                })
+            zf.writestr(f"{bundle_prefix}/cluster_status.json", json.dumps(cluster_status, indent=2))
+            
+            # 3. SSH Connection Stats
+            try:
+                ssh_stats = get_ssh_connection_stats()
+                zf.writestr(f"{bundle_prefix}/ssh_stats.json", json.dumps(ssh_stats, indent=2))
+            except Exception as e:
+                zf.writestr(f"{bundle_prefix}/ssh_stats_error.txt", f"Failed: {str(e)}")
+            
+            # 4. SSE Connection Info
+            sse_info = {'active_clients': len(sse_clients), 'clients': []}
+            try:
+                with sse_clients_lock:
+                    for client_id, client_data in list(sse_clients.items())[:50]:
+                        sse_info['clients'].append({
+                            'user': client_data.get('user', 'unknown'),
+                            'clusters': client_data.get('clusters', []),
+                            'connected_at': client_data.get('connected_at'),
+                            'auth_method': client_data.get('auth_method')
+                        })
+            except Exception as e:
+                sse_info['error'] = str(e)
+            zf.writestr(f"{bundle_prefix}/sse_connections.json", json.dumps(sse_info, indent=2))
+            
+            # 5. Active Sessions (anonymized)
+            sessions_info = {'total_active': len(active_sessions), 'sessions': []}
+            for sid, sess in list(active_sessions.items())[:50]:
+                sessions_info['sessions'].append({
+                    'user': sess.get('user', 'unknown'),
+                    'role': sess.get('role', 'unknown'),
+                    'created_at': sess.get('created_at'),
+                    'last_activity': sess.get('last_activity'),
+                })
+            zf.writestr(f"{bundle_prefix}/sessions_info.json", json.dumps(sessions_info, indent=2))
+            
+            # 6. Recent Audit Logs (last 500 entries)
+            try:
+                db = get_db()
+                cursor = db.conn.cursor()
+                cursor.execute('SELECT timestamp, user, action, details, ip_address FROM audit_log ORDER BY timestamp DESC LIMIT 500')
+                audit_entries = []
+                for row in cursor.fetchall():
+                    audit_entries.append({
+                        'timestamp': row[0],
+                        'user': row[1],
+                        'action': row[2],
+                        'details': row[3],
+                        'ip': (row[4][:10] + '...') if row[4] and len(row[4]) > 10 else row[4]
+                    })
+                zf.writestr(f"{bundle_prefix}/audit_log.json", json.dumps(audit_entries, indent=2))
+            except Exception as e:
+                zf.writestr(f"{bundle_prefix}/audit_log_error.txt", f"Failed: {str(e)}")
+            
+            # 7. Database Schema Info
+            try:
+                db = get_db()
+                cursor = db.conn.cursor()
+                schema_info = {}
+                cursor.execute("SELECT name FROM sqlite_master WHERE type='table'")
+                tables = [row[0] for row in cursor.fetchall()]
+                for table in tables:
+                    cursor.execute(f"PRAGMA table_info({table})")
+                    columns = [{'name': col[1], 'type': col[2]} for col in cursor.fetchall()]
+                    cursor.execute(f"SELECT COUNT(*) FROM {table}")
+                    count = cursor.fetchone()[0]
+                    schema_info[table] = {'columns': columns, 'row_count': count}
+                zf.writestr(f"{bundle_prefix}/database_schema.json", json.dumps(schema_info, indent=2))
+            except Exception as e:
+                zf.writestr(f"{bundle_prefix}/database_schema_error.txt", f"Failed: {str(e)}")
+            
+            # 8. Server Settings (sanitized)
+            try:
+                settings = load_server_settings()
+                safe_settings = {}
+                sensitive_keys = ['smtp_password', 'ssl_key', 'password', 'secret', 'token', 'api_key']
+                for key, value in settings.items():
+                    if any(s in key.lower() for s in sensitive_keys):
+                        safe_settings[key] = '[REDACTED]' if value else ''
+                    else:
+                        safe_settings[key] = value
+                zf.writestr(f"{bundle_prefix}/server_settings.json", json.dumps(safe_settings, indent=2))
+            except Exception as e:
+                zf.writestr(f"{bundle_prefix}/server_settings_error.txt", f"Failed: {str(e)}")
+            
+            # 9. User List (no sensitive data)
+            try:
+                users = load_users()
+                user_list = []
+                for uname, udata in users.items():
+                    user_list.append({
+                        'username': uname,
+                        'role': udata.get('role'),
+                        'enabled': udata.get('enabled', True),
+                        'totp_enabled': udata.get('totp_enabled', False),
+                        'tenant': udata.get('tenant'),
+                        'last_login': udata.get('last_login'),
+                    })
+                zf.writestr(f"{bundle_prefix}/users_list.json", json.dumps(user_list, indent=2))
+            except Exception as e:
+                zf.writestr(f"{bundle_prefix}/users_list_error.txt", f"Failed: {str(e)}")
+            
+            # 10. Application Log (last 1000 lines)
+            # Check multiple possible log locations
+            possible_log_files = [
+                os.path.join(CONFIG_DIR, 'pegaprox.log'),
+                '/var/log/pegaprox.log',
+                'pegaprox.log',
+            ]
+            log_file = None
+            for lf in possible_log_files:
+                if os.path.exists(lf):
+                    log_file = lf
+                    break
+            
+            if log_file:
+                try:
+                    with open(log_file, 'r', encoding='utf-8', errors='replace') as f:
+                        lines = f.readlines()
+                        last_lines = lines[-1000:] if len(lines) > 1000 else lines
+                        redacted_lines = []
+                        for line in last_lines:
+                            line = re.sub(r'(password["\']?\s*[:=]\s*["\']?)[^"\'&\s]+', r'\1[REDACTED]', line, flags=re.IGNORECASE)
+                            line = re.sub(r'(token["\']?\s*[:=]\s*["\']?)[^"\'&\s]+', r'\1[REDACTED]', line, flags=re.IGNORECASE)
+                            line = re.sub(r'(secret["\']?\s*[:=]\s*["\']?)[^"\'&\s]+', r'\1[REDACTED]', line, flags=re.IGNORECASE)
+                            redacted_lines.append(line)
+                        zf.writestr(f"{bundle_prefix}/pegaprox.log", ''.join(redacted_lines))
+                except Exception as e:
+                    zf.writestr(f"{bundle_prefix}/pegaprox_log_error.txt", f"Failed: {str(e)}")
+            else:
+                zf.writestr(f"{bundle_prefix}/pegaprox.log", "Log file not found. Checked: " + ", ".join(possible_log_files))
+            
+            # 11. Recent Tasks
+            try:
+                recent_tasks = []
+                for cluster_id, mgr in cluster_managers.items():
+                    if mgr.is_connected:
+                        try:
+                            tasks = mgr.get_tasks(limit=50)
+                            if tasks:
+                                for task in tasks:
+                                    task['cluster_id'] = cluster_id
+                                    recent_tasks.append(task)
+                        except:
+                            pass
+                recent_tasks.sort(key=lambda x: x.get('starttime', 0), reverse=True)
+                zf.writestr(f"{bundle_prefix}/recent_tasks.json", json.dumps(recent_tasks[:100], indent=2))
+            except Exception as e:
+                zf.writestr(f"{bundle_prefix}/recent_tasks_error.txt", f"Failed: {str(e)}")
+            
+            # 12. Environment Variables (safe ones only)
+            safe_env_vars = {}
+            safe_prefixes = ['PEGAPROX_', 'FLASK_', 'PYTHON']
+            for key, value in os.environ.items():
+                if any(key.startswith(p) for p in safe_prefixes):
+                    if 'password' in key.lower() or 'secret' in key.lower() or 'key' in key.lower():
+                        safe_env_vars[key] = '[REDACTED]'
+                    else:
+                        safe_env_vars[key] = value
+            zf.writestr(f"{bundle_prefix}/environment.json", json.dumps(safe_env_vars, indent=2))
+            
+            # 13. README
+            readme = f"""PegaProx Support Bundle
+========================
+Generated: {datetime.now().isoformat()}
+Version: {PEGAPROX_VERSION} (Build {PEGAPROX_BUILD})
+
+Contents:
+- system_info.json: System and environment information
+- cluster_status.json: Status of all configured clusters
+- ssh_stats.json: SSH connection pool statistics
+- sse_connections.json: Server-Sent Events connection info
+- sessions_info.json: Active session information (anonymized)
+- audit_log.json: Recent audit log entries (last 500)
+- database_schema.json: Database table structure and row counts
+- server_settings.json: Server configuration (passwords redacted)
+- users_list.json: User list (no passwords)
+- pegaprox.log: Application log (last 1000 lines, sensitive data redacted)
+- recent_tasks.json: Recent Proxmox tasks from all clusters
+- environment.json: Relevant environment variables
+
+Privacy Note:
+Sensitive information (passwords, tokens, secrets, API keys) has been 
+automatically redacted. Please review contents before sharing.
+
+Generated by: {username}
+"""
+            zf.writestr(f"{bundle_prefix}/README.txt", readme)
+        
+        # Prepare response
+        zip_buffer.seek(0)
+        
+        response = make_response(zip_buffer.getvalue())
+        response.headers['Content-Type'] = 'application/zip'
+        response.headers['Content-Disposition'] = f'attachment; filename=pegaprox_support_{timestamp}.zip'
+        
+        return response
+        
+    except Exception as e:
+        logging.error(f"Support bundle generation failed: {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({'error': f'Failed to generate support bundle: {str(e)}'}), 500
+
+
 @app.route('/api/clusters', methods=['GET'])
 @require_auth(perms=['cluster.view'])
 def get_clusters():
@@ -23014,6 +24138,27 @@ def get_join_info(cluster_id):
             data = r.json().get('data', {})
             if 'preferred_node' not in data:
                 data['preferred_node'] = host
+            # LW: Feb 2026 - Proxmox returns fingerprint as 'pve_fp' per node,
+            # but frontend expects top-level 'fingerprint'. Extract it.
+            if not data.get('fingerprint'):
+                for node_entry in data.get('nodelist', []):
+                    if isinstance(node_entry, dict) and node_entry.get('pve_fp'):
+                        data['fingerprint'] = node_entry['pve_fp']
+                        break
+            # Still no fingerprint? Get from SSL cert
+            if not data.get('fingerprint'):
+                try:
+                    import ssl, socket, hashlib
+                    context = ssl.create_default_context()
+                    context.check_hostname = False
+                    context.verify_mode = ssl.CERT_NONE
+                    with socket.create_connection((host, 8006), timeout=5) as sock:
+                        with context.wrap_socket(sock, server_hostname=host) as ssock:
+                            cert_der = ssock.getpeercert(binary_form=True)
+                            fp_hex = hashlib.sha256(cert_der).hexdigest()
+                            data['fingerprint'] = ':'.join(fp_hex[i:i+2].upper() for i in range(0, len(fp_hex), 2))
+                except:
+                    pass
             return jsonify(data)
         
         # fallback
@@ -23250,7 +24395,7 @@ def get_datastore_content(cluster_id, storage_name):
                 item['storage'] = storage_name
                 item['node'] = node
                 # Calculate size in human readable format
-                size = item.get('size', 0)
+                size = item.get('size') or 0
                 if size > 1024**3:
                     item['size_human'] = f"{size / 1024**3:.2f} GB"
                 elif size > 1024**2:
@@ -25357,6 +26502,313 @@ def get_storage_status(cluster_id, storage_id):
         return jsonify({'error': str(e)}), 500
 
 
+@app.route('/api/clusters/<cluster_id>/datacenter/storage/<storage_id>/rescan', methods=['POST'])
+@require_auth(roles=[ROLE_ADMIN])
+def rescan_storage(cluster_id, storage_id):
+    """Rescan storage to detect new LUNs, volumes, or refresh status
+    
+    NS: Feb 2026 - Useful for iSCSI, Shared LVM, FC storage after adding new LUNs
+    Performs rescan on all nodes where the storage is available
+    
+    Options:
+    - deep_scan: true = Use SSH to run system-level rescan commands (for LUN resize)
+    - pvresize: true = Auto-resize LVM PVs after SCSI rescan
+    """
+    manager, error = get_connected_manager(cluster_id)
+    if error:
+        return error
+    
+    username = request.session.get('user', 'unknown')
+    
+    try:
+        host = manager.current_host or manager.config.host
+        session = manager._create_session()
+        data = request.json or {}
+        target_nodes = data.get('nodes', [])  # Optional: specific nodes to rescan
+        deep_scan = data.get('deep_scan', False)  # Use SSH for deeper rescan
+        auto_pvresize = data.get('pvresize', True)  # Auto pvresize for LVM
+        
+        # Get storage config to determine type
+        config_url = f"https://{host}:8006/api2/json/storage/{storage_id}"
+        config_resp = session.get(config_url, timeout=5)
+        if config_resp.status_code != 200:
+            return jsonify({'error': f'Storage {storage_id} not found'}), 404
+        
+        storage_config = config_resp.json().get('data', {})
+        storage_type = storage_config.get('type', '')
+        vgname = storage_config.get('vgname', '')  # For LVM
+        base_path = storage_config.get('base', '')  # For iscsi LVM base device
+        
+        # Get online nodes
+        nodes_url = f"https://{host}:8006/api2/json/nodes"
+        nodes_resp = session.get(nodes_url, timeout=5)
+        if nodes_resp.status_code != 200:
+            return jsonify({'error': 'Could not get nodes'}), 500
+        
+        all_nodes = [n['node'] for n in nodes_resp.json().get('data', []) if n.get('status') == 'online']
+        
+        # Filter to target nodes if specified
+        if target_nodes:
+            nodes = [n for n in all_nodes if n in target_nodes]
+        else:
+            nodes = all_nodes
+        
+        if not nodes:
+            return jsonify({'error': 'No online nodes available for rescan'}), 400
+        
+        results = []
+        paramiko = get_paramiko() if deep_scan else None
+        
+        for node in nodes:
+            node_result = {'node': node, 'actions': [], 'success': True}
+            
+            try:
+                # Deep scan using SSH for more thorough rescan
+                if deep_scan and paramiko:
+                    ssh_acquired = False
+                    try:
+                        # Use SSH rate limiting like update manager
+                        ssh_acquired = _ssh_semaphore.acquire(timeout=60)
+                        if not ssh_acquired:
+                            node_result['actions'].append({
+                                'action': 'ssh_queue',
+                                'status': 'failed',
+                                'error': 'SSH queue timeout - too many concurrent connections'
+                            })
+                        else:
+                            _ssh_track_connection('normal', +1)
+                            
+                            # Get SSH config from cluster
+                            ssh_user = manager.config.ssh_user if hasattr(manager.config, 'ssh_user') and manager.config.ssh_user else 'root'
+                            ssh_port = getattr(manager.config, 'ssh_port', 22) or 22
+                            ssh_key = getattr(manager.config, 'ssh_key', '')
+                            ssh_pass = manager.config.pass_ if hasattr(manager.config, 'pass_') else None
+                            
+                            # Determine node hostname
+                            node_host = host if node == nodes[0] else f"{node}.{host.split('.', 1)[1] if '.' in host else host}"
+                            
+                            # Try to connect via SSH
+                            ssh = paramiko.SSHClient()
+                            ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+                            
+                            connect_kwargs = {
+                                'hostname': node_host,
+                                'port': ssh_port,
+                                'username': ssh_user,
+                                'timeout': 30,
+                                'banner_timeout': 30,
+                                'allow_agent': False,
+                                'look_for_keys': False
+                            }
+                            
+                            # Use SSH key if configured, otherwise password
+                            if ssh_key:
+                                import io
+                                key_file = io.StringIO(ssh_key)
+                                pkey = None
+                                for key_name, key_class in [
+                                    ('RSA', paramiko.RSAKey),
+                                    ('Ed25519', paramiko.Ed25519Key),
+                                    ('ECDSA', paramiko.ECDSAKey),
+                                    ('DSA', paramiko.DSSKey)
+                                ]:
+                                    try:
+                                        key_file.seek(0)
+                                        pkey = key_class.from_private_key(key_file)
+                                        break
+                                    except:
+                                        continue
+                                if pkey:
+                                    connect_kwargs['pkey'] = pkey
+                                else:
+                                    connect_kwargs['password'] = ssh_pass
+                            else:
+                                connect_kwargs['password'] = ssh_pass
+                            
+                            try:
+                                ssh.connect(**connect_kwargs)
+                                
+                                # 1. SCSI bus rescan (detects new LUNs AND size changes)
+                                if storage_type in ['iscsi', 'iscsidirect', 'lvm', 'lvmthin']:
+                                    stdin, stdout, stderr = ssh.exec_command(
+                                        'for host in /sys/class/scsi_host/host*; do echo "- - -" > "$host/scan" 2>/dev/null; done && '
+                                        'for device in /sys/class/scsi_device/*/device/rescan; do echo 1 > "$device" 2>/dev/null; done',
+                                        timeout=30
+                                    )
+                                    exit_code = stdout.channel.recv_exit_status()
+                                    node_result['actions'].append({
+                                        'action': 'scsi_bus_rescan',
+                                        'status': 'success' if exit_code == 0 else 'partial',
+                                        'ssh': True
+                                    })
+                                    
+                                    # 1b. Multipath reconfigure (if multipath is installed)
+                                    # This updates multipath maps after SCSI rescan
+                                    stdin, stdout, stderr = ssh.exec_command(
+                                        'if command -v multipathd >/dev/null 2>&1; then '
+                                        '  multipathd reconfigure 2>/dev/null && '
+                                        '  sleep 1 && '
+                                        '  multipathd show maps 2>/dev/null | grep -c mpath || echo 0; '
+                                        'else echo "no_multipath"; fi',
+                                        timeout=30
+                                    )
+                                    mp_output = stdout.read().decode().strip()
+                                    mp_exit_code = stdout.channel.recv_exit_status()
+                                    if mp_output != "no_multipath":
+                                        node_result['actions'].append({
+                                            'action': 'multipath_reconfigure',
+                                            'status': 'success' if mp_exit_code == 0 else 'partial',
+                                            'maps_count': mp_output if mp_output.isdigit() else None,
+                                            'ssh': True
+                                        })
+                                    
+                                    # 1c. Resize multipath devices (for LUN expansion)
+                                    stdin, stdout, stderr = ssh.exec_command(
+                                        'if command -v multipathd >/dev/null 2>&1; then '
+                                        '  for map in $(multipathd show maps raw format "%n" 2>/dev/null); do '
+                                        '    multipathd resize map "$map" 2>/dev/null; '
+                                        '  done && echo "resized"; '
+                                        'else echo "no_multipath"; fi',
+                                        timeout=60
+                                    )
+                                    resize_output = stdout.read().decode().strip()
+                                    resize_exit_code = stdout.channel.recv_exit_status()
+                                    if resize_output != "no_multipath":
+                                        node_result['actions'].append({
+                                            'action': 'multipath_resize',
+                                            'status': 'success' if resize_exit_code == 0 else 'partial',
+                                            'ssh': True
+                                        })
+                                
+                                # 2. LVM pvresize (auto-resize PVs to use new LUN size)
+                                if storage_type in ['lvm', 'lvmthin'] and auto_pvresize and vgname:
+                                    stdin, stdout, stderr = ssh.exec_command(
+                                        f'pvs --noheadings -o pv_name -S vgname={vgname} 2>/dev/null | xargs -r -n1 pvresize 2>&1',
+                                        timeout=60
+                                    )
+                                    output = stdout.read().decode()
+                                    exit_code = stdout.channel.recv_exit_status()
+                                    node_result['actions'].append({
+                                        'action': 'pvresize',
+                                        'status': 'success' if exit_code == 0 else 'failed',
+                                        'vgname': vgname,
+                                        'output': output.strip()[:200] if output else None,
+                                        'ssh': True
+                                    })
+                                
+                                # 3. ZFS autoexpand
+                                if storage_type in ['zfspool', 'zfs']:
+                                    pool = storage_config.get('pool', storage_id)
+                                    stdin, stdout, stderr = ssh.exec_command(
+                                        f'zpool online -e {pool} 2>&1 || zpool scrub {pool} 2>&1',
+                                        timeout=30
+                                    )
+                                    exit_code = stdout.channel.recv_exit_status()
+                                    node_result['actions'].append({
+                                        'action': 'zfs_expand',
+                                        'status': 'success' if exit_code == 0 else 'partial',
+                                        'pool': pool,
+                                        'ssh': True
+                                    })
+                                
+                                ssh.close()
+                                
+                            except Exception as ssh_err:
+                                node_result['actions'].append({
+                                    'action': 'ssh_connect',
+                                    'status': 'failed',
+                                    'error': str(ssh_err)[:100]
+                                })
+                    except Exception as e:
+                        node_result['actions'].append({
+                            'action': 'deep_scan',
+                            'status': 'failed',
+                            'error': str(e)[:100]
+                        })
+                    finally:
+                        # Always release SSH semaphore
+                        if ssh_acquired:
+                            _ssh_track_connection('normal', -1)
+                            _ssh_semaphore.release()
+                
+                # API-based rescan (always run as fallback/supplement)
+                
+                # 1. For iSCSI storage: rescan iSCSI sessions via API
+                if storage_type in ['iscsi', 'iscsidirect']:
+                    scsi_url = f"https://{host}:8006/api2/json/nodes/{node}/disks/scsi"
+                    scsi_resp = session.post(scsi_url, timeout=30)
+                    if scsi_resp.status_code in [200, 204]:
+                        node_result['actions'].append({'action': 'scsi_rescan_api', 'status': 'success'})
+                    else:
+                        node_result['actions'].append({'action': 'scsi_rescan_api', 'status': 'failed', 'error': scsi_resp.text[:100]})
+                
+                # 2. For LVM/shared LVM: trigger LVM rescan via API
+                if storage_type in ['lvm', 'lvmthin']:
+                    lvm_url = f"https://{host}:8006/api2/json/nodes/{node}/disks/lvm"
+                    lvm_resp = session.get(lvm_url, timeout=30)
+                    if lvm_resp.status_code == 200:
+                        node_result['actions'].append({'action': 'lvm_scan_api', 'status': 'success'})
+                    else:
+                        node_result['actions'].append({'action': 'lvm_scan_api', 'status': 'failed', 'error': lvm_resp.text[:100]})
+                
+                # 3. For ZFS: refresh pool status via API
+                if storage_type in ['zfspool', 'zfs']:
+                    zfs_url = f"https://{host}:8006/api2/json/nodes/{node}/disks/zfs"
+                    zfs_resp = session.get(zfs_url, timeout=30)
+                    if zfs_resp.status_code == 200:
+                        node_result['actions'].append({'action': 'zfs_scan_api', 'status': 'success'})
+                    else:
+                        node_result['actions'].append({'action': 'zfs_scan_api', 'status': 'failed', 'error': zfs_resp.text[:100]})
+                
+                # 4. Always: Refresh storage status to update cache
+                status_url = f"https://{host}:8006/api2/json/nodes/{node}/storage/{storage_id}/status"
+                status_resp = session.get(status_url, timeout=10)
+                if status_resp.status_code == 200:
+                    status_data = status_resp.json().get('data', {})
+                    node_result['actions'].append({
+                        'action': 'status_refresh', 
+                        'status': 'success',
+                        'storage_active': status_data.get('active', False),
+                        'storage_enabled': status_data.get('enabled', False),
+                        'total': status_data.get('total', 0),
+                        'used': status_data.get('used', 0),
+                        'avail': status_data.get('avail', 0),
+                    })
+                else:
+                    node_result['actions'].append({'action': 'status_refresh', 'status': 'failed'})
+                    node_result['success'] = False
+                    
+            except Exception as e:
+                node_result['success'] = False
+                node_result['error'] = str(e)
+            
+            results.append(node_result)
+        
+        # Log the action
+        log_audit(username, 'storage.rescan', f'Rescanned storage {storage_id} on {len(nodes)} nodes (deep_scan={deep_scan})', cluster_id)
+        
+        success_count = sum(1 for r in results if r['success'])
+        
+        return jsonify({
+            'success': success_count > 0,
+            'storage': storage_id,
+            'type': storage_type,
+            'vgname': vgname if storage_type in ['lvm', 'lvmthin'] else None,
+            'deep_scan': deep_scan,
+            'nodes_scanned': len(results),
+            'nodes_successful': success_count,
+            'results': results
+        })
+        
+    except Exception as e:
+        logging.error(f"Error rescanning storage {storage_id}: {e}")
+        return jsonify({'error': str(e)}), 500
+        
+    except Exception as e:
+        logging.error(f"Error rescanning storage {storage_id}: {e}")
+        return jsonify({'error': str(e)}), 500
+
+
 @app.route('/api/clusters/<cluster_id>/storage/scan', methods=['POST'])
 @require_auth(roles=[ROLE_ADMIN])
 def scan_storage(cluster_id):
@@ -25783,6 +27235,1657 @@ def delete_backup_job(cluster_id, job_id):
             user = getattr(request, 'session', {}).get('user', 'system')
             log_audit(user, 'backup.job_deleted', f"Deleted backup job {job_id}", cluster=manager.config.name)
             return jsonify({'success': True, 'message': 'Backup job deleted'})
+        return jsonify({'error': response.text}), response.status_code
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+# ============================================
+# NS: Multipath Easy Setup - Feb 2026
+# Redundant SAN/iSCSI with multipath
+# ============================================
+
+def _get_node_multipath_data(manager, node):
+    """Internal helper: Get multipath status for a node. Returns raw dict, never Flask Response.
+    
+    NS: Feb 2026 - Extracted from route function so cluster-wide endpoint 
+    can call this without broken jsonify/tuple parsing.
+    Uses same SSH fallback logic as HA: key → passwordless → sshpass+password
+    """
+    ssh_key_path = None
+    import subprocess
+    import tempfile
+    result = {
+        'installed': False,
+        'running': False,
+        'devices': [],
+        'paths_total': 0,
+        'paths_active': 0,
+        'paths_failed': 0,
+        'config_exists': False
+    }
+    
+    try:
+        # Get SSH credentials - same pattern as HA (_ha_ssh_stop_vms_on_node)
+        # 1. ssh_user: explicit config → derive from API user → fallback 'root'
+        ssh_user = getattr(manager.config, 'ssh_user', None) or ''
+        if not ssh_user:
+            api_user = manager.config.user  # e.g. "root@pam"
+            ssh_user = api_user.split('@')[0] if '@' in api_user else (api_user or 'root')
+        
+        # 2. ssh_key: from config (may be empty)
+        ssh_key_content = getattr(manager.config, 'ssh_key', '') or ''
+        
+        # 3. ssh_password: fallback to Proxmox API password
+        ssh_password = getattr(manager.config, 'pass_', '') or ''
+        
+        # We need at least one auth method
+        if not ssh_key_content and not ssh_password:
+            result['error'] = 'No SSH credentials available. Configure SSH key or password in cluster settings.'
+            return result
+        
+        # Resolve node IP from Proxmox API (node name might not be in DNS)
+        node_ip = manager._get_node_ip(node) or node
+        logging.debug(f"[Multipath] Resolved {node} → {node_ip}")
+        
+        # Write SSH key to temp file (if available)
+        if ssh_key_content:
+            key_fd, ssh_key_path = tempfile.mkstemp(prefix='pegaprox_mp_', suffix='.key')
+            try:
+                os.chmod(ssh_key_path, 0o600)
+                with os.fdopen(key_fd, 'w') as f:
+                    key_data = ssh_key_content.strip()
+                    if not key_data.endswith('\n'):
+                        key_data += '\n'
+                    f.write(key_data)
+                key_fd = None
+            except:
+                if key_fd:
+                    os.close(key_fd)
+                raise
+        
+        # Helper: run SSH command with fallback auth (same as HA pattern)
+        def ssh_run(command, timeout=15):
+            """Try SSH: key → passwordless → sshpass+password"""
+            ssh_base = ['-o', 'StrictHostKeyChecking=no', '-o', 'ConnectTimeout=10']
+            
+            # Method 1: SSH key
+            if ssh_key_path:
+                try:
+                    r = subprocess.run(
+                        ['ssh'] + ssh_base + ['-i', ssh_key_path, f'{ssh_user}@{node_ip}', command],
+                        capture_output=True, text=True, timeout=timeout
+                    )
+                    if r.returncode == 0:
+                        return r.stdout
+                except:
+                    pass
+            
+            # Method 2: Passwordless SSH (agent/authorized_keys)
+            try:
+                r = subprocess.run(
+                    ['ssh'] + ssh_base + ['-o', 'BatchMode=yes', f'{ssh_user}@{node_ip}', command],
+                    capture_output=True, text=True, timeout=timeout
+                )
+                if r.returncode == 0:
+                    return r.stdout
+            except:
+                pass
+            
+            # Method 3: sshpass with password
+            if ssh_password:
+                try:
+                    env = os.environ.copy()
+                    env['SSHPASS'] = ssh_password
+                    r = subprocess.run(
+                        ['sshpass', '-e', 'ssh'] + ssh_base + [f'{ssh_user}@{node_ip}', command],
+                        capture_output=True, text=True, timeout=timeout, env=env
+                    )
+                    if r.returncode == 0:
+                        return r.stdout
+                except FileNotFoundError:
+                    logging.debug("[Multipath] sshpass not installed - cannot use password auth")
+                except:
+                    pass
+            
+            return None
+        
+        # Check if multipathd is installed and running
+        check_output = ssh_run('command -v multipathd && systemctl is-active multipathd 2>/dev/null || echo inactive')
+        
+        if check_output is None:
+            result['error'] = f'SSH connection failed to {node} ({node_ip}). Check credentials.'
+            return result
+        
+        if '/multipathd' in check_output:
+            result['installed'] = True
+        if 'active' in check_output and 'inactive' not in check_output:
+            result['running'] = True
+        
+        # Check if multipath.conf exists
+        conf_output = ssh_run('test -f /etc/multipath.conf && echo exists || echo missing')
+        result['config_exists'] = conf_output and 'exists' in conf_output
+        
+        if not result['running']:
+            return result
+        
+        # Get multipath topology with detailed path info
+        topo_output = ssh_run('multipathd show maps raw format "%n %w %d %N" 2>/dev/null')
+        
+        devices = []
+        if topo_output:
+            for line in topo_output.strip().split('\n'):
+                if not line.strip():
+                    continue
+                parts = line.split()
+                if len(parts) >= 4:
+                    dev_name = parts[0]
+                    wwid = parts[1]
+                    dm_dev = parts[2]
+                    nr_active = int(parts[3]) if parts[3].isdigit() else 0
+                    
+                    # Get paths for this device
+                    paths_output = ssh_run(f'multipathd show paths raw format "%m %d %t %T %s" 2>/dev/null | grep "^{dev_name}"')
+                    
+                    paths = []
+                    if paths_output:
+                        for path_line in paths_output.strip().split('\n'):
+                            if not path_line.strip():
+                                continue
+                            path_parts = path_line.split()
+                            if len(path_parts) >= 5:
+                                paths.append({
+                                    'device': path_parts[1],
+                                    'dm_state': path_parts[2],
+                                    'path_state': path_parts[3],
+                                    'host': path_parts[4] if len(path_parts) > 4 else ''
+                                })
+                                
+                                if path_parts[2] == 'active':
+                                    result['paths_active'] += 1
+                                elif path_parts[2] == 'failed':
+                                    result['paths_failed'] += 1
+                                result['paths_total'] += 1
+                    
+                    # Get size of the multipath device
+                    size_output = ssh_run(f'lsblk -b -n -o SIZE /dev/mapper/{dev_name} 2>/dev/null | head -1')
+                    size_bytes = 0
+                    if size_output and size_output.strip().isdigit():
+                        size_bytes = int(size_output.strip())
+                    
+                    devices.append({
+                        'name': dev_name,
+                        'wwid': wwid,
+                        'dm_device': dm_dev,
+                        'active_paths': nr_active,
+                        'total_paths': len(paths),
+                        'paths': paths,
+                        'size_bytes': size_bytes,
+                        'size_gb': round(size_bytes / (1024**3), 2) if size_bytes else 0,
+                        'status': 'healthy' if nr_active >= 2 else ('degraded' if nr_active == 1 else 'failed')
+                    })
+        
+        result['devices'] = devices
+        
+    except subprocess.TimeoutExpired:
+        result['error'] = 'SSH timeout'
+    except Exception as e:
+        logging.error(f"Error getting multipath status for {node}: {e}")
+        result['error'] = str(e)
+    finally:
+        if ssh_key_path and os.path.exists(ssh_key_path):
+            try:
+                os.remove(ssh_key_path)
+            except:
+                pass
+    
+    return result
+
+
+@app.route('/api/clusters/<cluster_id>/nodes/<node>/multipath', methods=['GET'])
+@require_auth(perms=['node.view'])
+def get_node_multipath_status(cluster_id, node):
+    """Get multipath status for a node - all devices, paths, and their states"""
+    manager, error = get_connected_manager(cluster_id)
+    if error:
+        return error
+    
+    result = _get_node_multipath_data(manager, node)
+    
+    if 'error' in result and result['error']:
+        return jsonify(result), 200
+    return jsonify(result)
+
+
+@app.route('/api/clusters/<cluster_id>/datacenter/multipath/status', methods=['GET'])
+@require_auth(perms=['node.view'])
+def get_cluster_multipath_status(cluster_id):
+    """Get multipath status for entire cluster"""
+    manager, error = get_connected_manager(cluster_id)
+    if error:
+        return error
+    
+    try:
+        host = manager.current_host or manager.config.host
+        
+        # Get all nodes
+        nodes_url = f"https://{host}:8006/api2/json/nodes"
+        nodes_resp = manager._create_session().get(nodes_url, timeout=10)
+        
+        if nodes_resp.status_code != 200:
+            return jsonify({'error': 'Failed to get nodes'}), 500
+        
+        nodes = [n['node'] for n in nodes_resp.json().get('data', []) if n.get('status') == 'online']
+        
+        cluster_status = {
+            'nodes': {},
+            'summary': {
+                'total_nodes': len(nodes),
+                'nodes_with_multipath': 0,
+                'total_devices': 0,
+                'healthy_devices': 0,
+                'degraded_devices': 0,
+                'failed_devices': 0
+            }
+        }
+        
+        # MK: Feb 2026 - Call internal helper directly instead of Flask route
+        # Old code called the route function which returns Response/tuples that
+        # couldn't be parsed → always showed "not installed"
+        for node in nodes:
+            try:
+                node_data = _get_node_multipath_data(manager, node)
+                cluster_status['nodes'][node] = node_data
+                
+                if node_data.get('running'):
+                    cluster_status['summary']['nodes_with_multipath'] += 1
+                
+                for dev in node_data.get('devices', []):
+                    cluster_status['summary']['total_devices'] += 1
+                    status = dev.get('status', 'unknown')
+                    if status == 'healthy':
+                        cluster_status['summary']['healthy_devices'] += 1
+                    elif status == 'degraded':
+                        cluster_status['summary']['degraded_devices'] += 1
+                    elif status == 'failed':
+                        cluster_status['summary']['failed_devices'] += 1
+            except Exception as e:
+                cluster_status['nodes'][node] = {'error': str(e), 'installed': False, 'running': False, 'devices': []}
+        
+        return jsonify(cluster_status)
+        
+    except Exception as e:
+        logging.error(f"Error getting cluster multipath status: {e}")
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/clusters/<cluster_id>/datacenter/multipath/setup', methods=['POST'])
+@require_auth(roles=[ROLE_ADMIN])
+def setup_multipath(cluster_id):
+    """Easy Setup: Install and configure multipath on all nodes
+    
+    This will:
+    1. Install multipath-tools package
+    2. Generate optimized multipath.conf (unless skipExistingConfig and config exists)
+    3. Enable and start multipathd service
+    4. Scan for devices
+    
+    Once multipathd is running, ALL new iSCSI/FC connections will automatically
+    use multipath if multiple paths are available!
+    """
+    manager, error = get_connected_manager(cluster_id)
+    if error:
+        return error
+    
+    data = request.json or {}
+    target_nodes = data.get('nodes', [])  # Empty = all nodes
+    vendor = data.get('vendor', 'default')  # default, netapp, emc, hpe, pure, dell
+    policy = data.get('policy', 'service-time')  # round-robin, service-time, queue-length
+    skip_existing_config = data.get('skipExistingConfig', False)  # Don't overwrite existing config
+    
+    try:
+        host = manager.current_host or manager.config.host
+        # LW: Feb 2026 - Same SSH credential pattern as HA
+        ssh_user = getattr(manager.config, 'ssh_user', None) or ''
+        if not ssh_user:
+            api_user = manager.config.user
+            ssh_user = api_user.split('@')[0] if '@' in api_user else (api_user or 'root')
+        ssh_key_content = getattr(manager.config, 'ssh_key', '') or ''
+        ssh_password = getattr(manager.config, 'pass_', '') or ''
+        
+        if not ssh_key_content and not ssh_password:
+            return jsonify({'error': 'SSH credentials required for multipath setup. Configure SSH key or password in cluster settings.'}), 400
+        
+        # Write SSH key to temp file (if available)
+        import tempfile
+        ssh_key_path = None
+        if ssh_key_content:
+            key_fd, ssh_key_path = tempfile.mkstemp(prefix='pegaprox_mp_', suffix='.key')
+            try:
+                os.chmod(ssh_key_path, 0o600)
+                with os.fdopen(key_fd, 'w') as f:
+                    key_data = ssh_key_content.strip()
+                    if not key_data.endswith('\n'):
+                        key_data += '\n'
+                    f.write(key_data)
+                key_fd = None  # fd is now closed
+            except:
+                if key_fd:
+                    os.close(key_fd)
+                raise
+        
+        # Get nodes if not specified
+        if not target_nodes:
+            nodes_url = f"https://{host}:8006/api2/json/nodes"
+            nodes_resp = manager._create_session().get(nodes_url, timeout=10)
+            if nodes_resp.status_code == 200:
+                target_nodes = [n['node'] for n in nodes_resp.json().get('data', []) if n.get('status') == 'online']
+        
+        # Generate multipath.conf based on vendor
+        multipath_conf = generate_multipath_conf(vendor, policy)
+        
+        results = []
+        import subprocess
+        
+        # MK: Feb 2026 - Build SSH prefix based on available credentials
+        if ssh_key_path:
+            ssh_prefix = f"ssh -o StrictHostKeyChecking=no -o ConnectTimeout=15 -i {ssh_key_path}"
+        elif ssh_password:
+            ssh_prefix = f"sshpass -e ssh -o StrictHostKeyChecking=no -o ConnectTimeout=15"
+        else:
+            ssh_prefix = f"ssh -o StrictHostKeyChecking=no -o ConnectTimeout=15 -o BatchMode=yes"
+        
+        # Set SSHPASS env for password auth
+        ssh_env = os.environ.copy()
+        if ssh_password:
+            ssh_env['SSHPASS'] = ssh_password
+        
+        for node in target_nodes:
+            node_result = {'node': node, 'steps': [], 'success': True, 'skipped_config': False}
+            
+            # Resolve node IP
+            node_ip = manager._get_node_ip(node) or node
+            
+            try:
+                # Step 1: Check if already installed
+                check_cmd = f"{ssh_prefix} {ssh_user}@{node_ip} 'dpkg -l | grep -q multipath-tools && echo installed || echo not_installed'"
+                check_result = subprocess.run(check_cmd, shell=True, capture_output=True, text=True, timeout=15, env=ssh_env)
+                already_installed = 'installed' in check_result.stdout and 'not_installed' not in check_result.stdout
+                
+                # Step 2: Install multipath-tools (if not installed)
+                if not already_installed:
+                    install_cmd = f"{ssh_prefix} {ssh_user}@{node_ip} 'DEBIAN_FRONTEND=noninteractive apt-get update -qq && apt-get install -y multipath-tools 2>&1'"
+                    install_result = subprocess.run(install_cmd, shell=True, capture_output=True, text=True, timeout=120, env=ssh_env)
+                    node_result['steps'].append({
+                        'action': 'install',
+                        'success': install_result.returncode == 0,
+                        'output': install_result.stdout[-500:] if install_result.stdout else install_result.stderr[-500:]
+                    })
+                else:
+                    node_result['steps'].append({
+                        'action': 'install',
+                        'success': True,
+                        'output': 'Already installed'
+                    })
+                
+                # Step 3: Check if config exists
+                config_check_cmd = f"{ssh_prefix} {ssh_user}@{node_ip} 'test -f /etc/multipath.conf && cat /etc/multipath.conf | head -5 || echo NO_CONFIG'"
+                config_check = subprocess.run(config_check_cmd, shell=True, capture_output=True, text=True, timeout=10, env=ssh_env)
+                config_exists = 'NO_CONFIG' not in config_check.stdout
+                
+                # Step 4: Handle config
+                if config_exists and skip_existing_config:
+                    # Keep existing config
+                    node_result['skipped_config'] = True
+                    node_result['steps'].append({
+                        'action': 'config',
+                        'success': True,
+                        'output': 'Existing config preserved'
+                    })
+                else:
+                    # Backup and write new config
+                    if config_exists:
+                        backup_cmd = f"{ssh_prefix} {ssh_user}@{node_ip} 'cp /etc/multipath.conf /etc/multipath.conf.bak.$(date +%Y%m%d%H%M%S)'"
+                        subprocess.run(backup_cmd, shell=True, capture_output=True, timeout=10, env=ssh_env)
+                    
+                    # Write new multipath.conf
+                    # Use heredoc with base64 encoding for safer transfer
+                    import base64
+                    conf_b64 = base64.b64encode(multipath_conf.encode()).decode()
+                    write_cmd = f"{ssh_prefix} {ssh_user}@{node_ip} 'echo {conf_b64} | base64 -d > /etc/multipath.conf'"
+                    write_result = subprocess.run(write_cmd, shell=True, capture_output=True, text=True, timeout=30, env=ssh_env)
+                    node_result['steps'].append({
+                        'action': 'config',
+                        'success': write_result.returncode == 0,
+                        'output': 'Config written' if write_result.returncode == 0 else write_result.stderr[:200]
+                    })
+                
+                # Step 5: Enable and restart multipathd
+                service_cmd = f"{ssh_prefix} {ssh_user}@{node_ip} 'systemctl enable multipathd && systemctl restart multipathd && sleep 2 && systemctl is-active multipathd'"
+                service_result = subprocess.run(service_cmd, shell=True, capture_output=True, text=True, timeout=30, env=ssh_env)
+                node_result['steps'].append({
+                    'action': 'service',
+                    'success': 'active' in service_result.stdout,
+                    'status': service_result.stdout.strip()
+                })
+                
+                # Step 6: Scan for devices
+                scan_cmd = f"{ssh_prefix} {ssh_user}@{node_ip} 'multipathd reconfigure && sleep 1 && multipath -ll 2>/dev/null | head -20 || echo \"No multipath devices found\"'"
+                scan_result = subprocess.run(scan_cmd, shell=True, capture_output=True, text=True, timeout=30, env=ssh_env)
+                node_result['steps'].append({
+                    'action': 'scan',
+                    'success': scan_result.returncode == 0,
+                    'devices': scan_result.stdout[:1000]
+                })
+                
+                # Check if critical steps succeeded (install and service)
+                critical_steps = [s for s in node_result['steps'] if s['action'] in ['install', 'service']]
+                node_result['success'] = all(s.get('success', False) for s in critical_steps)
+                
+            except subprocess.TimeoutExpired:
+                node_result['success'] = False
+                node_result['error'] = 'SSH timeout'
+            except Exception as e:
+                node_result['success'] = False
+                node_result['error'] = str(e)
+            
+            results.append(node_result)
+        
+        # Audit log
+        user = getattr(request, 'session', {}).get('user', 'system')
+        success_count = sum(1 for r in results if r['success'])
+        skipped_count = sum(1 for r in results if r.get('skipped_config'))
+        log_audit(user, 'multipath.setup', f"Multipath Easy Setup on {success_count}/{len(results)} nodes (vendor={vendor}, policy={policy}, configs_skipped={skipped_count})", cluster=manager.config.name)
+        
+        # Cleanup temp SSH key
+        if ssh_key_path and os.path.exists(ssh_key_path):
+            try:
+                os.remove(ssh_key_path)
+            except:
+                pass
+        
+        return jsonify({
+            'success': all(r['success'] for r in results),
+            'results': results,
+            'config_used': multipath_conf if not skip_existing_config else None,
+            'message': 'Multipath is now active. All new iSCSI/FC LUNs will automatically use redundant paths!'
+        })
+        
+    except Exception as e:
+        logging.error(f"Error in multipath setup: {e}")
+        # Cleanup temp SSH key on error
+        if 'ssh_key_path' in locals() and ssh_key_path and os.path.exists(ssh_key_path):
+            try:
+                os.remove(ssh_key_path)
+            except:
+                pass
+        return jsonify({'error': str(e)}), 500
+
+
+def generate_multipath_conf(vendor: str, policy: str) -> str:
+    """Generate optimized multipath.conf for different storage vendors"""
+    
+    # Common defaults section
+    defaults = f'''defaults {{
+    user_friendly_names yes
+    find_multipaths yes
+    path_grouping_policy failover
+    path_selector "{policy} 0"
+    failback immediate
+    no_path_retry 5
+    polling_interval 5
+}}
+
+blacklist {{
+    devnode "^(ram|raw|loop|fd|md|dm-|sr|scd|st)[0-9]*"
+    devnode "^hd[a-z]"
+    devnode "^vd[a-z]"
+    device {{
+        vendor "VBOX"
+        product "HARDDISK"
+    }}
+}}
+
+blacklist_exceptions {{
+    device {{
+        vendor ".*"
+        product ".*"
+    }}
+}}
+'''
+    
+    # Vendor-specific device sections
+    vendor_configs = {
+        'default': '',
+        
+        'netapp': '''
+devices {
+    device {
+        vendor "NETAPP"
+        product "LUN.*"
+        path_grouping_policy group_by_prio
+        path_selector "service-time 0"
+        prio alua
+        failback immediate
+        no_path_retry 5
+        rr_weight uniform
+        rr_min_io 128
+        dev_loss_tmo infinity
+    }
+}
+''',
+        
+        'emc': '''
+devices {
+    device {
+        vendor "EMC"
+        product ".*"
+        path_grouping_policy group_by_prio
+        path_selector "service-time 0"
+        prio emc
+        failback immediate
+        no_path_retry 5
+        hardware_handler "1 emc"
+    }
+    device {
+        vendor "DGC"
+        product ".*"
+        path_grouping_policy group_by_prio
+        path_selector "service-time 0"
+        prio alua
+        failback immediate
+        no_path_retry 5
+    }
+}
+''',
+        
+        'hpe': '''
+devices {
+    device {
+        vendor "HP"
+        product ".*"
+        path_grouping_policy group_by_prio
+        path_selector "service-time 0"
+        prio alua
+        failback immediate
+        no_path_retry 5
+    }
+    device {
+        vendor "3PARdata"
+        product "VV"
+        path_grouping_policy group_by_prio
+        path_selector "service-time 0"
+        prio alua
+        failback immediate
+        no_path_retry 5
+    }
+}
+''',
+        
+        'pure': '''
+devices {
+    device {
+        vendor "PURE"
+        product "FlashArray"
+        path_grouping_policy group_by_prio
+        path_selector "service-time 0"
+        prio alua
+        failback immediate
+        no_path_retry 5
+        fast_io_fail_tmo 10
+        dev_loss_tmo 60
+    }
+}
+''',
+        
+        'dell': '''
+devices {
+    device {
+        vendor "DELL"
+        product ".*"
+        path_grouping_policy group_by_prio
+        path_selector "service-time 0"
+        prio alua
+        failback immediate
+        no_path_retry 5
+    }
+    device {
+        vendor "COMPELNT"
+        product "Compellent Vol"
+        path_grouping_policy multibus
+        path_selector "service-time 0"
+        failback immediate
+        no_path_retry 5
+    }
+}
+'''
+    }
+    
+    device_config = vendor_configs.get(vendor, vendor_configs['default'])
+    
+    return f'''# Multipath configuration - Generated by PegaProx
+# Vendor: {vendor}
+# Policy: {policy}
+# Generated: {datetime.now().isoformat()}
+
+{defaults}
+{device_config}'''
+
+
+@app.route('/api/clusters/<cluster_id>/nodes/<node>/multipath/reconfigure', methods=['POST'])
+@require_auth(roles=[ROLE_ADMIN])
+def reconfigure_multipath(cluster_id, node):
+    """Reconfigure multipath on a specific node (rescan devices)"""
+    manager, error = get_connected_manager(cluster_id)
+    if error:
+        return error
+    
+    ssh_key_path = None
+    try:
+        # LW: Feb 2026 - Same SSH credential pattern as HA
+        ssh_user = getattr(manager.config, 'ssh_user', None) or ''
+        if not ssh_user:
+            api_user = manager.config.user
+            ssh_user = api_user.split('@')[0] if '@' in api_user else (api_user or 'root')
+        ssh_key_content = getattr(manager.config, 'ssh_key', '') or ''
+        ssh_password = getattr(manager.config, 'pass_', '') or ''
+        
+        if not ssh_key_content and not ssh_password:
+            return jsonify({'error': 'SSH credentials required'}), 400
+        
+        # Resolve node IP
+        node_ip = manager._get_node_ip(node) or node
+        
+        # Write SSH key to temp file (if available)
+        import tempfile
+        if ssh_key_content:
+            key_fd, ssh_key_path = tempfile.mkstemp(prefix='pegaprox_mp_', suffix='.key')
+            try:
+                os.chmod(ssh_key_path, 0o600)
+                with os.fdopen(key_fd, 'w') as f:
+                    key_data = ssh_key_content.strip()
+                    if not key_data.endswith('\n'):
+                        key_data += '\n'
+                    f.write(key_data)
+                key_fd = None
+            except:
+                if key_fd:
+                    os.close(key_fd)
+                raise
+        
+        import subprocess
+        
+        # Build SSH prefix based on available credentials
+        if ssh_key_path:
+            ssh_prefix = f"ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 -i {ssh_key_path}"
+        elif ssh_password:
+            ssh_prefix = "sshpass -e ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10"
+        else:
+            ssh_prefix = "ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 -o BatchMode=yes"
+        
+        ssh_env = os.environ.copy()
+        if ssh_password:
+            ssh_env['SSHPASS'] = ssh_password
+        
+        # Reconfigure multipath
+        cmd = f"{ssh_prefix} {ssh_user}@{node_ip} 'multipathd reconfigure && sleep 2 && multipath -ll'"
+        result = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=60, env=ssh_env)
+        
+        user = getattr(request, 'session', {}).get('user', 'system')
+        log_audit(user, 'multipath.reconfigure', f"Reconfigured multipath on {node}", cluster=manager.config.name)
+        
+        return jsonify({
+            'success': result.returncode == 0,
+            'output': result.stdout,
+            'error': result.stderr if result.returncode != 0 else None
+        })
+        
+    except subprocess.TimeoutExpired:
+        return jsonify({'error': 'SSH timeout'}), 500
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+    finally:
+        if ssh_key_path and os.path.exists(ssh_key_path):
+            try:
+                os.remove(ssh_key_path)
+            except:
+                pass
+
+
+@app.route('/api/clusters/<cluster_id>/nodes/<node>/iscsi/discover', methods=['POST'])
+@require_auth(roles=[ROLE_ADMIN])
+def discover_iscsi_targets(cluster_id, node):
+    """Discover iSCSI targets on a portal - for Easy Setup"""
+    manager, error = get_connected_manager(cluster_id)
+    if error:
+        return error
+    
+    data = request.json or {}
+    portal = data.get('portal', '')  # IP:port or just IP
+    
+    if not portal:
+        return jsonify({'error': 'Portal address required'}), 400
+    
+    # Add default port if not specified
+    if ':' not in portal:
+        portal = f"{portal}:3260"
+    
+    try:
+        host = manager.current_host or manager.config.host
+        
+        # Use Proxmox API to scan iSCSI targets
+        scan_url = f"https://{host}:8006/api2/json/nodes/{node}/scan/iscsi"
+        response = manager._create_session().get(scan_url, params={'portal': portal}, timeout=30)
+        
+        if response.status_code == 200:
+            targets = response.json().get('data', [])
+            return jsonify({
+                'portal': portal,
+                'targets': targets
+            })
+        else:
+            return jsonify({'error': response.text}), response.status_code
+            
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/clusters/<cluster_id>/nodes/<node>/iscsi/login', methods=['POST'])
+@require_auth(roles=[ROLE_ADMIN])
+def login_iscsi_target(cluster_id, node):
+    """Login to an iSCSI target - creates persistent connection"""
+    manager, error = get_connected_manager(cluster_id)
+    if error:
+        return error
+    
+    data = request.json or {}
+    portal = data.get('portal', '')
+    target = data.get('target', '')
+    username = data.get('username', '')
+    password = data.get('password', '')
+    
+    if not portal or not target:
+        return jsonify({'error': 'Portal and target required'}), 400
+    
+    ssh_key_path = None
+    try:
+        ssh_user = manager.config.ssh_user if hasattr(manager.config, 'ssh_user') else ''
+        ssh_key_content = manager.config.ssh_key if hasattr(manager.config, 'ssh_key') else ''
+        
+        if not ssh_user or not ssh_key_content:
+            return jsonify({'error': 'SSH credentials required'}), 400
+        
+        # Write SSH key to temp file
+        import tempfile
+        key_fd, ssh_key_path = tempfile.mkstemp(prefix='pegaprox_mp_', suffix='.key')
+        try:
+            os.chmod(ssh_key_path, 0o600)
+            with os.fdopen(key_fd, 'w') as f:
+                key_data = ssh_key_content.strip()
+                if not key_data.endswith('\n'):
+                    key_data += '\n'
+                f.write(key_data)
+            key_fd = None
+        except:
+            if key_fd:
+                os.close(key_fd)
+            raise
+        
+        import subprocess
+        ssh_opts = f"-o StrictHostKeyChecking=no -o ConnectTimeout=15 -i {ssh_key_path}"
+        
+        # If CHAP credentials provided, set them first
+        if username and password:
+            chap_cmd = f'''ssh {ssh_opts} {ssh_user}@{node} '
+                iscsiadm -m node -T {target} -p {portal} --op update -n node.session.auth.authmethod -v CHAP
+                iscsiadm -m node -T {target} -p {portal} --op update -n node.session.auth.username -v {username}
+                iscsiadm -m node -T {target} -p {portal} --op update -n node.session.auth.password -v {password}
+            ' '''
+            subprocess.run(chap_cmd, shell=True, capture_output=True, timeout=30)
+        
+        # Discovery
+        discover_cmd = f"ssh {ssh_opts} {ssh_user}@{node} 'iscsiadm -m discovery -t sendtargets -p {portal}'"
+        discover_result = subprocess.run(discover_cmd, shell=True, capture_output=True, text=True, timeout=30)
+        
+        # Login
+        login_cmd = f"ssh {ssh_opts} {ssh_user}@{node} 'iscsiadm -m node -T {target} -p {portal} --login'"
+        login_result = subprocess.run(login_cmd, shell=True, capture_output=True, text=True, timeout=30)
+        
+        # Make persistent
+        persist_cmd = f"ssh {ssh_opts} {ssh_user}@{node} 'iscsiadm -m node -T {target} -p {portal} --op update -n node.startup -v automatic'"
+        subprocess.run(persist_cmd, shell=True, capture_output=True, timeout=15)
+        
+        # Trigger multipath rescan
+        mp_cmd = f"ssh {ssh_opts} {ssh_user}@{node} 'multipathd reconfigure 2>/dev/null || true'"
+        subprocess.run(mp_cmd, shell=True, capture_output=True, timeout=15)
+        
+        user = getattr(request, 'session', {}).get('user', 'system')
+        log_audit(user, 'iscsi.login', f"Logged into iSCSI target {target} on {node}", cluster=manager.config.name)
+        
+        # Cleanup
+        if ssh_key_path and os.path.exists(ssh_key_path):
+            try:
+                os.remove(ssh_key_path)
+            except:
+                pass
+        
+        return jsonify({
+            'success': login_result.returncode == 0,
+            'output': login_result.stdout,
+            'error': login_result.stderr if login_result.returncode != 0 else None
+        })
+        
+    except subprocess.TimeoutExpired:
+        if ssh_key_path and os.path.exists(ssh_key_path):
+            try:
+                os.remove(ssh_key_path)
+            except:
+                pass
+        return jsonify({'error': 'SSH timeout'}), 500
+    except Exception as e:
+        if 'ssh_key_path' in locals() and ssh_key_path and os.path.exists(ssh_key_path):
+            try:
+                os.remove(ssh_key_path)
+            except:
+                pass
+        return jsonify({'error': str(e)}), 500
+
+
+# ============================================
+# LW: SDN (Software Defined Networking) - Feb 2026
+# View and manage SDN zones, vnets, subnets
+# GitHub Issue #38 - requested by multiple users
+# MK: Proxmox SDN API is a bit inconsistent, some endpoints return
+# different formats depending on PVE version. We normalize everything here.
+# ============================================
+
+@app.route('/api/clusters/<cluster_id>/datacenter/sdn', methods=['GET'])
+@require_auth(perms=['node.view'])
+def get_sdn_overview(cluster_id):
+    """Get complete SDN overview including zones, vnets, subnets, controllers, IPAM, DNS"""
+    manager, error = get_connected_manager(cluster_id)
+    if error:
+        return error
+    
+    try:
+        host = manager.current_host or manager.config.host
+        session = manager._create_session()
+        
+        result = {
+            'available': False,
+            'zones': [],
+            'vnets': [],
+            'subnets': [],
+            'controllers': [],
+            'ipams': [],
+            'dns': [],
+            'pending': False,
+            'digest': None,
+            'debug': {}  # Debug info for troubleshooting
+        }
+        
+        # Check if SDN is available
+        sdn_url = f"https://{host}:8006/api2/json/cluster/sdn"
+        try:
+            sdn_resp = session.get(sdn_url, timeout=10)
+            result['debug']['sdn_status'] = sdn_resp.status_code
+            logging.info(f"SDN API response: status={sdn_resp.status_code}")
+            
+            if sdn_resp.status_code == 501:
+                # SDN not installed/configured - this is normal for clusters without SDN
+                logging.info("SDN not available (501 - not installed)")
+                return jsonify(result)
+            
+            if sdn_resp.status_code == 200:
+                result['available'] = True
+                sdn_data = sdn_resp.json().get('data', {})
+                result['digest'] = sdn_data.get('digest')
+                logging.info(f"SDN available, digest={result['digest']}")
+            elif sdn_resp.status_code == 403:
+                # Permission denied - SDN exists but user can't access
+                logging.warning("SDN permission denied (403)")
+                result['available'] = True  # Mark as available, permissions issue
+                result['error'] = 'Permission denied - check SDN.Audit permission'
+            else:
+                # Other error - try to continue anyway
+                logging.warning(f"SDN API returned {sdn_resp.status_code}: {sdn_resp.text[:200]}")
+                # Still try to get zones/vnets - they might work
+                result['available'] = True
+        except Exception as e:
+            logging.error(f"SDN availability check failed: {e}")
+            # Try to continue - maybe zones endpoint works
+            result['available'] = True
+        
+        # Get zones
+        zones_url = f"https://{host}:8006/api2/json/cluster/sdn/zones"
+        try:
+            zones_resp = session.get(zones_url, timeout=10)
+            result['debug']['zones_status'] = zones_resp.status_code
+            logging.info(f"SDN zones response: status={zones_resp.status_code}")
+            if zones_resp.status_code == 200:
+                result['zones'] = zones_resp.json().get('data', [])
+                result['available'] = True  # If zones works, SDN is available
+                logging.info(f"Found {len(result['zones'])} SDN zones")
+            elif zones_resp.status_code == 501:
+                # Definitely no SDN
+                result['available'] = False
+                result['debug']['error'] = 'SDN not installed (501 from zones endpoint)'
+                logging.info("SDN zones returned 501 - SDN not installed")
+                return jsonify(result)
+            else:
+                result['debug']['zones_error'] = zones_resp.text[:200] if zones_resp.text else 'No response body'
+        except Exception as e:
+            logging.error(f"SDN zones fetch failed: {e}")
+            result['debug']['zones_exception'] = str(e)
+        
+        # Get vnets
+        vnets_url = f"https://{host}:8006/api2/json/cluster/sdn/vnets"
+        vnets_resp = session.get(vnets_url, timeout=10)
+        if vnets_resp.status_code == 200:
+            result['vnets'] = vnets_resp.json().get('data', [])
+        
+        # Get subnets for each vnet
+        subnets = []
+        for vnet in result['vnets']:
+            vnet_name = vnet.get('vnet', '')
+            if vnet_name:
+                subnets_url = f"https://{host}:8006/api2/json/cluster/sdn/vnets/{vnet_name}/subnets"
+                subnets_resp = session.get(subnets_url, timeout=10)
+                if subnets_resp.status_code == 200:
+                    for subnet in subnets_resp.json().get('data', []):
+                        subnet['vnet'] = vnet_name
+                        subnets.append(subnet)
+        result['subnets'] = subnets
+        
+        # Get controllers
+        try:
+            ctrl_url = f"https://{host}:8006/api2/json/cluster/sdn/controllers"
+            ctrl_resp = session.get(ctrl_url, timeout=10)
+            if ctrl_resp.status_code == 200:
+                result['controllers'] = ctrl_resp.json().get('data', [])
+        except:
+            pass
+        
+        # Get IPAM configurations
+        try:
+            ipam_url = f"https://{host}:8006/api2/json/cluster/sdn/ipams"
+            ipam_resp = session.get(ipam_url, timeout=10)
+            if ipam_resp.status_code == 200:
+                result['ipams'] = ipam_resp.json().get('data', [])
+        except:
+            pass
+        
+        # Get DNS configurations
+        try:
+            dns_url = f"https://{host}:8006/api2/json/cluster/sdn/dns"
+            dns_resp = session.get(dns_url, timeout=10)
+            if dns_resp.status_code == 200:
+                result['dns'] = dns_resp.json().get('data', [])
+        except:
+            pass
+        
+        # Check for pending changes
+        try:
+            pending_url = f"https://{host}:8006/api2/json/cluster/sdn"
+            pending_resp = session.get(pending_url, timeout=10)
+            if pending_resp.status_code == 200:
+                # If there are pending changes, the running config differs from pending
+                pending_data = pending_resp.json().get('data', {})
+                result['pending'] = bool(pending_data.get('pending'))
+        except:
+            pass
+        
+        return jsonify(result)
+        
+    except Exception as e:
+        logging.error(f"Error getting SDN overview: {e}")
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/clusters/<cluster_id>/datacenter/sdn/zones', methods=['GET'])
+@require_auth(perms=['node.view'])
+def get_sdn_zones(cluster_id):
+    """Get SDN zones"""
+    # MK: 501 means SDN not enabled on this cluster - return empty list instead of error
+    manager, error = get_connected_manager(cluster_id)
+    if error:
+        return error
+    
+    try:
+        host = manager.current_host or manager.config.host
+        url = f"https://{host}:8006/api2/json/cluster/sdn/zones"
+        response = manager._create_session().get(url, timeout=10)
+        
+        if response.status_code == 200:
+            return jsonify(response.json().get('data', []))
+        elif response.status_code == 501:
+            return jsonify([])
+        return jsonify({'error': response.text}), response.status_code
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/clusters/<cluster_id>/datacenter/sdn/zones', methods=['POST'])
+@require_auth(roles=[ROLE_ADMIN])
+def create_sdn_zone(cluster_id):
+    # NS: Zone types: simple, vlan, qinq, vxlan, evpn - each has different required params
+    """Create a new SDN zone"""
+    manager, error = get_connected_manager(cluster_id)
+    if error:
+        return error
+    
+    try:
+        host = manager.current_host or manager.config.host
+        data = request.json or {}
+        
+        url = f"https://{host}:8006/api2/json/cluster/sdn/zones"
+        response = manager._create_session().post(url, data=data, timeout=10)
+        
+        if response.status_code in [200, 201]:
+            user = getattr(request, 'session', {}).get('user', 'system')
+            log_audit(user, 'sdn.zone_created', f"Created SDN zone: {data.get('zone', 'unknown')}", cluster=manager.config.name)
+            return jsonify({'success': True, 'message': 'Zone created'})
+        return jsonify({'error': response.text}), response.status_code
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/clusters/<cluster_id>/datacenter/sdn/zones/<zone_id>', methods=['PUT'])
+@require_auth(roles=[ROLE_ADMIN])
+def update_sdn_zone(cluster_id, zone_id):
+    """Update an SDN zone"""
+    manager, error = get_connected_manager(cluster_id)
+    if error:
+        return error
+    
+    try:
+        host = manager.current_host or manager.config.host
+        data = request.json or {}
+        
+        url = f"https://{host}:8006/api2/json/cluster/sdn/zones/{zone_id}"
+        response = manager._create_session().put(url, data=data, timeout=10)
+        
+        if response.status_code == 200:
+            user = getattr(request, 'session', {}).get('user', 'system')
+            log_audit(user, 'sdn.zone_updated', f"Updated SDN zone: {zone_id}", cluster=manager.config.name)
+            return jsonify({'success': True, 'message': 'Zone updated'})
+        return jsonify({'error': response.text}), response.status_code
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/clusters/<cluster_id>/datacenter/sdn/zones/<zone_id>', methods=['DELETE'])
+@require_auth(roles=[ROLE_ADMIN])
+def delete_sdn_zone(cluster_id, zone_id):
+    """Delete an SDN zone"""
+    manager, error = get_connected_manager(cluster_id)
+    if error:
+        return error
+    
+    try:
+        host = manager.current_host or manager.config.host
+        
+        url = f"https://{host}:8006/api2/json/cluster/sdn/zones/{zone_id}"
+        response = manager._create_session().delete(url, timeout=10)
+        
+        if response.status_code == 200:
+            user = getattr(request, 'session', {}).get('user', 'system')
+            log_audit(user, 'sdn.zone_deleted', f"Deleted SDN zone: {zone_id}", cluster=manager.config.name)
+            return jsonify({'success': True, 'message': 'Zone deleted'})
+        return jsonify({'error': response.text}), response.status_code
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/clusters/<cluster_id>/datacenter/sdn/vnets', methods=['GET'])
+@require_auth(perms=['node.view'])
+def get_sdn_vnets(cluster_id):
+    """Get SDN VNets"""
+    # LW: VNets are the main abstraction layer - each vnet belongs to exactly one zone
+    manager, error = get_connected_manager(cluster_id)
+    if error:
+        return error
+    
+    try:
+        host = manager.current_host or manager.config.host
+        url = f"https://{host}:8006/api2/json/cluster/sdn/vnets"
+        response = manager._create_session().get(url, timeout=10)
+        
+        if response.status_code == 200:
+            return jsonify(response.json().get('data', []))
+        elif response.status_code == 501:
+            return jsonify([])
+        return jsonify({'error': response.text}), response.status_code
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/clusters/<cluster_id>/datacenter/sdn/vnets', methods=['POST'])
+@require_auth(roles=[ROLE_ADMIN])
+def create_sdn_vnet(cluster_id):
+    """Create a new SDN VNet"""
+    manager, error = get_connected_manager(cluster_id)
+    if error:
+        return error
+    
+    try:
+        host = manager.current_host or manager.config.host
+        data = request.json or {}
+        
+        url = f"https://{host}:8006/api2/json/cluster/sdn/vnets"
+        response = manager._create_session().post(url, data=data, timeout=10)
+        
+        if response.status_code in [200, 201]:
+            user = getattr(request, 'session', {}).get('user', 'system')
+            log_audit(user, 'sdn.vnet_created', f"Created SDN VNet: {data.get('vnet', 'unknown')}", cluster=manager.config.name)
+            return jsonify({'success': True, 'message': 'VNet created'})
+        return jsonify({'error': response.text}), response.status_code
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/clusters/<cluster_id>/datacenter/sdn/vnets/<vnet_id>', methods=['PUT'])
+@require_auth(roles=[ROLE_ADMIN])
+def update_sdn_vnet(cluster_id, vnet_id):
+    """Update an SDN VNet"""
+    manager, error = get_connected_manager(cluster_id)
+    if error:
+        return error
+    
+    try:
+        host = manager.current_host or manager.config.host
+        data = request.json or {}
+        
+        url = f"https://{host}:8006/api2/json/cluster/sdn/vnets/{vnet_id}"
+        response = manager._create_session().put(url, data=data, timeout=10)
+        
+        if response.status_code == 200:
+            user = getattr(request, 'session', {}).get('user', 'system')
+            log_audit(user, 'sdn.vnet_updated', f"Updated SDN VNet: {vnet_id}", cluster=manager.config.name)
+            return jsonify({'success': True, 'message': 'VNet updated'})
+        return jsonify({'error': response.text}), response.status_code
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/clusters/<cluster_id>/datacenter/sdn/vnets/<vnet_id>', methods=['DELETE'])
+@require_auth(roles=[ROLE_ADMIN])
+def delete_sdn_vnet(cluster_id, vnet_id):
+    """Delete an SDN VNet"""
+    manager, error = get_connected_manager(cluster_id)
+    if error:
+        return error
+    
+    try:
+        host = manager.current_host or manager.config.host
+        
+        url = f"https://{host}:8006/api2/json/cluster/sdn/vnets/{vnet_id}"
+        response = manager._create_session().delete(url, timeout=10)
+        
+        if response.status_code == 200:
+            user = getattr(request, 'session', {}).get('user', 'system')
+            log_audit(user, 'sdn.vnet_deleted', f"Deleted SDN VNet: {vnet_id}", cluster=manager.config.name)
+            return jsonify({'success': True, 'message': 'VNet deleted'})
+        return jsonify({'error': response.text}), response.status_code
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/clusters/<cluster_id>/datacenter/sdn/vnets/<vnet_id>/subnets', methods=['GET'])
+@require_auth(perms=['node.view'])
+def get_sdn_subnets(cluster_id, vnet_id):
+    # MK: Subnets are nested under vnets in the API but stored flat in PVE config
+    """Get subnets for a VNet"""
+    manager, error = get_connected_manager(cluster_id)
+    if error:
+        return error
+    
+    try:
+        host = manager.current_host or manager.config.host
+        url = f"https://{host}:8006/api2/json/cluster/sdn/vnets/{vnet_id}/subnets"
+        response = manager._create_session().get(url, timeout=10)
+        
+        if response.status_code == 200:
+            return jsonify(response.json().get('data', []))
+        elif response.status_code == 501:
+            return jsonify([])
+        return jsonify({'error': response.text}), response.status_code
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/clusters/<cluster_id>/datacenter/sdn/vnets/<vnet_id>/subnets', methods=['POST'])
+@require_auth(roles=[ROLE_ADMIN])
+def create_sdn_subnet(cluster_id, vnet_id):
+    """Create a subnet in a VNet"""
+    manager, error = get_connected_manager(cluster_id)
+    if error:
+        return error
+    
+    try:
+        host = manager.current_host or manager.config.host
+        data = request.json or {}
+        
+        url = f"https://{host}:8006/api2/json/cluster/sdn/vnets/{vnet_id}/subnets"
+        response = manager._create_session().post(url, data=data, timeout=10)
+        
+        if response.status_code in [200, 201]:
+            user = getattr(request, 'session', {}).get('user', 'system')
+            log_audit(user, 'sdn.subnet_created', f"Created subnet in VNet {vnet_id}: {data.get('subnet', 'unknown')}", cluster=manager.config.name)
+            return jsonify({'success': True, 'message': 'Subnet created'})
+        return jsonify({'error': response.text}), response.status_code
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/clusters/<cluster_id>/datacenter/sdn/vnets/<vnet_id>/subnets/<subnet_id>', methods=['DELETE'])
+@require_auth(roles=[ROLE_ADMIN])
+def delete_sdn_subnet(cluster_id, vnet_id, subnet_id):
+    """Delete a subnet from a VNet"""
+    manager, error = get_connected_manager(cluster_id)
+    if error:
+        return error
+    
+    try:
+        host = manager.current_host or manager.config.host
+        
+        # Subnet ID needs URL encoding as it contains CIDR notation
+        url = f"https://{host}:8006/api2/json/cluster/sdn/vnets/{vnet_id}/subnets/{subnet_id}"
+        response = manager._create_session().delete(url, timeout=10)
+        
+        if response.status_code == 200:
+            user = getattr(request, 'session', {}).get('user', 'system')
+            log_audit(user, 'sdn.subnet_deleted', f"Deleted subnet {subnet_id} from VNet {vnet_id}", cluster=manager.config.name)
+            return jsonify({'success': True, 'message': 'Subnet deleted'})
+        return jsonify({'error': response.text}), response.status_code
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/clusters/<cluster_id>/datacenter/sdn/apply', methods=['POST'])
+@require_auth(roles=[ROLE_ADMIN])
+def apply_sdn_config(cluster_id):
+    """Apply pending SDN configuration changes to all nodes"""
+    manager, error = get_connected_manager(cluster_id)
+    if error:
+        return error
+    
+    try:
+        host = manager.current_host or manager.config.host
+        
+        url = f"https://{host}:8006/api2/json/cluster/sdn"
+        response = manager._create_session().put(url, timeout=30)
+        
+        if response.status_code == 200:
+            user = getattr(request, 'session', {}).get('user', 'system')
+            log_audit(user, 'sdn.config_applied', "Applied SDN configuration to cluster", cluster=manager.config.name)
+            return jsonify({'success': True, 'message': 'SDN configuration applied'})
+        return jsonify({'error': response.text}), response.status_code
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+# ============================================
+# SDN Controllers (BGP, EVPN, ISIS)
+# ============================================
+
+@app.route('/api/clusters/<cluster_id>/datacenter/sdn/controllers', methods=['GET'])
+@require_auth(perms=['node.view'])
+def get_sdn_controllers(cluster_id):
+    # LW: Controllers are optional - only needed for EVPN/BGP setups
+    """Get SDN controllers"""
+    manager, error = get_connected_manager(cluster_id)
+    if error:
+        return error
+    
+    try:
+        host = manager.current_host or manager.config.host
+        url = f"https://{host}:8006/api2/json/cluster/sdn/controllers"
+        response = manager._create_session().get(url, timeout=10)
+        
+        if response.status_code == 200:
+            return jsonify(response.json().get('data', []))
+        elif response.status_code == 501:
+            return jsonify([])
+        return jsonify({'error': response.text}), response.status_code
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/clusters/<cluster_id>/datacenter/sdn/controllers', methods=['POST'])
+@require_auth(roles=[ROLE_ADMIN])
+def create_sdn_controller(cluster_id):
+    """Create a new SDN controller (BGP, EVPN, ISIS)"""
+    manager, error = get_connected_manager(cluster_id)
+    if error:
+        return error
+    
+    try:
+        host = manager.current_host or manager.config.host
+        data = request.json or {}
+        
+        url = f"https://{host}:8006/api2/json/cluster/sdn/controllers"
+        response = manager._create_session().post(url, data=data, timeout=10)
+        
+        if response.status_code in [200, 201]:
+            user = getattr(request, 'session', {}).get('user', 'system')
+            log_audit(user, 'sdn.controller_created', f"Created SDN controller: {data.get('controller', 'unknown')} ({data.get('type', '')})", cluster=manager.config.name)
+            return jsonify({'success': True, 'message': 'Controller created'})
+        return jsonify({'error': response.text}), response.status_code
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/clusters/<cluster_id>/datacenter/sdn/controllers/<controller_id>', methods=['PUT'])
+@require_auth(roles=[ROLE_ADMIN])
+def update_sdn_controller(cluster_id, controller_id):
+    """Update an SDN controller"""
+    manager, error = get_connected_manager(cluster_id)
+    if error:
+        return error
+    
+    try:
+        host = manager.current_host or manager.config.host
+        data = request.json or {}
+        
+        url = f"https://{host}:8006/api2/json/cluster/sdn/controllers/{controller_id}"
+        response = manager._create_session().put(url, data=data, timeout=10)
+        
+        if response.status_code == 200:
+            user = getattr(request, 'session', {}).get('user', 'system')
+            log_audit(user, 'sdn.controller_updated', f"Updated SDN controller: {controller_id}", cluster=manager.config.name)
+            return jsonify({'success': True, 'message': 'Controller updated'})
+        return jsonify({'error': response.text}), response.status_code
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/clusters/<cluster_id>/datacenter/sdn/controllers/<controller_id>', methods=['DELETE'])
+@require_auth(roles=[ROLE_ADMIN])
+def delete_sdn_controller(cluster_id, controller_id):
+    """Delete an SDN controller"""
+    manager, error = get_connected_manager(cluster_id)
+    if error:
+        return error
+    
+    try:
+        host = manager.current_host or manager.config.host
+        
+        url = f"https://{host}:8006/api2/json/cluster/sdn/controllers/{controller_id}"
+        response = manager._create_session().delete(url, timeout=10)
+        
+        if response.status_code == 200:
+            user = getattr(request, 'session', {}).get('user', 'system')
+            log_audit(user, 'sdn.controller_deleted', f"Deleted SDN controller: {controller_id}", cluster=manager.config.name)
+            return jsonify({'success': True, 'message': 'Controller deleted'})
+        return jsonify({'error': response.text}), response.status_code
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+# ============================================
+# SDN IPAM (IP Address Management)
+# ============================================
+
+@app.route('/api/clusters/<cluster_id>/datacenter/sdn/ipams', methods=['GET'])
+@require_auth(perms=['node.view'])
+def get_sdn_ipams(cluster_id):
+    # NS: IPAM = IP Address Management, default is pve-internal but can use phpIPAM or Netbox
+    """Get SDN IPAM configurations"""
+    manager, error = get_connected_manager(cluster_id)
+    if error:
+        return error
+    
+    try:
+        host = manager.current_host or manager.config.host
+        url = f"https://{host}:8006/api2/json/cluster/sdn/ipams"
+        response = manager._create_session().get(url, timeout=10)
+        
+        if response.status_code == 200:
+            return jsonify(response.json().get('data', []))
+        elif response.status_code == 501:
+            return jsonify([])
+        return jsonify({'error': response.text}), response.status_code
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/clusters/<cluster_id>/datacenter/sdn/ipams', methods=['POST'])
+@require_auth(roles=[ROLE_ADMIN])
+def create_sdn_ipam(cluster_id):
+    """Create a new IPAM configuration (pve, netbox, phpipam)"""
+    manager, error = get_connected_manager(cluster_id)
+    if error:
+        return error
+    
+    try:
+        host = manager.current_host or manager.config.host
+        data = request.json or {}
+        
+        url = f"https://{host}:8006/api2/json/cluster/sdn/ipams"
+        response = manager._create_session().post(url, data=data, timeout=10)
+        
+        if response.status_code in [200, 201]:
+            user = getattr(request, 'session', {}).get('user', 'system')
+            log_audit(user, 'sdn.ipam_created', f"Created IPAM: {data.get('ipam', 'unknown')} ({data.get('type', '')})", cluster=manager.config.name)
+            return jsonify({'success': True, 'message': 'IPAM created'})
+        return jsonify({'error': response.text}), response.status_code
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/clusters/<cluster_id>/datacenter/sdn/ipams/<ipam_id>', methods=['PUT'])
+@require_auth(roles=[ROLE_ADMIN])
+def update_sdn_ipam(cluster_id, ipam_id):
+    """Update an IPAM configuration"""
+    manager, error = get_connected_manager(cluster_id)
+    if error:
+        return error
+    
+    try:
+        host = manager.current_host or manager.config.host
+        data = request.json or {}
+        
+        url = f"https://{host}:8006/api2/json/cluster/sdn/ipams/{ipam_id}"
+        response = manager._create_session().put(url, data=data, timeout=10)
+        
+        if response.status_code == 200:
+            user = getattr(request, 'session', {}).get('user', 'system')
+            log_audit(user, 'sdn.ipam_updated', f"Updated IPAM: {ipam_id}", cluster=manager.config.name)
+            return jsonify({'success': True, 'message': 'IPAM updated'})
+        return jsonify({'error': response.text}), response.status_code
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/clusters/<cluster_id>/datacenter/sdn/ipams/<ipam_id>', methods=['DELETE'])
+@require_auth(roles=[ROLE_ADMIN])
+def delete_sdn_ipam(cluster_id, ipam_id):
+    """Delete an IPAM configuration"""
+    manager, error = get_connected_manager(cluster_id)
+    if error:
+        return error
+    
+    try:
+        host = manager.current_host or manager.config.host
+        
+        url = f"https://{host}:8006/api2/json/cluster/sdn/ipams/{ipam_id}"
+        response = manager._create_session().delete(url, timeout=10)
+        
+        if response.status_code == 200:
+            user = getattr(request, 'session', {}).get('user', 'system')
+            log_audit(user, 'sdn.ipam_deleted', f"Deleted IPAM: {ipam_id}", cluster=manager.config.name)
+            return jsonify({'success': True, 'message': 'IPAM deleted'})
+        return jsonify({'error': response.text}), response.status_code
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+# ============================================
+# SDN DNS
+# ============================================
+
+@app.route('/api/clusters/<cluster_id>/datacenter/sdn/dns', methods=['GET'])
+@require_auth(perms=['node.view'])
+def get_sdn_dns(cluster_id):
+    # MK: DNS integration for auto-registration of VMs in zones
+    """Get SDN DNS configurations"""
+    manager, error = get_connected_manager(cluster_id)
+    if error:
+        return error
+    
+    try:
+        host = manager.current_host or manager.config.host
+        url = f"https://{host}:8006/api2/json/cluster/sdn/dns"
+        response = manager._create_session().get(url, timeout=10)
+        
+        if response.status_code == 200:
+            return jsonify(response.json().get('data', []))
+        elif response.status_code == 501:
+            return jsonify([])
+        return jsonify({'error': response.text}), response.status_code
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/clusters/<cluster_id>/datacenter/sdn/dns', methods=['POST'])
+@require_auth(roles=[ROLE_ADMIN])
+def create_sdn_dns(cluster_id):
+    """Create a new DNS configuration (powerdns)"""
+    manager, error = get_connected_manager(cluster_id)
+    if error:
+        return error
+    
+    try:
+        host = manager.current_host or manager.config.host
+        data = request.json or {}
+        
+        url = f"https://{host}:8006/api2/json/cluster/sdn/dns"
+        response = manager._create_session().post(url, data=data, timeout=10)
+        
+        if response.status_code in [200, 201]:
+            user = getattr(request, 'session', {}).get('user', 'system')
+            log_audit(user, 'sdn.dns_created', f"Created DNS: {data.get('dns', 'unknown')}", cluster=manager.config.name)
+            return jsonify({'success': True, 'message': 'DNS created'})
+        return jsonify({'error': response.text}), response.status_code
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/clusters/<cluster_id>/datacenter/sdn/dns/<dns_id>', methods=['PUT'])
+@require_auth(roles=[ROLE_ADMIN])
+def update_sdn_dns(cluster_id, dns_id):
+    """Update a DNS configuration"""
+    manager, error = get_connected_manager(cluster_id)
+    if error:
+        return error
+    
+    try:
+        host = manager.current_host or manager.config.host
+        data = request.json or {}
+        
+        url = f"https://{host}:8006/api2/json/cluster/sdn/dns/{dns_id}"
+        response = manager._create_session().put(url, data=data, timeout=10)
+        
+        if response.status_code == 200:
+            user = getattr(request, 'session', {}).get('user', 'system')
+            log_audit(user, 'sdn.dns_updated', f"Updated DNS: {dns_id}", cluster=manager.config.name)
+            return jsonify({'success': True, 'message': 'DNS updated'})
+        return jsonify({'error': response.text}), response.status_code
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/clusters/<cluster_id>/datacenter/sdn/dns/<dns_id>', methods=['DELETE'])
+@require_auth(roles=[ROLE_ADMIN])
+def delete_sdn_dns(cluster_id, dns_id):
+    """Delete a DNS configuration"""
+    manager, error = get_connected_manager(cluster_id)
+    if error:
+        return error
+    
+    try:
+        host = manager.current_host or manager.config.host
+        
+        url = f"https://{host}:8006/api2/json/cluster/sdn/dns/{dns_id}"
+        response = manager._create_session().delete(url, timeout=10)
+        
+        if response.status_code == 200:
+            user = getattr(request, 'session', {}).get('user', 'system')
+            log_audit(user, 'sdn.dns_deleted', f"Deleted DNS: {dns_id}", cluster=manager.config.name)
+            return jsonify({'success': True, 'message': 'DNS deleted'})
+        return jsonify({'error': response.text}), response.status_code
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+# ============================================
+# SDN Zone Details (for editing all options)
+# ============================================
+
+@app.route('/api/clusters/<cluster_id>/datacenter/sdn/zones/<zone_id>', methods=['GET'])
+@require_auth(perms=['node.view'])
+def get_sdn_zone_details(cluster_id, zone_id):
+    """Get detailed zone configuration"""
+    manager, error = get_connected_manager(cluster_id)
+    if error:
+        return error
+    
+    try:
+        host = manager.current_host or manager.config.host
+        url = f"https://{host}:8006/api2/json/cluster/sdn/zones/{zone_id}"
+        response = manager._create_session().get(url, timeout=10)
+        
+        if response.status_code == 200:
+            return jsonify(response.json().get('data', {}))
+        return jsonify({'error': response.text}), response.status_code
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/clusters/<cluster_id>/datacenter/sdn/vnets/<vnet_id>', methods=['GET'])
+@require_auth(perms=['node.view'])
+def get_sdn_vnet_details(cluster_id, vnet_id):
+    """Get detailed VNet configuration"""
+    manager, error = get_connected_manager(cluster_id)
+    if error:
+        return error
+    
+    try:
+        host = manager.current_host or manager.config.host
+        url = f"https://{host}:8006/api2/json/cluster/sdn/vnets/{vnet_id}"
+        response = manager._create_session().get(url, timeout=10)
+        
+        if response.status_code == 200:
+            return jsonify(response.json().get('data', {}))
+        return jsonify({'error': response.text}), response.status_code
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/clusters/<cluster_id>/datacenter/sdn/vnets/<vnet_id>/subnets/<path:subnet_id>', methods=['PUT'])
+@require_auth(roles=[ROLE_ADMIN])
+def update_sdn_subnet(cluster_id, vnet_id, subnet_id):
+    """Update a subnet (DHCP range, gateway, etc.)"""
+    manager, error = get_connected_manager(cluster_id)
+    if error:
+        return error
+    
+    try:
+        host = manager.current_host or manager.config.host
+        data = request.json or {}
+        
+        # URL encode the subnet ID (contains /)
+        from urllib.parse import quote
+        encoded_subnet = quote(subnet_id, safe='')
+        
+        url = f"https://{host}:8006/api2/json/cluster/sdn/vnets/{vnet_id}/subnets/{encoded_subnet}"
+        response = manager._create_session().put(url, data=data, timeout=10)
+        
+        if response.status_code == 200:
+            user = getattr(request, 'session', {}).get('user', 'system')
+            log_audit(user, 'sdn.subnet_updated', f"Updated subnet {subnet_id} in VNet {vnet_id}", cluster=manager.config.name)
+            return jsonify({'success': True, 'message': 'Subnet updated'})
         return jsonify({'error': response.text}), response.status_code
     except Exception as e:
         return jsonify({'error': str(e)}), 500
@@ -26437,6 +29540,7 @@ def acknowledge_maintenance_warning(cluster_id, node_name):
 @require_auth(perms=['cluster.admin'])
 def test_node_connection(cluster_id):
     """Test SSH connection to a new node and gather system info"""
+    # LW: Feb 2026 - Pre-flight check before join, also detects orphaned cluster configs
     ok, err = check_cluster_access(cluster_id)
     if not ok: return err
     
@@ -26487,6 +29591,27 @@ def test_node_connection(cluster_id):
                     current_cluster = line.split(':')[1].strip()
                     break
         
+        # NS: Feb 2026 - Check for orphaned cluster config files
+        # LW: /etc/pve/ is a FUSE mount (pmxcfs), test -f doesn't always work there
+        # so we also use ls and check for leftover node directories
+        stdin, stdout, stderr = ssh.exec_command(
+            'test -f /etc/corosync/authkey && echo HAS_AUTHKEY; '
+            'test -f /etc/corosync/corosync.conf && echo HAS_COROSYNC; '
+            'ls /etc/pve/corosync.conf 2>/dev/null && echo HAS_PVE_COROSYNC; '
+            'ls /etc/pve/nodes/ 2>/dev/null | wc -l'
+        )
+        orphan_output = stdout.read().decode().strip()
+        has_old_config = 'HAS_AUTHKEY' in orphan_output or 'HAS_COROSYNC' in orphan_output or 'HAS_PVE_COROSYNC' in orphan_output
+        
+        # Check if /etc/pve/nodes/ has dirs for other nodes (leftover from old cluster)
+        try:
+            lines = orphan_output.strip().split('\n')
+            node_dir_count = int(lines[-1]) if lines[-1].isdigit() else 0
+            if node_dir_count > 1:
+                has_old_config = True
+        except:
+            pass
+        
         ssh.close()
         
         return jsonify({
@@ -26497,7 +29622,8 @@ def test_node_connection(cluster_id):
                 'proxmox_installed': proxmox_installed,
                 'proxmox_version': proxmox_version,
                 'already_in_cluster': already_in_cluster,
-                'current_cluster': current_cluster
+                'current_cluster': current_cluster,
+                'has_old_config': has_old_config
             }
         })
         
@@ -26515,6 +29641,8 @@ def test_node_connection(cluster_id):
 @require_auth(perms=['cluster.admin'])
 def join_node_to_cluster(cluster_id):
     """Add a new node to the Proxmox cluster"""
+    # MK: Feb 2026 - This uses SSH + interactive shell because pvecm add prompts for password
+    # LW: Force rejoin option added to handle nodes removed via pvecm delnode that still have stale configs
     ok, err = check_cluster_access(cluster_id)
     if not ok: return err
     
@@ -26533,36 +29661,137 @@ def join_node_to_cluster(cluster_id):
     password = data.get('password', '')
     ssh_port = int(data.get('ssh_port', 22))
     link0_address = data.get('link0_address', '').strip()
+    force_rejoin = data.get('force', False)  # LW: Feb 2026 - Clean old cluster config before join
     
     if not node_ip or not password:
         return jsonify({'success': False, 'error': 'Node IP and password are required'}), 400
     
     try:
         # Get join information from existing cluster
-        join_info = mgr.api_request('GET', '/cluster/config/join')
-        if not join_info:
-            return jsonify({'success': False, 'error': 'Could not get cluster join information'}), 500
+        # MK: Feb 2026 - Use direct API call (same as get_join_info which works)
+        # instead of api_request() wrapper which was silently failing
+        host = mgr.current_host or mgr.config.host
+        join_url = f"https://{host}:8006/api2/json/cluster/config/join"
+        join_resp = mgr._create_session().get(join_url, timeout=10)
         
-        # Extract fingerprint and join address
-        fingerprint = join_info.get('fingerprint', '')
-        # Find the best node to join to (first online node)
+        if join_resp.status_code != 200:
+            logging.error(f"Join info API returned {join_resp.status_code}: {join_resp.text[:500]}")
+            return jsonify({'success': False, 'error': f'Could not get cluster join information (HTTP {join_resp.status_code})'}), 500
+        
+        join_info = join_resp.json().get('data', {})
+        logging.info(f"[Join] Got join info keys: {list(join_info.keys()) if isinstance(join_info, dict) else type(join_info)}")
+        
+        # Extract fingerprint and join address from nodelist
+        # Proxmox returns fingerprint per-node as 'pve_fp', not top-level
+        fingerprint = ''
         join_addr = None
-        for node_data in join_info.get('nodelist', []):
-            if node_data.get('ring0_addr'):
-                join_addr = node_data.get('ring0_addr')
-                break
+        
+        # Check top-level first (some PVE versions)
+        if isinstance(join_info, dict):
+            fingerprint = join_info.get('fingerprint', '') or ''
+        
+        # Iterate nodelist for pve_fp and ring0_addr
+        nodelist = join_info.get('nodelist', []) if isinstance(join_info, dict) else []
+        for node_data in nodelist:
+            if isinstance(node_data, dict):
+                # Get fingerprint from first node that has it
+                if not fingerprint and node_data.get('pve_fp'):
+                    fingerprint = node_data['pve_fp']
+                # Find best node to join to
+                if not join_addr and node_data.get('ring0_addr'):
+                    join_addr = node_data['ring0_addr']
+                # Also try pve_addr as fallback for join address
+                if not join_addr and node_data.get('pve_addr'):
+                    join_addr = node_data['pve_addr']
         
         if not join_addr:
             # Fallback to cluster host
             join_addr = mgr.config.host
         
         if not fingerprint:
-            return jsonify({'success': False, 'error': 'Could not get cluster fingerprint'}), 500
+            # Fallback: extract fingerprint from Proxmox SSL certificate
+            # Same method as get_join_info uses - this is the cert fingerprint
+            # that pvecm add --fingerprint expects
+            logging.warning(f"[Join] No pve_fp in API response, extracting from SSL certificate of {host}")
+            try:
+                import ssl
+                import socket
+                import hashlib
+                
+                context = ssl.create_default_context()
+                context.check_hostname = False
+                context.verify_mode = ssl.CERT_NONE
+                
+                with socket.create_connection((host, 8006), timeout=5) as sock:
+                    with context.wrap_socket(sock, server_hostname=host) as ssock:
+                        cert_der = ssock.getpeercert(binary_form=True)
+                        fp_hex = hashlib.sha256(cert_der).hexdigest()
+                        fingerprint = ':'.join(fp_hex[i:i+2].upper() for i in range(0, len(fp_hex), 2))
+                        logging.info(f"[Join] Got SSL fingerprint: {fingerprint[:20]}...")
+            except Exception as ssl_err:
+                logging.error(f"[Join] SSL fingerprint extraction failed: {ssl_err}")
+        
+        if not fingerprint:
+            logging.error(f"[Join] No fingerprint found! join_info type={type(join_info).__name__}, "
+                         f"nodelist={len(nodelist)} entries, "
+                         f"first_node_keys={list(nodelist[0].keys()) if nodelist and isinstance(nodelist[0], dict) else 'N/A'}")
+            return jsonify({'success': False, 'error': 'Could not get cluster fingerprint. Check server logs for details.'}), 500
         
         # Connect to new node via SSH
         ssh = paramiko.SSHClient()
         ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
         ssh.connect(node_ip, port=ssh_port, username=username, password=password, timeout=30)
+        
+        # NS: Feb 2026 - Clean old cluster config if force rejoin
+        # This is needed when a node was removed from a cluster but still has
+        # old corosync/pve config files (authkey, corosync.conf, etc.)
+        if force_rejoin:
+            logging.info(f"[Join] Force rejoin: cleaning old cluster config on {node_ip}")
+            channel = ssh.invoke_shell()
+            time.sleep(0.5)
+            if channel.recv_ready():
+                channel.recv(4096)
+            
+            cleanup_commands = [
+                'systemctl stop pve-cluster corosync 2>/dev/null',
+                'sleep 1',
+                'killall -9 pmxcfs 2>/dev/null',
+                'sleep 1',
+                'rm -f /var/lock/pve-cluster.lck /var/lock/pvecm.lock /var/lib/pve-cluster/.pmxcfs.lockfile',
+                'pmxcfs -l &',
+                'sleep 3',
+                'rm -f /etc/corosync/authkey',
+                'rm -f /etc/corosync/corosync.conf',
+                'rm -f /etc/pve/corosync.conf',
+                'killall -9 pmxcfs 2>/dev/null',
+                'sleep 1',
+                'rm -f /var/lock/pve-cluster.lck /var/lock/pvecm.lock /var/lib/pve-cluster/.pmxcfs.lockfile',
+                'systemctl start pve-cluster',
+                'sleep 3',
+                'echo CLEANUP_DONE',
+            ]
+            for cmd in cleanup_commands:
+                channel.send(cmd + '\n')
+                time.sleep(0.5)
+            
+            time.sleep(5)
+            cleanup_output = ''
+            for _ in range(20):
+                if channel.recv_ready():
+                    cleanup_output += channel.recv(4096).decode('utf-8', errors='ignore')
+                if 'CLEANUP_DONE' in cleanup_output:
+                    break
+                time.sleep(0.5)
+            
+            channel.close()
+            logging.info(f"[Join] Cleanup output: {cleanup_output[-500:]}")
+            
+            # Reconnect SSH after pve-cluster restart
+            ssh.close()
+            time.sleep(2)
+            ssh = paramiko.SSHClient()
+            ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+            ssh.connect(node_ip, port=ssh_port, username=username, password=password, timeout=30)
         
         # Use interactive shell for pvecm add (it prompts for password)
         channel = ssh.invoke_shell()
@@ -26574,6 +29803,8 @@ def join_node_to_cluster(cluster_id):
         
         # Build and send the join command
         join_cmd = f'pvecm add {join_addr} --fingerprint {fingerprint}'
+        if force_rejoin:
+            join_cmd += ' --force'
         if link0_address:
             join_cmd += f' --link0 {link0_address}'
         
@@ -26635,73 +29866,96 @@ def join_node_to_cluster(cluster_id):
 @require_auth(perms=['cluster.admin'])
 def check_can_remove_node(cluster_id, node_name):
     """Check if a node can be safely removed from the cluster"""
-    ok, err = check_cluster_access(cluster_id)
-    if not ok: return err
-    
-    if cluster_id not in cluster_managers:
-        return jsonify({'error': 'Cluster not found'}), 404
-    
-    mgr = cluster_managers[cluster_id]
-    
-    # Check maintenance status
-    in_maintenance = node_name in maintenance_tasks
-    maintenance_complete = False
-    if in_maintenance:
-        task = maintenance_tasks[node_name]
-        maintenance_complete = task.get('status') in ['completed', 'completed_with_errors']
-    
-    # Check if node is offline
-    is_offline = True
+    # NS: Feb 2026 - Blockers vs warnings: blockers prevent removal, warnings are recommendations
+    # MK: Offline check is a warning not a blocker because pvecm delnode runs on another node
     try:
-        nodes = mgr.api_request('GET', '/nodes')
-        for node in (nodes or []):
-            if node.get('node') == node_name:
-                is_offline = node.get('status') != 'online'
-                break
-    except:
-        pass
-    
-    # Check for VMs/CTs on the node
-    has_vms = False
-    vm_count = 0
-    try:
-        # Try to get resources on the node
-        resources = mgr.api_request('GET', f'/nodes/{node_name}/qemu') or []
-        resources += mgr.api_request('GET', f'/nodes/{node_name}/lxc') or []
-        vm_count = len(resources)
-        has_vms = vm_count > 0
-    except:
-        # Node might be offline, which is fine
-        pass
-    
-    # Determine blockers
-    blockers = []
-    if not in_maintenance:
-        blockers.append('Node must be in maintenance mode first')
-    if not maintenance_complete and in_maintenance:
-        blockers.append('Maintenance/evacuation must be complete')
-    if not is_offline:
-        blockers.append('Node must be offline (shutdown) before removal')
-    if has_vms and not is_offline:
-        blockers.append(f'Node still has {vm_count} VM(s)/Container(s)')
-    
-    can_remove = len(blockers) == 0
-    
-    return jsonify({
-        'can_remove': can_remove,
-        'in_maintenance': in_maintenance,
-        'maintenance_complete': maintenance_complete,
-        'is_offline': is_offline,
-        'has_vms': has_vms,
-        'vm_count': vm_count,
-        'blockers': blockers
-    })
+        ok, err = check_cluster_access(cluster_id)
+        if not ok: return err
+        
+        if cluster_id not in cluster_managers:
+            return jsonify({'can_remove': False, 'error': 'Cluster not found', 'blockers': ['Cluster not found']}), 200
+        
+        mgr = cluster_managers[cluster_id]
+        
+        # Check maintenance status
+        in_maintenance = node_name in mgr.nodes_in_maintenance
+        maintenance_complete = False
+        if in_maintenance:
+            task = mgr.nodes_in_maintenance[node_name]
+            maintenance_complete = getattr(task, 'status', None) in ['completed', 'completed_with_errors']
+        
+        # Check if node is offline
+        is_offline = True
+        try:
+            host = mgr.current_host or mgr.config.host
+            nodes_url = f"https://{host}:8006/api2/json/nodes"
+            nodes_resp = mgr._create_session().get(nodes_url, timeout=10)
+            nodes_list = nodes_resp.json().get('data', []) if nodes_resp.status_code == 200 else []
+            for n in nodes_list:
+                if n.get('node') == node_name:
+                    is_offline = n.get('status') != 'online'
+                    break
+        except Exception as e:
+            logging.debug(f"[RemoveNode] Could not check node status: {e}")
+        
+        # Check for VMs/CTs on the node
+        has_vms = False
+        vm_count = 0
+        try:
+            host = mgr.current_host or mgr.config.host
+            session = mgr._create_session()
+            resources = []
+            for endpoint in [f"/nodes/{node_name}/qemu", f"/nodes/{node_name}/lxc"]:
+                try:
+                    r = session.get(f"https://{host}:8006/api2/json{endpoint}", timeout=10)
+                    if r.status_code == 200:
+                        resources += r.json().get('data', [])
+                except:
+                    pass
+            vm_count = len(resources)
+            has_vms = vm_count > 0
+        except:
+            pass
+        
+        # Determine blockers
+        # MK: Feb 2026 - pvecm delnode runs on a REMAINING online node,
+        # so the target node doesn't need to be offline.
+        # It just needs VMs evacuated (maintenance complete).
+        blockers = []
+        warnings = []
+        if not in_maintenance:
+            blockers.append('Node must be in maintenance mode first')
+        if not maintenance_complete and in_maintenance:
+            blockers.append('Maintenance/evacuation must be complete')
+        if has_vms:
+            blockers.append(f'Node still has {vm_count} VM(s)/Container(s) - evacuate first')
+        if not is_offline:
+            warnings.append('Node is still online - it will be removed from cluster config. Recommended: shutdown node after removal.')
+        
+        can_remove = len(blockers) == 0
+        
+        return jsonify({
+            'can_remove': can_remove,
+            'in_maintenance': in_maintenance,
+            'maintenance_complete': maintenance_complete,
+            'is_offline': is_offline,
+            'has_vms': has_vms,
+            'vm_count': vm_count,
+            'blockers': blockers,
+            'warnings': warnings
+        })
+    except Exception as e:
+        logging.error(f"[RemoveNode] check_can_remove error: {e}")
+        return jsonify({'can_remove': False, 'error': str(e), 'blockers': [str(e)]}), 200
 
 
 @app.route('/api/clusters/<cluster_id>/nodes/<node_name>/cluster-membership', methods=['DELETE'])
 @require_auth(perms=['cluster.admin'])
 def remove_node_from_cluster(cluster_id, node_name):
     """Remove a node from the Proxmox cluster"""
+    # LW: Feb 2026 - Runs pvecm delnode on a remaining online node, then SSHs into the
+    # removed node to clean up stale configs (authkey, corosync.conf, lock files)
+    # MK: IP must be resolved BEFORE delnode or we might wipe the wrong node!
     ok, err = check_cluster_access(cluster_id)
     if not ok: return err
     
@@ -26718,36 +29972,73 @@ def remove_node_from_cluster(cluster_id, node_name):
     if not data.get('confirm'):
         return jsonify({'success': False, 'error': 'Confirmation required'}), 400
     
-    # Double-check the node can be removed
-    in_maintenance = node_name in maintenance_tasks
+    # LW: Feb 2026 - Maintenance is recommended but not strictly required
+    # pvecm delnode runs on another node, not on the target
+    in_maintenance = node_name in mgr.nodes_in_maintenance
     if not in_maintenance:
-        return jsonify({'success': False, 'error': 'Node must be in maintenance mode'}), 400
+        logging.warning(f"[RemoveNode] {node_name} not in maintenance mode - proceeding anyway")
     
     try:
-        # Get cluster credentials for SSH
+        # Get cluster credentials for SSH - same pattern as HA
         cluster_config = mgr.config
-        ssh_user = getattr(cluster_config, 'ssh_user', None) or cluster_config.user.split('@')[0]
-        ssh_password = getattr(cluster_config, 'ssh_password', None) or cluster_config.password
+        ssh_user = getattr(cluster_config, 'ssh_user', None) or ''
+        if not ssh_user:
+            api_user = cluster_config.user
+            ssh_user = api_user.split('@')[0] if '@' in api_user else (api_user or 'root')
+        ssh_password = getattr(cluster_config, 'pass_', '') or ''
+        ssh_key_content = getattr(cluster_config, 'ssh_key', '') or ''
         
         # Find an online node to execute the removal from
-        nodes = mgr.api_request('GET', '/nodes') or []
+        host = mgr.current_host or mgr.config.host
+        nodes_url = f"https://{host}:8006/api2/json/nodes"
+        nodes_resp = mgr._create_session().get(nodes_url, timeout=10)
+        nodes = nodes_resp.json().get('data', []) if nodes_resp.status_code == 200 else []
+        
         online_node = None
         online_node_ip = None
         
         for node in nodes:
             if node.get('node') != node_name and node.get('status') == 'online':
                 online_node = node.get('node')
-                # Use cluster host as IP
-                online_node_ip = cluster_config.host
+                online_node_ip = mgr._get_node_ip(online_node) or cluster_config.host
                 break
         
         if not online_node:
             return jsonify({'success': False, 'error': 'No online node found to execute removal'}), 500
         
+        # MK: Feb 2026 - CRITICAL: Resolve the target node's IP BEFORE removal
+        # After pvecm delnode, the node is gone from cluster config and _get_node_ip
+        # would return wrong/stale data, potentially wiping another node's config!
+        removed_node_ip = mgr._get_node_ip(node_name) if hasattr(mgr, '_get_node_ip') else None
+        logging.info(f"[RemoveNode] Pre-resolved IP for {node_name}: {removed_node_ip}")
+        
         # Connect to an online node via SSH
         ssh = paramiko.SSHClient()
         ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-        ssh.connect(online_node_ip, port=22, username=ssh_user, password=ssh_password, timeout=30)
+        
+        # Try SSH key first, then password (same as HA pattern)
+        connected = False
+        if ssh_key_content:
+            try:
+                import io
+                pkey = paramiko.RSAKey.from_private_key(io.StringIO(ssh_key_content))
+                ssh.connect(online_node_ip, port=22, username=ssh_user, pkey=pkey, timeout=30)
+                connected = True
+            except Exception as key_err:
+                logging.debug(f"[RemoveNode] SSH key auth failed: {key_err}")
+                try:
+                    pkey = paramiko.Ed25519Key.from_private_key(io.StringIO(ssh_key_content))
+                    ssh.connect(online_node_ip, port=22, username=ssh_user, pkey=pkey, timeout=30)
+                    connected = True
+                except:
+                    pass
+        
+        if not connected and ssh_password:
+            ssh.connect(online_node_ip, port=22, username=ssh_user, password=ssh_password, timeout=30)
+            connected = True
+        
+        if not connected:
+            return jsonify({'success': False, 'error': 'Could not authenticate via SSH. Configure SSH key or password.'}), 500
         
         # Execute pvecm delnode command
         cmd = f'pvecm delnode {node_name}'
@@ -26763,9 +30054,114 @@ def remove_node_from_cluster(cluster_id, node_name):
             error_msg = stderr_text or stdout_text or 'Unknown error'
             return jsonify({'success': False, 'error': f'Failed to remove node: {error_msg}'}), 500
         
+        # NS: Feb 2026 - SSH into the REMOVED node and clean up old cluster config
+        # pvecm delnode only updates the remaining nodes' config, the removed node
+        # still has stale corosync/authkey/pve config that blocks future joins
+        # IMPORTANT: removed_node_ip was resolved BEFORE pvecm delnode (see above)
+        # LW: Lock files (.pmxcfs.lockfile) are the #1 reason pve-cluster won't start after cleanup
+        cleanup_result = {'success': False, 'message': 'Skipped - could not determine node IP'}
+        
+        if removed_node_ip:
+            try:
+                logging.info(f"[RemoveNode] Cleaning up cluster config on removed node {node_name} ({removed_node_ip})")
+                ssh_cleanup = paramiko.SSHClient()
+                ssh_cleanup.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+                
+                # Try to connect to the removed node
+                cleanup_connected = False
+                if ssh_key_content:
+                    try:
+                        import io
+                        pkey = paramiko.RSAKey.from_private_key(io.StringIO(ssh_key_content))
+                        ssh_cleanup.connect(removed_node_ip, port=22, username=ssh_user, pkey=pkey, timeout=15)
+                        cleanup_connected = True
+                    except:
+                        try:
+                            pkey = paramiko.Ed25519Key.from_private_key(io.StringIO(ssh_key_content))
+                            ssh_cleanup.connect(removed_node_ip, port=22, username=ssh_user, pkey=pkey, timeout=15)
+                            cleanup_connected = True
+                        except:
+                            pass
+                if not cleanup_connected and ssh_password:
+                    try:
+                        ssh_cleanup.connect(removed_node_ip, port=22, username=ssh_user, password=ssh_password, timeout=15)
+                        cleanup_connected = True
+                    except:
+                        pass
+                
+                if cleanup_connected:
+                    # SAFETY CHECK: Verify we're on the correct node before wiping config!
+                    stdin, stdout, stderr = ssh_cleanup.exec_command('hostname', timeout=10)
+                    actual_hostname = stdout.read().decode().strip()
+                    
+                    # LW: Case-insensitive compare - Proxmox uses lowercase node names
+                    # but hostname might be "Pve1" while node_name is "pve1"
+                    if actual_hostname.lower() != node_name.lower():
+                        cleanup_result = {'success': False, 'message': f'Hostname mismatch! Expected {node_name} but got {actual_hostname} - cleanup ABORTED to protect wrong node'}
+                        logging.error(f"[RemoveNode] CRITICAL: Hostname mismatch on {removed_node_ip}! Expected '{node_name}', got '{actual_hostname}'. Cleanup aborted!")
+                        ssh_cleanup.close()
+                    else:
+                        # MK: Feb 2026 - Use invoke_shell for cleanup because:
+                        # /etc/pve/ is a FUSE mount (pmxcfs). exec_command can't properly
+                        # background pmxcfs -l. invoke_shell handles this correctly.
+                        channel = ssh_cleanup.invoke_shell()
+                        time.sleep(0.5)
+                        if channel.recv_ready():
+                            channel.recv(4096)  # clear prompt
+                        
+                        cleanup_commands = [
+                            'systemctl stop pve-cluster corosync 2>/dev/null',
+                            'sleep 1',
+                            'killall -9 pmxcfs 2>/dev/null',
+                            'sleep 1',
+                            'rm -f /var/lock/pve-cluster.lck /var/lock/pvecm.lock /var/lib/pve-cluster/.pmxcfs.lockfile',
+                            'pmxcfs -l &',
+                            'sleep 3',
+                            'rm -f /etc/corosync/authkey',
+                            'rm -f /etc/corosync/corosync.conf', 
+                            'rm -f /etc/pve/corosync.conf',
+                            'killall -9 pmxcfs 2>/dev/null',
+                            'sleep 1',
+                            'rm -f /var/lock/pve-cluster.lck /var/lock/pvecm.lock /var/lib/pve-cluster/.pmxcfs.lockfile',
+                            'systemctl start pve-cluster',
+                            'echo CLEANUP_DONE',
+                        ]
+                        
+                        for cmd in cleanup_commands:
+                            channel.send(cmd + '\n')
+                            time.sleep(0.5)
+                        
+                        # Wait for completion
+                        time.sleep(5)
+                        cleanup_output = ''
+                        for _ in range(20):
+                            if channel.recv_ready():
+                                cleanup_output += channel.recv(4096).decode('utf-8', errors='ignore')
+                            if 'CLEANUP_DONE' in cleanup_output:
+                                break
+                            time.sleep(0.5)
+                        
+                        channel.close()
+                        ssh_cleanup.close()
+                        
+                        logging.info(f"[RemoveNode] Cleanup output on {node_name}: {cleanup_output[-500:]}")
+                        
+                        if 'CLEANUP_DONE' in cleanup_output:
+                            cleanup_result = {'success': True, 'message': 'Old cluster config cleaned up'}
+                            logging.info(f"[RemoveNode] Cleanup on {node_name} successful")
+                        else:
+                            cleanup_result = {'success': False, 'message': f'Cleanup uncertain - check node manually. Output: {cleanup_output[-200:]}'}
+                            logging.warning(f"[RemoveNode] Cleanup on {node_name} uncertain")
+                else:
+                    cleanup_result = {'success': False, 'message': 'Could not SSH into removed node for cleanup'}
+                    logging.warning(f"[RemoveNode] Could not connect to {removed_node_ip} for cleanup")
+            except Exception as cleanup_ex:
+                cleanup_result = {'success': False, 'message': str(cleanup_ex)}
+                logging.warning(f"[RemoveNode] Cleanup error on {node_name}: {cleanup_ex}")
+        
         # Clean up maintenance task
-        if node_name in maintenance_tasks:
-            del maintenance_tasks[node_name]
+        if node_name in mgr.nodes_in_maintenance:
+            del mgr.nodes_in_maintenance[node_name]
         
         # MK: Clean up excluded_nodes - remove the deleted node
         excluded = getattr(mgr.config, 'excluded_nodes', []) or []
@@ -26794,7 +30190,8 @@ def remove_node_from_cluster(cluster_id, node_name):
         
         return jsonify({
             'success': True,
-            'message': f'Node {node_name} has been removed from the cluster'
+            'message': f'Node {node_name} has been removed from the cluster',
+            'cleanup': cleanup_result
         })
         
     except paramiko.AuthenticationException:
@@ -27048,21 +30445,12 @@ def vm_action_api(cluster_id, node, vm_type, vmid, action):
         broadcast_action(action, vm_type, str(vmid), {'node': node, 'force': force}, cluster_id, usr)
         
         # NS: Push immediate resource update for faster UI feedback
-        # Proxmox needs a moment to update status, so we do a quick delayed refresh
-        def delayed_resource_push():
-            import time
-            time.sleep(0.5)  # Give Proxmox 500ms to update status
-            try:
-                resources = manager.get_all_resources()
-                if resources:
-                    broadcast_sse('resources', resources, cluster_id)
-                tasks = manager.get_tasks(limit=50)
-                if tasks:
-                    broadcast_sse('tasks', tasks, cluster_id)
-            except:
-                pass  # Silently fail - next loop will catch it anyway
+        push_immediate_update(cluster_id, delay=0.5)
         
-        threading.Thread(target=delayed_resource_push, daemon=True).start()
+        # NS: Register which PegaProx user initiated this task
+        upid = result.get('data')
+        if upid:
+            register_task_user(upid, usr, cluster_id)
         
         return jsonify({'message': f'{action} successful for VM {vmid}', 'data': result.get('data')})
     else:
@@ -27137,6 +30525,15 @@ def clone_vm_api(cluster_id, node, vm_type, vmid):
         # Audit log
         user = getattr(request, 'session', {}).get('user', 'system')
         log_audit(user, 'vm.cloned', f"{vm_type.upper()} {vmid} cloned to {newid}" + (f" as '{data.get('name')}'" if data.get('name') else ""), cluster=manager.config.name)
+        
+        # NS: Register PegaProx user for this task
+        upid = result.get('data')
+        if upid:
+            register_task_user(upid, user, cluster_id)
+        
+        # NS: Push immediate update for live UI
+        push_immediate_update(cluster_id, delay=0.5)
+        
         return jsonify({
             'message': f'Clone gestartet: {vmid} -> {newid}',
             'newid': newid,
@@ -27330,11 +30727,52 @@ def update_vm_config_api(cluster_id, node, vm_type, vmid):
     result = manager.update_vm_config(node, vmid, vm_type, config_updates)
     
     if result['success']:
+        # NS: Broadcast VM config change via SSE for live UI updates
+        try:
+            updated_config = manager.get_vm_config(node, vmid, vm_type)
+            if updated_config.get('success'):
+                broadcast_sse('vm_config', {
+                    'vmid': vmid,
+                    'node': node,
+                    'vm_type': vm_type,
+                    'config': updated_config.get('config', {})
+                }, cluster_id)
+        except Exception as e:
+            logging.debug(f"Failed to broadcast vm_config SSE: {e}")
+        
         # Audit log
         user = getattr(request, 'session', {}).get('user', 'system')
         changes = ', '.join([f"{k}={v}" for k, v in config_updates.items()][:5])
         log_audit(user, 'vm.config_changed', f"{vm_type.upper()} {vmid} config updated: {changes}", cluster=manager.config.name)
         return jsonify({'message': result['message']})
+    else:
+        return jsonify({'error': result['error']}), 500
+
+
+@app.route('/api/clusters/<cluster_id>/vms/<node>/<vm_type>/<int:vmid>/sanitize-boot-order', methods=['POST'])
+@require_auth(perms=['vm.config'])
+def sanitize_boot_order_api(cluster_id, node, vm_type, vmid):
+    """Sanitize boot order by removing non-existent devices.
+    
+    NS: Feb 2026 - Fixes 'invalid bootorder: device does not exist' errors.
+    """
+    if cluster_id not in cluster_managers:
+        return jsonify({'error': 'Cluster not found'}), 404
+    
+    users = load_users()
+    user = users.get(request.session['user'], {})
+    user['username'] = request.session['user']
+    if not user_can_access_vm(user, cluster_id, vmid, 'vm.config', vm_type):
+        return jsonify({'error': 'Permission denied: vm.config'}), 403
+    
+    manager = cluster_managers[cluster_id]
+    result = manager.sanitize_boot_order(node, vmid, vm_type)
+    
+    if result['success']:
+        if result.get('changed'):
+            user = getattr(request, 'session', {}).get('user', 'system')
+            log_audit(user, 'vm.boot_order_sanitized', f"{vm_type.upper()} {vmid} boot order sanitized", cluster=manager.config.name)
+        return jsonify(result)
     else:
         return jsonify({'error': result['error']}), 500
 
@@ -27775,6 +31213,19 @@ def add_disk_api(cluster_id, node, vm_type, vmid):
     result = manager.add_disk(node, vmid, vm_type, disk_config)
     
     if result['success']:
+        # NS: Broadcast VM config change via SSE for live UI updates
+        try:
+            updated_config = manager.get_vm_config(node, vmid, vm_type)
+            if updated_config.get('success'):
+                broadcast_sse('vm_config', {
+                    'vmid': vmid,
+                    'node': node,
+                    'vm_type': vm_type,
+                    'config': updated_config.get('config', {})
+                }, cluster_id)
+        except Exception as e:
+            logging.debug(f"Failed to broadcast vm_config SSE: {e}")
+        
         # Audit log
         user = getattr(request, 'session', {}).get('user', 'system')
         log_audit(user, 'vm.disk_added', f"{vm_type.upper()} {vmid} - disk added: {disk_config.get('size', 'unknown')}GB on {disk_config.get('storage', 'default')}", cluster=manager.config.name)
@@ -27786,7 +31237,7 @@ def add_disk_api(cluster_id, node, vm_type, vmid):
 @app.route('/api/clusters/<cluster_id>/vms/<node>/<vm_type>/<int:vmid>/disks/<disk_id>', methods=['DELETE'])
 @require_auth(perms=['vm.config'])
 def remove_disk_api(cluster_id, node, vm_type, vmid, disk_id):
-    """Remove disk from VM - NS: Now also cleans up boot order"""
+    """Remove disk from VM - boot order cleanup is now handled in remove_disk method"""
     
     if cluster_id not in cluster_managers:
         return jsonify({'error': 'Cluster not found'}), 404
@@ -27794,35 +31245,21 @@ def remove_disk_api(cluster_id, node, vm_type, vmid, disk_id):
     manager = cluster_managers[cluster_id]
     delete_data = request.args.get('delete_data', 'false').lower() == 'true'
     
-    # MK: First get current config to check boot order
-    config_result = manager.get_vm_config(node, vmid, vm_type)
-    old_boot = ''
-    if config_result.get('success'):
-        # MK: Boot order is in raw config, not parsed
-        raw_config = config_result.get('config', {}).get('raw', {})
-        old_boot = raw_config.get('boot', '')
-    
     result = manager.remove_disk(node, vmid, vm_type, disk_id, delete_data)
     
     if result['success']:
-        # LW: Auto-update boot order if it contains the removed disk
-        if old_boot and disk_id in old_boot:
-            try:
-                # Parse boot order (format: order=scsi0;ide2;net0)
-                if 'order=' in old_boot:
-                    parts = old_boot.split('order=')[1].split(';')
-                    new_parts = [p for p in parts if p != disk_id and p.strip()]
-                    if new_parts:
-                        new_boot = 'order=' + ';'.join(new_parts)
-                    else:
-                        new_boot = ''  # no devices left
-                    
-                    # Update VM config with new boot order
-                    if new_boot != old_boot:
-                        manager.update_vm_config(node, vmid, vm_type, {'boot': new_boot})
-                        logging.info(f"[DISK] Auto-updated boot order after removing {disk_id}: {new_boot}")
-            except Exception as e:
-                logging.warning(f"[DISK] Failed to auto-update boot order: {e}")
+        # NS: Broadcast VM config change via SSE for live UI updates
+        try:
+            updated_config = manager.get_vm_config(node, vmid, vm_type)
+            if updated_config.get('success'):
+                broadcast_sse('vm_config', {
+                    'vmid': vmid,
+                    'node': node,
+                    'vm_type': vm_type,
+                    'config': updated_config.get('config', {})
+                }, cluster_id)
+        except Exception as e:
+            logging.debug(f"Failed to broadcast vm_config SSE: {e}")
         
         # Audit log
         user = getattr(request, 'session', {}).get('user', 'system')
@@ -27853,6 +31290,12 @@ def move_disk_api(cluster_id, node, vm_type, vmid, disk_id):
         # Audit log
         user = getattr(request, 'session', {}).get('user', 'system')
         log_audit(user, 'vm.disk_moved', f"{vm_type.upper()} {vmid} - disk {disk_id} moved to {target_storage}", cluster=manager.config.name)
+        
+        # NS: Register PegaProx user for this task
+        upid = result.get('task') or result.get('upid')
+        if upid:
+            register_task_user(upid, user, cluster_id)
+        
         return jsonify({'message': result['message'], 'task': result.get('task')})
     else:
         return jsonify({'error': result['error']}), 500
@@ -27873,6 +31316,19 @@ def set_cdrom_api(cluster_id, node, vmid):
     result = manager.set_cdrom(node, vmid, iso_path, drive)
     
     if result['success']:
+        # NS: Broadcast VM config change via SSE for live UI updates
+        try:
+            updated_config = manager.get_vm_config(node, vmid, 'qemu')
+            if updated_config.get('success'):
+                broadcast_sse('vm_config', {
+                    'vmid': vmid,
+                    'node': node,
+                    'vm_type': 'qemu',
+                    'config': updated_config.get('config', {})
+                }, cluster_id)
+        except Exception as e:
+            logging.debug(f"Failed to broadcast vm_config SSE: {e}")
+        
         return jsonify({'message': result['message']})
     else:
         return jsonify({'error': result['error']}), 500
@@ -29711,6 +33167,15 @@ def migrate_vm_api(cluster_id, node, vm_type, vmid):
         if target_storage:
             details += f" to storage {target_storage}"
         log_audit(user, 'vm.migrated', details, cluster=manager.config.name)
+        
+        # NS: Register PegaProx user for this task
+        upid = result.get('upid') or result.get('data')
+        if upid:
+            register_task_user(upid, user, cluster_id)
+        
+        # NS: Push immediate update for live UI
+        push_immediate_update(cluster_id, delay=0.5)
+        
         return jsonify(result)
     else:
         return jsonify(result), 400
@@ -29744,6 +33209,15 @@ def delete_vm_api(cluster_id, node, vm_type, vmid):
         usr = getattr(request, 'session', {}).get('user', 'system')
         log_audit(usr, 'vm.deleted', f"{vm_type.upper()} {vmid} deleted from {node}" + (" (purged)" if purge else ""), cluster=manager.config.name)
         broadcast_action('delete', vm_type, str(vmid), {'node': node, 'purge': purge}, cluster_id, usr)
+        
+        # NS: Register PegaProx user for this task
+        upid = result.get('task') or result.get('upid') or result.get('data')
+        if upid:
+            register_task_user(upid, usr, cluster_id)
+        
+        # NS: Push immediate update for live UI
+        push_immediate_update(cluster_id, delay=0.5)
+        
         return jsonify({'message': f'{vm_type.upper()} {vmid} deleted', 'task': result.get('task')})
     else:
         return jsonify({'error': result.get('error', 'Delete failed')}), 500
@@ -29777,12 +33251,20 @@ def bulk_migrate_api(cluster_id):
     results = []
     for vm in vms:
         result = mgr.migrate_vm_manual(vm['node'], vm['vmid'], vm['type'], target_node, online)
+        
+        # NS: Register PegaProx user for each migration task
+        if result.get('task') or result.get('upid'):
+            register_task_user(result.get('task') or result.get('upid'), user, cluster_id)
+        
         results.append({
             'vmid': vm['vmid'],
             'success': result.get('success', False),
             'task': result.get('task'),
             'error': result.get('error')
         })
+    
+    # NS: Push immediate update for live UI (all migrations started)
+    push_immediate_update(cluster_id, delay=0.5)
     
     return jsonify({
         'results': results,
@@ -29835,6 +33317,15 @@ def remote_migrate_vm_api(cluster_id, node, vm_type, vmid):
     )
     
     if result.get('success'):
+        # NS: Register PegaProx user for this task
+        user = getattr(request, 'session', {}).get('user', 'system')
+        upid = result.get('task') or result.get('upid')
+        if upid:
+            register_task_user(upid, user, cluster_id)
+        
+        # NS: Push immediate update for live UI
+        push_immediate_update(cluster_id, delay=0.5)
+        
         return jsonify({'message': f'Remote migration started for {vm_type}/{vmid}', 'task': result.get('task')})
     else:
         return jsonify({'error': result.get('error', 'Remote migration failed')}), 500
@@ -29868,7 +33359,9 @@ def cross_cluster_migrate_api():
     target_bridge = data.get('target_bridge', 'vmbr0')
     target_vmid = data.get('target_vmid')
     online = data.get('online', True)
+    force_online = data.get('force_online', False)  # Override automatic offline for large disks
     delete_source = data.get('delete_source', True)
+    bwlimit = data.get('bwlimit', 0)  # 0 = no limit (maximum speed to beat ticket timeout)
     
     if not target_node:
         return jsonify({'error': 'Target node is required for cross-cluster migration'}), 400
@@ -29903,9 +33396,21 @@ def cross_cluster_migrate_api():
                         elif size_unit == 'M':
                             total_disk_gb += size_val / 1024
             
-            if total_disk_gb > 100 and online:
-                warnings.append(f"VM has {total_disk_gb:.0f}GB disk - migration may take a while. Ensure stable network connection between clusters.")
-                logging.info(f"[CROSS-MIGRATE] Large VM ({total_disk_gb}GB) - migration may take extended time")
+            if total_disk_gb > 100 and online and not force_online:
+                # MK: Proxmox WebSocket tickets have internal timeout (~5 min)
+                # Large disk migrations take longer than this, causing 401 errors
+                # during RAM sync phase. Auto-switch to offline migration.
+                # 
+                # Math: 100GB in 5 min = 333 MB/s = ~2.7 Gbit/s sustained
+                # Most cross-cluster links can't sustain this.
+                required_speed_mbps = (total_disk_gb * 1024) / 300  # MB/s needed for 5 min
+                warnings.append(f"VM has {total_disk_gb:.0f}GB disk. Would need {required_speed_mbps:.0f} MB/s ({required_speed_mbps*8/1000:.1f} Gbit/s) to complete in 5 min. Automatically using offline migration.")
+                logging.warning(f"[CROSS-MIGRATE] Large VM ({total_disk_gb}GB) - forcing offline migration due to Proxmox WebSocket ticket timeout limitation")
+                online = False  # Force offline migration for large disks
+            elif total_disk_gb > 100 and online and force_online:
+                required_speed_mbps = (total_disk_gb * 1024) / 300
+                warnings.append(f"VM has {total_disk_gb:.0f}GB disk with forced online migration. Need {required_speed_mbps:.0f} MB/s sustained to avoid timeout. Migration may fail with '401 Unauthorized'.")
+                logging.warning(f"[CROSS-MIGRATE] Large VM ({total_disk_gb}GB) - online migration forced by user, may fail")
     except Exception as e:
         logging.debug(f"Could not check VM size: {e}")
     
@@ -29945,7 +33450,7 @@ def cross_cluster_migrate_api():
         result = source_manager.remote_migrate_vm(
             source_node, vmid, vm_type,
             target_endpoint, target_storage, target_bridge,
-            target_vmid, online, delete_source
+            target_vmid, online, delete_source, bwlimit
         )
         
         if result.get('success'):
@@ -29958,8 +33463,15 @@ def cross_cluster_migrate_api():
                 request.remote_addr
             )
             
-            # Schedule intelligent token cleanup - monitors task status
+            # NS: Register PegaProx user for this task
             task_upid = result.get('task')
+            if task_upid:
+                register_task_user(task_upid, user, source_cluster_id)
+            
+            # NS: Push immediate update for live UI (source cluster)
+            push_immediate_update(source_cluster_id, delay=0.5)
+            
+            # Schedule intelligent token cleanup - monitors task status
             def cleanup_token_when_done():
                 import time
                 max_wait = 7200  # Maximum 2 hours (large VMs can take a long time!)
@@ -30144,6 +33656,9 @@ def create_vm_api(cluster_id, node):
         # Broadcast to all clients
         broadcast_action('create', 'qemu', str(vmid), {'node': node, 'name': vm_name}, cluster_id, user)
         
+        # NS: Push immediate update for live UI
+        push_immediate_update(cluster_id, delay=0.5)
+        
         return jsonify(result)
     else:
         return jsonify(result), 400
@@ -30173,6 +33688,9 @@ def create_container_api(cluster_id, node):
         
         # Broadcast to all clients
         broadcast_action('create', 'lxc', str(vmid), {'node': node, 'name': ct_name}, cluster_id, user)
+        
+        # NS: Push immediate update for live UI
+        push_immediate_update(cluster_id, delay=0.5)
         
         return jsonify(result)
     else:
@@ -32528,6 +36046,8 @@ def start_rolling_update(cluster_id):
     skip_up_to_date = data.get('skip_up_to_date', True)
     force_all = data.get('force_all', False)
     skip_evacuation = data.get('skip_evacuation', False)  # MK: Issue #22 - skip VM evacuation (NOT RECOMMENDED)
+    wait_for_reboot = data.get('wait_for_reboot', True)  # NS: GitHub #40
+    pause_on_evacuation_error = data.get('pause_on_evacuation_error', True)  # NS: GitHub #40
     
     # MK: Configurable timeouts (GitHub Issue fix)
     evacuation_timeout = data.get('evacuation_timeout', 1800)  # 30 minutes default (was 5 min!)
@@ -32569,6 +36089,8 @@ def start_rolling_update(cluster_id):
         'include_reboot': include_reboot,
         'skip_up_to_date': skip_up_to_date,
         'skip_evacuation': skip_evacuation,  # MK: Issue #22
+        'wait_for_reboot': wait_for_reboot,  # NS: GitHub #40
+        'pause_on_evacuation_error': pause_on_evacuation_error,  # NS: GitHub #40
         'force_all': force_all,
         'evacuation_timeout': evacuation_timeout,
         'update_timeout': update_timeout,
@@ -32580,6 +36102,9 @@ def start_rolling_update(cluster_id):
         'completed_nodes': [],
         'skipped_nodes': [],  # MK: Track skipped nodes
         'failed_nodes': [],
+        'rebooting_nodes': [],
+        'paused_reason': None,
+        'paused_details': None,
         'logs': []
     }
     
@@ -32656,26 +36181,67 @@ def start_rolling_update(cluster_id):
                         last_progress_log = 0
                         
                         while waited < evacuation_timeout:
-                            # Check maintenance task status directly
+                            if mgr._rolling_update.get('status') not in ['running', 'paused']:
+                                break
                             if node_name in mgr.nodes_in_maintenance:
                                 maintenance_task = mgr.nodes_in_maintenance[node_name]
-                                if maintenance_task.status in ['completed', 'completed_with_errors']:
-                                    mgr._rolling_update['logs'].append(f"[{time.strftime('%H:%M:%S')}] ✓ Evacuation completed")
+                                if maintenance_task.status == 'completed':
+                                    mgr._rolling_update['logs'].append(f"[{time.strftime('%H:%M:%S')}] ✓ Evacuation completed - all VMs migrated")
                                     evacuation_completed = True
                                     break
+                                elif maintenance_task.status == 'completed_with_errors':
+                                    failed_vm_list = getattr(maintenance_task, 'failed_vms', [])
+                                    failed_names = [f"{v.get('name', 'VM')} (VMID: {v.get('vmid', '?')})" for v in failed_vm_list]
+                                    migrated = getattr(maintenance_task, 'migrated_vms', 0)
+                                    total = getattr(maintenance_task, 'total_vms', 0)
+                                    mgr._rolling_update['logs'].append(
+                                        f"[{time.strftime('%H:%M:%S')}] ⚠️ Evacuation: {migrated}/{total} migrated, {len(failed_vm_list)} failed")
+                                    for fn in failed_names:
+                                        mgr._rolling_update['logs'].append(f"[{time.strftime('%H:%M:%S')}]   ✗ Failed: {fn}")
+                                    
+                                    if pause_on_evacuation_error:
+                                        mgr._rolling_update['status'] = 'paused'
+                                        mgr._rolling_update['current_step'] = 'paused_evacuation'
+                                        mgr._rolling_update['paused_reason'] = 'evacuation_failures'
+                                        mgr._rolling_update['paused_details'] = {
+                                            'node': node_name, 'migrated': migrated, 'total': total,
+                                            'failed_vms': [{'vmid': v.get('vmid'), 'name': v.get('name', 'VM'), 'error': v.get('error', '')} for v in failed_vm_list],
+                                            'message': f"{len(failed_vm_list)} VM(s) failed to migrate from {node_name}. Manually migrate/shutdown these VMs, then click Continue or Cancel."
+                                        }
+                                        mgr._rolling_update['logs'].append(f"[{time.strftime('%H:%M:%S')}] ⏸ PAUSED - Waiting for user action.")
+                                        logging.warning(f"[RollingUpdate] Paused on {node_name}: {len(failed_vm_list)} VMs failed to migrate")
+                                        while mgr._rolling_update.get('status') == 'paused':
+                                            time.sleep(2)
+                                        if mgr._rolling_update.get('status') == 'cancelled':
+                                            mgr._rolling_update['logs'].append(f"[{time.strftime('%H:%M:%S')}] Rolling update cancelled by user during pause")
+                                            break
+                                        elif mgr._rolling_update.get('status') == 'running':
+                                            mgr._rolling_update['logs'].append(f"[{time.strftime('%H:%M:%S')}] ▶ Resumed by user - continuing update on {node_name}")
+                                            mgr._rolling_update['paused_reason'] = None
+                                            mgr._rolling_update['paused_details'] = None
+                                            evacuation_completed = True
+                                            break
+                                    else:
+                                        mgr._rolling_update['logs'].append(f"[{time.strftime('%H:%M:%S')}] ⚠️ Continuing despite failures (pause_on_evacuation_error=False)")
+                                        evacuation_completed = True
+                                        break
+                                elif maintenance_task.status == 'failed':
+                                    error_msg = getattr(maintenance_task, 'error', 'Unknown error')
+                                    mgr._rolling_update['logs'].append(f"[{time.strftime('%H:%M:%S')}] ✗ Evacuation failed: {error_msg}")
+                                    raise Exception(f"Evacuation failed: {error_msg}")
                                 else:
-                                    # Log progress every 30 seconds
                                     if waited - last_progress_log >= 30:
                                         if hasattr(maintenance_task, 'migrated_vms') and hasattr(maintenance_task, 'total_vms'):
-                                            mgr._rolling_update['logs'].append(f"[{time.strftime('%H:%M:%S')}] Evacuating: {maintenance_task.migrated_vms}/{maintenance_task.total_vms} VMs migrated ({waited}s elapsed)")
+                                            mgr._rolling_update['logs'].append(f"[{time.strftime('%H:%M:%S')}] Evacuating: {maintenance_task.migrated_vms}/{maintenance_task.total_vms} VMs ({waited}s)")
                                         else:
-                                            mgr._rolling_update['logs'].append(f"[{time.strftime('%H:%M:%S')}] Evacuation in progress... ({waited}s elapsed)")
+                                            mgr._rolling_update['logs'].append(f"[{time.strftime('%H:%M:%S')}] Evacuation in progress... ({waited}s)")
                                         last_progress_log = waited
                             time.sleep(5)
                             waited += 5
-                        
+                        if mgr._rolling_update.get('status') == 'cancelled':
+                            break
                         if not evacuation_completed:
-                            raise Exception(f"Evacuation timed out after {evacuation_timeout}s - consider increasing evacuation_timeout")
+                            raise Exception(f"Evacuation timed out after {evacuation_timeout}s")
                     
                     # Step 2: Run apt update/upgrade
                     mgr._rolling_update['current_step'] = 'updating'
@@ -32714,23 +36280,77 @@ def start_rolling_update(cluster_id):
                     if include_reboot:
                         mgr._rolling_update['current_step'] = 'rebooting'
                         mgr._rolling_update['logs'].append(f"[{time.strftime('%H:%M:%S')}] Node {node_name} rebooting (timeout: {reboot_timeout}s)...")
-                        logging.info(f"[RollingUpdate] Node {node_name} rebooting")
+                        if 'rebooting_nodes' not in mgr._rolling_update:
+                            mgr._rolling_update['rebooting_nodes'] = []
+                        mgr._rolling_update['rebooting_nodes'].append(node_name)
                         
-                        # Wait for node to come back online
-                        waited = 0
-                        while waited < reboot_timeout:
+                        # Phase 1: Wait for offline
+                        offline_waited = 0
+                        node_went_offline = False
+                        while offline_waited < 120:
                             try:
-                                node_status = mgr.get_node_status()
-                                if node_name in node_status and node_status[node_name].get('status') == 'online':
-                                    mgr._rolling_update['logs'].append(f"[{time.strftime('%H:%M:%S')}] ✓ Node {node_name} back online")
+                                ns = mgr.get_node_status()
+                                if node_name not in ns or ns[node_name].get('status') != 'online':
+                                    node_went_offline = True
+                                    mgr._rolling_update['logs'].append(f"[{time.strftime('%H:%M:%S')}] {node_name} is now offline")
                                     break
                             except:
-                                pass
-                            time.sleep(10)
-                            waited += 10
+                                node_went_offline = True
+                                break
+                            time.sleep(5)
+                            offline_waited += 5
                         
-                        if waited >= reboot_timeout:
-                            mgr._rolling_update['logs'].append(f"[{time.strftime('%H:%M:%S')}] ⚠ Warning: Node {node_name} did not come back online within {reboot_timeout}s")
+                        if not node_went_offline:
+                            mgr._rolling_update['logs'].append(f"[{time.strftime('%H:%M:%S')}] ⚠️ {node_name} did not go offline within 120s")
+                        
+                        if wait_for_reboot:
+                            # Phase 2: Wait for online
+                            mgr._rolling_update['logs'].append(f"[{time.strftime('%H:%M:%S')}] Waiting for {node_name} to come back online...")
+                            waited = 0
+                            node_back_online = False
+                            while waited < reboot_timeout:
+                                if mgr._rolling_update.get('status') == 'cancelled':
+                                    break
+                                try:
+                                    ns = mgr.get_node_status()
+                                    if node_name in ns and ns[node_name].get('status') == 'online':
+                                        node_back_online = True
+                                        mgr._rolling_update['logs'].append(f"[{time.strftime('%H:%M:%S')}] ✓ {node_name} back online ({waited}s)")
+                                        if node_name in mgr._rolling_update.get('rebooting_nodes', []):
+                                            mgr._rolling_update['rebooting_nodes'].remove(node_name)
+                                        time.sleep(10)
+                                        break
+                                except:
+                                    pass
+                                time.sleep(10)
+                                waited += 10
+                                if waited % 60 == 0:
+                                    mgr._rolling_update['logs'].append(f"[{time.strftime('%H:%M:%S')}] Still waiting for {node_name} ({waited}s/{reboot_timeout}s)...")
+                            
+                            if not node_back_online and mgr._rolling_update.get('status') != 'cancelled':
+                                mgr._rolling_update['logs'].append(f"[{time.strftime('%H:%M:%S')}] ✗ {node_name} reboot timeout ({reboot_timeout}s). Pausing.")
+                                mgr._rolling_update['status'] = 'paused'
+                                mgr._rolling_update['current_step'] = 'paused_reboot'
+                                mgr._rolling_update['paused_reason'] = 'reboot_timeout'
+                                mgr._rolling_update['paused_details'] = {
+                                    'node': node_name, 'timeout': reboot_timeout,
+                                    'message': f"{node_name} did not come back online within {reboot_timeout}s. Check manually, then Continue or Cancel."
+                                }
+                                while mgr._rolling_update.get('status') == 'paused':
+                                    time.sleep(2)
+                                if mgr._rolling_update.get('status') == 'cancelled':
+                                    break
+                                elif mgr._rolling_update.get('status') == 'running':
+                                    mgr._rolling_update['logs'].append(f"[{time.strftime('%H:%M:%S')}] ▶ Resumed after reboot timeout")
+                                    mgr._rolling_update['paused_reason'] = None
+                                    mgr._rolling_update['paused_details'] = None
+                                    if node_name in mgr._rolling_update.get('rebooting_nodes', []):
+                                        mgr._rolling_update['rebooting_nodes'].remove(node_name)
+                        else:
+                            mgr._rolling_update['logs'].append(f"[{time.strftime('%H:%M:%S')}] Not waiting for {node_name} (wait_for_reboot=False)")
+                    
+                    if mgr._rolling_update.get('status') == 'cancelled':
+                        break
                     
                     # Step 5: Disable maintenance mode
                     mgr._rolling_update['current_step'] = 'finishing'
@@ -32810,6 +36430,22 @@ def cancel_rolling_update(cluster_id):
             pass
     
     return jsonify({'success': True, 'message': 'Rolling update cancelled'})
+
+
+@app.route('/api/clusters/<cluster_id>/updates/rolling/resume', methods=['POST'])
+@require_auth(roles=[ROLE_ADMIN])
+def resume_rolling_update(cluster_id):
+    if cluster_id not in cluster_managers:
+        return jsonify({'error': 'Cluster not found'}), 404
+    manager = cluster_managers[cluster_id]
+    if not hasattr(manager, '_rolling_update') or not manager._rolling_update:
+        return jsonify({'error': 'No rolling update in progress'}), 400
+    if manager._rolling_update.get('status') != 'paused':
+        return jsonify({'error': f"Not paused (status: {manager._rolling_update.get('status')})"}), 400
+    paused_reason = manager._rolling_update.get('paused_reason', 'unknown')
+    manager._rolling_update['status'] = 'running'
+    manager._rolling_update['logs'].append(f"[{time.strftime('%H:%M:%S')}] ▶ Resumed (was: {paused_reason})")
+    return jsonify({'success': True, 'message': 'Resumed', 'was_paused_for': paused_reason})
 
 
 @app.route('/api/clusters/<cluster_id>/updates/rolling/clear', methods=['POST'])
@@ -32999,6 +36635,7 @@ def set_update_schedule(cluster_id):
         'skip_evacuation': data.get('skip_evacuation', False),
         'skip_up_to_date': data.get('skip_up_to_date', True),
         'evacuation_timeout': data.get('evacuation_timeout', 1800),
+        'wait_for_reboot': data.get('wait_for_reboot', True),
         'last_run': None,
         'next_run': None
     }
@@ -33700,7 +37337,7 @@ import queue as queue_module
 # MK: tokens are only valid for 5 min, way better than exposing the actual session
 sse_tokens = {}  # token -> {'user': username, 'expires': timestamp, 'allowed_clusters': [...]}
 sse_tokens_lock = threading.Lock()
-SSE_TOKEN_TTL = 300  # 5 min
+SSE_TOKEN_TTL = 600  # NS: Increased to 10 min (was 5 min) - gives more buffer for refresh
 
 def create_sse_token(username: str, allowed_clusters: list) -> str:
     """Create SSE token - avoids session ID in URL"""
@@ -33761,8 +37398,10 @@ def broadcast_sse(update_type: str, data: dict, cluster_id: str = None):
             return
         
         # Determine if this is a cluster-specific event
-        cluster_specific_events = ['node_status', 'vm_update', 'task_update', 'metrics', 
-                                   'migration', 'maintenance', 'ha_event', 'alert']
+        # NS: Added 'tasks' and 'resources' - broadcast loop sends these types
+        cluster_specific_events = ['node_status', 'vm_update', 'task_update', 'tasks', 
+                                   'metrics', 'resources', 'migration', 'maintenance', 
+                                   'ha_event', 'alert', 'ha_status']
         is_cluster_specific = update_type in cluster_specific_events or cluster_id is not None
         
         with sse_clients_lock:
@@ -33775,13 +37414,13 @@ def broadcast_sse(update_type: str, data: dict, cluster_id: str = None):
                     if not is_cluster_specific:
                         # Global event - send to everyone
                         should_send = True
+                    elif cluster_id and subscribed is None:
+                        # NS: subscribed=None means admin/all-access → send everything
+                        # Was previously blocking ALL SSE events for admin users!
+                        should_send = True
                     elif cluster_id and subscribed and cluster_id in subscribed:
                         # Cluster-specific event and client is subscribed
                         should_send = True
-                    elif cluster_id and subscribed is None:
-                        # Client didn't specify clusters - skip cluster-specific events
-                        # This prevents cross-cluster pollution
-                        should_send = False
                     
                     if q and should_send:
                         try:
@@ -33912,6 +37551,8 @@ def broadcast_resources_loop():
     
     MK: Increased frequency for more responsive UI
     NS: Further optimized Jan 2026 - resources now every 2s instead of 4s
+    NS: Feb 2026 - Fixed: process clusters in parallel to prevent one slow 
+        cluster from blocking updates to all others
     """
     print("=" * 50)
     print("SSE BROADCAST LOOP STARTED")
@@ -33931,41 +37572,55 @@ def broadcast_resources_loop():
             if loop_count % 10 == 1:  # Log every 10th loop
                 logging.debug(f"[SSE] Broadcasting to {client_count} clients (loop {loop_count})")
             
-            for cluster_id, manager in list(cluster_managers.items()):
+            def broadcast_for_cluster(cid, mgr):
+                """Broadcast updates for a single cluster - runs in own thread"""
                 try:
                     # SKIP OFFLINE CLUSTERS - Don't wait for timeouts!
-                    if not manager.is_connected:
+                    if not mgr.is_connected:
                         # Send empty data for offline clusters so UI knows
-                        broadcast_sse('tasks', [], cluster_id)
-                        continue
+                        broadcast_sse('tasks', [], cid)
+                        return
                     
                     # Get tasks every loop - always broadcast (even empty list)
-                    tasks = manager.get_tasks(limit=50)
-                    broadcast_sse('tasks', tasks or [], cluster_id)
+                    tasks = mgr.get_tasks(limit=50)
+                    broadcast_sse('tasks', tasks or [], cid)
                     
                     # Get metrics every loop
                     try:
-                        metrics = manager.get_node_status()
+                        metrics = mgr.get_node_status()
                         if metrics:
-                            broadcast_sse('metrics', metrics, cluster_id)
+                            broadcast_sse('metrics', metrics, cid)
                     except:
                         pass
                     
                     # NS: Resources every loop now (was every 2nd loop)
                     # This makes VM status update much faster in the UI
+                    # NS: Fixed - was calling get_all_resources() which doesn't exist!
                     try:
-                        resources = manager.get_all_resources()
+                        resources = mgr.get_vm_resources()
                         if resources:
-                            broadcast_sse('resources', resources, cluster_id)
+                            broadcast_sse('resources', resources, cid)
                     except:
                         pass
                         
                 except Exception as e:
-                    logging.debug(f"Error broadcasting updates for {cluster_id}: {e}")
+                    logging.debug(f"Error broadcasting updates for {cid}: {e}")
             
-            # NS: Reduced to 1.5 seconds for snappier updates
+            # NS: Run each cluster broadcast in its own thread with 8s max
+            # Prevents one slow/timing-out cluster from blocking all SSE updates
+            threads = []
+            for cluster_id, manager in list(cluster_managers.items()):
+                t = threading.Thread(target=broadcast_for_cluster, args=(cluster_id, manager), daemon=True)
+                t.start()
+                threads.append(t)
+            
+            # Wait for all threads, but max 8 seconds
+            for t in threads:
+                t.join(timeout=8)
+            
+            # NS: Reduced to 1 second for faster task updates
             # Proxmox API can handle this - it's just GET requests
-            time.sleep(1.5)
+            time.sleep(1)
                     
         except Exception as e:
             logging.error(f"Broadcast loop error: {e}")
