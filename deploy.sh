@@ -248,11 +248,19 @@ main() {
                     ;;
                 3)
                     read -p "Enter port (1-65535): " CUSTOM_PORT
+                    # Strip leading zeros so bash arithmetic doesn't treat value as octal
+                    CUSTOM_PORT="${CUSTOM_PORT##+(0)}"
+                    CUSTOM_PORT="${CUSTOM_PORT:-0}"
                     if [[ "$CUSTOM_PORT" =~ ^[0-9]+$ ]] && [ "$CUSTOM_PORT" -ge 1 ] && [ "$CUSTOM_PORT" -le 65535 ]; then
                         ACCESS_PORT=$CUSTOM_PORT
+                        if [ "$ACCESS_PORT" -lt 1024 ]; then
+                            echo -e "${YELLOW}  ⚠ Port $ACCESS_PORT is privileged (<1024).${NC}"
+                            echo -e "${YELLOW}    The service will use CAP_NET_BIND_SERVICE to bind it.${NC}"
+                            echo -e "${YELLOW}    Ensure the host grants this capability or run as root.${NC}"
+                        fi
                         break
                     else
-                        echo -e "${RED}Invalid port${NC}"
+                        echo -e "${RED}Invalid port. Please enter a number between 1 and 65535.${NC}"
                     fi
                     ;;
                 *)
