@@ -24,7 +24,7 @@ from pegaprox.utils.audit import log_audit
 from pegaprox.utils.rbac import user_can_access_vm, get_user_permissions
 from pegaprox.utils.realtime import broadcast_sse, broadcast_action, push_immediate_update
 from pegaprox.core.config import save_config
-from pegaprox.api.helpers import get_connected_manager, check_cluster_access, register_task_user
+from pegaprox.api.helpers import get_connected_manager, check_cluster_access, register_task_user, safe_error
 from pegaprox.utils.ssh import get_paramiko
 from urllib.parse import urlencode, quote as url_quote
 import signal
@@ -63,13 +63,14 @@ def get_datacenter_status(cluster_id):
         # calc summary
         nodes_online = sum(1 for s in status_data if s.get('type') == 'node' and s.get('online', 0) == 1)
         nodes_offline = sum(1 for s in status_data if s.get('type') == 'node' and s.get('online', 0) == 0)
-        cluster_info = next((s for s in status_data if s.get('type') == 'cluster'), {})
-        
+        cluster_info = next((s for s in status_data if s.get('type') == 'cluster'), None)
+        is_standalone = cluster_info is None
+
         vms_running = sum(1 for r in resources_data if r.get('type') == 'qemu' and r.get('status') == 'running')
         vms_stopped = sum(1 for r in resources_data if r.get('type') == 'qemu' and r.get('status') == 'stopped')
         cts_running = sum(1 for r in resources_data if r.get('type') == 'lxc' and r.get('status') == 'running')
         cts_stopped = sum(1 for r in resources_data if r.get('type') == 'lxc' and r.get('status') == 'stopped')
-        
+
         # Calculate total resources
         total_cpu = sum(r.get('maxcpu', 0) for r in resources_data if r.get('type') == 'node')
         used_cpu = sum(r.get('cpu', 0) * r.get('maxcpu', 0) for r in resources_data if r.get('type') == 'node')
@@ -77,13 +78,26 @@ def get_datacenter_status(cluster_id):
         used_mem = sum(r.get('mem', 0) for r in resources_data if r.get('type') == 'node')
         total_disk = sum(r.get('maxdisk', 0) for r in resources_data if r.get('type') == 'storage')
         used_disk = sum(r.get('disk', 0) for r in resources_data if r.get('type') == 'storage')
-        
-        return jsonify({
-            'cluster': {
+
+        # NS: single-node Proxmox doesn't return a cluster entry, was showing red X for no reason (#90)
+        if is_standalone:
+            node_name = next((s.get('name', '') for s in status_data if s.get('type') == 'node'), manager.config.name)
+            cluster_result = {
+                'name': node_name,
+                'quorate': None,
+                'standalone': True,
+                'version': 0
+            }
+        else:
+            cluster_result = {
                 'name': cluster_info.get('name', 'Unknown'),
                 'quorate': cluster_info.get('quorate', 0) == 1,
+                'standalone': False,
                 'version': cluster_info.get('version', 0)
-            },
+            }
+
+        return jsonify({
+            'cluster': cluster_result,
             'nodes': {
                 'online': nodes_online,
                 'offline': nodes_offline,
@@ -305,6 +319,9 @@ def get_join_info(cluster_id):
 @require_auth(perms=["cluster.view"])
 def get_datacenter_options(cluster_id):
     """Get datacenter options"""
+    ok, err = check_cluster_access(cluster_id)
+    if not ok:
+        return err
     manager, error = get_connected_manager(cluster_id)
     if error:
         return error
@@ -325,15 +342,26 @@ def get_datacenter_options(cluster_id):
 @require_auth(roles=[ROLE_ADMIN])
 def set_datacenter_options(cluster_id):
     """Update datacenter options"""
+    ok, err = check_cluster_access(cluster_id)
+    if not ok:
+        return err
     manager, error = get_connected_manager(cluster_id)
     if error:
         return error
     
+    # LW Feb 2026 - allowlist of valid datacenter options to prevent mass assignment
+    ALLOWED_DC_OPTIONS = {
+        'keyboard', 'language', 'console', 'email_from', 'max_workers',
+        'migration', 'migration_unsecure', 'ha', 'fencing', 'mac_prefix',
+        'bwlimit', 'u2f', 'webauthn', 'description', 'tag-style',
+        'notify', 'registered-tags', 'user-tag-access', 'crs',
+    }
     try:
         host = manager.current_host or manager.config.host
         url = f"https://{host}:8006/api2/json/cluster/options"
-        data = request.json or {}
-        
+        raw_data = request.json or {}
+        data = {k: v for k, v in raw_data.items() if k in ALLOWED_DC_OPTIONS}
+
         response = manager._create_session().put(url, data=data, timeout=10)
         
         if response.status_code == 200:
@@ -501,6 +529,9 @@ def get_datastore_content(cluster_id, storage_name):
 @require_auth(roles=[ROLE_ADMIN])
 def delete_datastore_content(cluster_id, storage_name, volid):
     """Delete content from a datastore (ISO, backup, etc.)"""
+    ok, err = check_cluster_access(cluster_id)
+    if not ok:
+        return err
     manager, error = get_connected_manager(cluster_id)
     if error:
         return error
@@ -598,6 +629,9 @@ def delete_datastore_content(cluster_id, storage_name, volid):
 @require_auth(roles=[ROLE_ADMIN])
 def upload_to_datastore(cluster_id, storage_name):
     """Upload ISO or other content to a datastore"""
+    ok, err = check_cluster_access(cluster_id)
+    if not ok:
+        return err
     manager, error = get_connected_manager(cluster_id)
     if error:
         return error
@@ -671,6 +705,9 @@ _url_downloads = {}  # task_id -> { status, percent, message, ... }
 @require_auth(roles=[ROLE_ADMIN])
 def download_iso_from_url(cluster_id, storage_name):
     """Download ISO/image from URL to storage (like Proxmox)"""
+    ok, err = check_cluster_access(cluster_id)
+    if not ok:
+        return err
     manager, error = get_connected_manager(cluster_id)
     if error:
         return error
@@ -842,6 +879,9 @@ def download_iso_from_url(cluster_id, storage_name):
 @require_auth(roles=[ROLE_ADMIN])
 def get_download_status(cluster_id, storage_name, task_id):
     """Get status of URL download task"""
+    ok, err = check_cluster_access(cluster_id)
+    if not ok:
+        return err
     if task_id not in _url_downloads:
         return jsonify({'status': 'unknown', 'message': 'Task not found'}), 404
     
@@ -861,6 +901,9 @@ def get_vm_backups(cluster_id, node, vm_type, vmid):
     
     LW: Scans all backup-capable storages for vzdump files matching the vmid
     """
+    ok, err = check_cluster_access(cluster_id)
+    if not ok:
+        return err
     manager, error = get_connected_manager(cluster_id)
     if error:
         return error
@@ -933,6 +976,9 @@ def create_vm_backup(cluster_id, node, vm_type, vmid):
     
     NS: Uses vzdump to create a backup
     """
+    ok, err = check_cluster_access(cluster_id)
+    if not ok:
+        return err
     manager, error = get_connected_manager(cluster_id)
     if error:
         return error
@@ -989,6 +1035,9 @@ def restore_vm_backup(cluster_id, node, vm_type, vmid):
     
     MK: Can restore to same VMID (overwrite) or new VMID
     """
+    ok, err = check_cluster_access(cluster_id)
+    if not ok:
+        return err
     manager, error = get_connected_manager(cluster_id)
     if error:
         return error
@@ -1055,13 +1104,22 @@ def restore_vm_backup(cluster_id, node, vm_type, vmid):
 @require_auth(perms=['backup.delete'])
 def delete_vm_backup(cluster_id, node, vm_type, vmid, volid):
     """Delete a specific backup
-    
+
     LW: Deletes from the storage where the backup is located
     """
+    ok, err = check_cluster_access(cluster_id)
+    if not ok:
+        return err
+    # LW Feb 2026 - check VM-level backup permission
+    users = load_users()
+    user = users.get(request.session['user'], {})
+    user['username'] = request.session['user']
+    if not user_can_access_vm(user, cluster_id, vmid, 'vm.backup', vm_type):
+        return jsonify({'error': 'Permission denied: vm.backup'}), 403
     manager, error = get_connected_manager(cluster_id)
     if error:
         return error
-    
+
     try:
         host = manager.current_host or manager.config.host
         session = manager._create_session()
@@ -1094,6 +1152,9 @@ def delete_vm_backup(cluster_id, node, vm_type, vmid, volid):
 @require_auth(perms=["cluster.view"])
 def get_replication_jobs(cluster_id):
     """Get all replication jobs"""
+    ok, err = check_cluster_access(cluster_id)
+    if not ok:
+        return err
     manager, error = get_connected_manager(cluster_id)
     if error:
         return error
@@ -1292,6 +1353,9 @@ def delete_firewall_rule(cluster_id, pos):
 @require_auth(perms=["cluster.view"])
 def get_firewall_groups(cluster_id):
     """Get firewall security groups"""
+    ok, err = check_cluster_access(cluster_id)
+    if not ok:
+        return err
     manager, error = get_connected_manager(cluster_id)
     if error:
         return error
@@ -1312,6 +1376,9 @@ def get_firewall_groups(cluster_id):
 @require_auth(perms=["cluster.view"])
 def get_firewall_aliases(cluster_id):
     """Get firewall aliases"""
+    ok, err = check_cluster_access(cluster_id)
+    if not ok:
+        return err
     manager, error = get_connected_manager(cluster_id)
     if error:
         return error
@@ -1332,6 +1399,9 @@ def get_firewall_aliases(cluster_id):
 @require_auth(perms=["cluster.view"])
 def get_firewall_ipsets(cluster_id):
     """Get firewall IP sets"""
+    ok, err = check_cluster_access(cluster_id)
+    if not ok:
+        return err
     manager, error = get_connected_manager(cluster_id)
     if error:
         return error
@@ -1360,6 +1430,9 @@ def _vm_fw_url(manager, node, vmtype, vmid, sub=''):
 @bp.route('/api/clusters/<cluster_id>/vms/<node>/<vmtype>/<vmid>/firewall/options', methods=['GET'])
 @require_auth(perms=['vm.view'])
 def get_vm_firewall_options(cluster_id, node, vmtype, vmid):
+    ok, err = check_cluster_access(cluster_id)
+    if not ok:
+        return err
     manager, error = get_connected_manager(cluster_id)
     if error: return error
     try:
@@ -1374,6 +1447,9 @@ def get_vm_firewall_options(cluster_id, node, vmtype, vmid):
 @bp.route('/api/clusters/<cluster_id>/vms/<node>/<vmtype>/<vmid>/firewall/options', methods=['PUT'])
 @require_auth(perms=['vm.config'])
 def set_vm_firewall_options(cluster_id, node, vmtype, vmid):
+    ok, err = check_cluster_access(cluster_id)
+    if not ok:
+        return err
     manager, error = get_connected_manager(cluster_id)
     if error: return error
     try:
@@ -1391,6 +1467,9 @@ def set_vm_firewall_options(cluster_id, node, vmtype, vmid):
 @bp.route('/api/clusters/<cluster_id>/vms/<node>/<vmtype>/<vmid>/firewall/rules', methods=['GET'])
 @require_auth(perms=['vm.view'])
 def get_vm_firewall_rules(cluster_id, node, vmtype, vmid):
+    ok, err = check_cluster_access(cluster_id)
+    if not ok:
+        return err
     manager, error = get_connected_manager(cluster_id)
     if error: return error
     try:
@@ -1408,6 +1487,9 @@ def get_vm_firewall_rules(cluster_id, node, vmtype, vmid):
 @bp.route('/api/clusters/<cluster_id>/vms/<node>/<vmtype>/<vmid>/firewall/rules', methods=['POST'])
 @require_auth(perms=['vm.config'])
 def create_vm_firewall_rule(cluster_id, node, vmtype, vmid):
+    ok, err = check_cluster_access(cluster_id)
+    if not ok:
+        return err
     manager, error = get_connected_manager(cluster_id)
     if error: return error
     try:
@@ -1432,6 +1514,9 @@ def create_vm_firewall_rule(cluster_id, node, vmtype, vmid):
 @bp.route('/api/clusters/<cluster_id>/vms/<node>/<vmtype>/<vmid>/firewall/rules/<int:pos>', methods=['PUT'])
 @require_auth(perms=['vm.config'])
 def update_vm_firewall_rule(cluster_id, node, vmtype, vmid, pos):
+    ok, err = check_cluster_access(cluster_id)
+    if not ok:
+        return err
     manager, error = get_connected_manager(cluster_id)
     if error: return error
     try:
@@ -1447,6 +1532,9 @@ def update_vm_firewall_rule(cluster_id, node, vmtype, vmid, pos):
 @bp.route('/api/clusters/<cluster_id>/vms/<node>/<vmtype>/<vmid>/firewall/rules/<int:pos>', methods=['DELETE'])
 @require_auth(perms=['vm.config'])
 def delete_vm_firewall_rule(cluster_id, node, vmtype, vmid, pos):
+    ok, err = check_cluster_access(cluster_id)
+    if not ok:
+        return err
     manager, error = get_connected_manager(cluster_id)
     if error: return error
     try:
@@ -1463,6 +1551,9 @@ def delete_vm_firewall_rule(cluster_id, node, vmtype, vmid, pos):
 @bp.route('/api/clusters/<cluster_id>/vms/<node>/<vmtype>/<vmid>/firewall/aliases', methods=['GET'])
 @require_auth(perms=['vm.view'])
 def get_vm_firewall_aliases(cluster_id, node, vmtype, vmid):
+    ok, err = check_cluster_access(cluster_id)
+    if not ok:
+        return err
     manager, error = get_connected_manager(cluster_id)
     if error: return error
     try:
@@ -1477,6 +1568,9 @@ def get_vm_firewall_aliases(cluster_id, node, vmtype, vmid):
 @bp.route('/api/clusters/<cluster_id>/vms/<node>/<vmtype>/<vmid>/firewall/aliases', methods=['POST'])
 @require_auth(perms=['vm.config'])
 def create_vm_firewall_alias(cluster_id, node, vmtype, vmid):
+    ok, err = check_cluster_access(cluster_id)
+    if not ok:
+        return err
     manager, error = get_connected_manager(cluster_id)
     if error: return error
     try:
@@ -1492,6 +1586,9 @@ def create_vm_firewall_alias(cluster_id, node, vmtype, vmid):
 @bp.route('/api/clusters/<cluster_id>/vms/<node>/<vmtype>/<vmid>/firewall/aliases/<name>', methods=['PUT'])
 @require_auth(perms=['vm.config'])
 def update_vm_firewall_alias(cluster_id, node, vmtype, vmid, name):
+    ok, err = check_cluster_access(cluster_id)
+    if not ok:
+        return err
     manager, error = get_connected_manager(cluster_id)
     if error: return error
     try:
@@ -1507,6 +1604,9 @@ def update_vm_firewall_alias(cluster_id, node, vmtype, vmid, name):
 @bp.route('/api/clusters/<cluster_id>/vms/<node>/<vmtype>/<vmid>/firewall/aliases/<name>', methods=['DELETE'])
 @require_auth(perms=['vm.config'])
 def delete_vm_firewall_alias(cluster_id, node, vmtype, vmid, name):
+    ok, err = check_cluster_access(cluster_id)
+    if not ok:
+        return err
     manager, error = get_connected_manager(cluster_id)
     if error: return error
     try:
@@ -1521,6 +1621,9 @@ def delete_vm_firewall_alias(cluster_id, node, vmtype, vmid, name):
 @bp.route('/api/clusters/<cluster_id>/vms/<node>/<vmtype>/<vmid>/firewall/ipset', methods=['GET'])
 @require_auth(perms=['vm.view'])
 def get_vm_firewall_ipsets(cluster_id, node, vmtype, vmid):
+    ok, err = check_cluster_access(cluster_id)
+    if not ok:
+        return err
     manager, error = get_connected_manager(cluster_id)
     if error: return error
     try:
@@ -1535,6 +1638,9 @@ def get_vm_firewall_ipsets(cluster_id, node, vmtype, vmid):
 @bp.route('/api/clusters/<cluster_id>/vms/<node>/<vmtype>/<vmid>/firewall/ipset', methods=['POST'])
 @require_auth(perms=['vm.config'])
 def create_vm_firewall_ipset(cluster_id, node, vmtype, vmid):
+    ok, err = check_cluster_access(cluster_id)
+    if not ok:
+        return err
     manager, error = get_connected_manager(cluster_id)
     if error: return error
     try:
@@ -1550,6 +1656,9 @@ def create_vm_firewall_ipset(cluster_id, node, vmtype, vmid):
 @bp.route('/api/clusters/<cluster_id>/vms/<node>/<vmtype>/<vmid>/firewall/ipset/<name>', methods=['GET'])
 @require_auth(perms=['vm.view'])
 def get_vm_firewall_ipset_content(cluster_id, node, vmtype, vmid, name):
+    ok, err = check_cluster_access(cluster_id)
+    if not ok:
+        return err
     manager, error = get_connected_manager(cluster_id)
     if error: return error
     try:
@@ -1564,6 +1673,9 @@ def get_vm_firewall_ipset_content(cluster_id, node, vmtype, vmid, name):
 @bp.route('/api/clusters/<cluster_id>/vms/<node>/<vmtype>/<vmid>/firewall/ipset/<name>', methods=['POST'])
 @require_auth(perms=['vm.config'])
 def add_vm_firewall_ipset_entry(cluster_id, node, vmtype, vmid, name):
+    ok, err = check_cluster_access(cluster_id)
+    if not ok:
+        return err
     manager, error = get_connected_manager(cluster_id)
     if error: return error
     try:
@@ -1579,6 +1691,9 @@ def add_vm_firewall_ipset_entry(cluster_id, node, vmtype, vmid, name):
 @bp.route('/api/clusters/<cluster_id>/vms/<node>/<vmtype>/<vmid>/firewall/ipset/<name>/<path:cidr>', methods=['DELETE'])
 @require_auth(perms=['vm.config'])
 def delete_vm_firewall_ipset_entry(cluster_id, node, vmtype, vmid, name, cidr):
+    ok, err = check_cluster_access(cluster_id)
+    if not ok:
+        return err
     manager, error = get_connected_manager(cluster_id)
     if error: return error
     try:
@@ -1593,6 +1708,9 @@ def delete_vm_firewall_ipset_entry(cluster_id, node, vmtype, vmid, name, cidr):
 @bp.route('/api/clusters/<cluster_id>/vms/<node>/<vmtype>/<vmid>/firewall/ipset/<name>', methods=['DELETE'])
 @require_auth(perms=['vm.config'])
 def delete_vm_firewall_ipset(cluster_id, node, vmtype, vmid, name):
+    ok, err = check_cluster_access(cluster_id)
+    if not ok:
+        return err
     manager, error = get_connected_manager(cluster_id)
     if error: return error
     try:
@@ -1607,6 +1725,9 @@ def delete_vm_firewall_ipset(cluster_id, node, vmtype, vmid, name):
 @bp.route('/api/clusters/<cluster_id>/vms/<node>/<vmtype>/<vmid>/firewall/refs', methods=['GET'])
 @require_auth(perms=['vm.view'])
 def get_vm_firewall_refs(cluster_id, node, vmtype, vmid):
+    ok, err = check_cluster_access(cluster_id)
+    if not ok:
+        return err
     manager, error = get_connected_manager(cluster_id)
     if error: return error
     try:
@@ -1621,6 +1742,9 @@ def get_vm_firewall_refs(cluster_id, node, vmtype, vmid):
 @bp.route('/api/clusters/<cluster_id>/vms/<node>/<vmtype>/<vmid>/firewall/log', methods=['GET'])
 @require_auth(perms=['vm.view'])
 def get_vm_firewall_log(cluster_id, node, vmtype, vmid):
+    ok, err = check_cluster_access(cluster_id)
+    if not ok:
+        return err
     manager, error = get_connected_manager(cluster_id)
     if error: return error
     try:
@@ -1642,6 +1766,9 @@ def get_vm_firewall_log(cluster_id, node, vmtype, vmid):
 @require_auth(perms=["cluster.view"])
 def get_pci_mappings(cluster_id):
     """Get PCI device mappings"""
+    ok, err = check_cluster_access(cluster_id)
+    if not ok:
+        return err
     manager, error = get_connected_manager(cluster_id)
     if error:
         return error
@@ -1662,6 +1789,9 @@ def get_pci_mappings(cluster_id):
 @require_auth(perms=["cluster.view"])
 def get_usb_mappings(cluster_id):
     """Get USB device mappings"""
+    ok, err = check_cluster_access(cluster_id)
+    if not ok:
+        return err
     manager, error = get_connected_manager(cluster_id)
     if error:
         return error
@@ -1758,6 +1888,9 @@ def exit_maintenance_mode_api(cluster_id, node_name):
 @require_auth(perms=['node.maintenance'])
 def acknowledge_maintenance_warning(cluster_id, node_name):
     """Acknowledge maintenance warning (e.g., when some VMs couldn't migrate)"""
+    ok, err = check_cluster_access(cluster_id)
+    if not ok:
+        return err
     if cluster_id not in cluster_managers:
         return jsonify({'error': 'Cluster not found'}), 404
     
@@ -1812,7 +1945,7 @@ def test_node_connection(cluster_id):
     try:
         # Connect via SSH
         ssh = paramiko.SSHClient()
-        ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        ssh.set_missing_host_key_policy(paramiko.WarningPolicy())
         ssh.connect(node_ip, port=ssh_port, username=username, password=password, timeout=15)
         
         # Get hostname
@@ -1986,7 +2119,7 @@ def join_node_to_cluster(cluster_id):
         
         # Connect to new node via SSH
         ssh = paramiko.SSHClient()
-        ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        ssh.set_missing_host_key_policy(paramiko.WarningPolicy())
         ssh.connect(node_ip, port=ssh_port, username=username, password=password, timeout=30)
         
         # NS: Feb 2026 - Clean old cluster config if force rejoin
@@ -2037,7 +2170,7 @@ def join_node_to_cluster(cluster_id):
             ssh.close()
             time.sleep(2)
             ssh = paramiko.SSHClient()
-            ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+            ssh.set_missing_host_key_policy(paramiko.WarningPolicy())
             ssh.connect(node_ip, port=ssh_port, username=username, password=password, timeout=30)
         
         # Use interactive shell for pvecm add (it prompts for password)
@@ -2289,7 +2422,7 @@ def remove_node_from_cluster(cluster_id, node_name):
         
         # Connect to an online node via SSH
         ssh = paramiko.SSHClient()
-        ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        ssh.set_missing_host_key_policy(paramiko.WarningPolicy())
         
         # Try SSH key first, then password
         connected = False
@@ -2345,7 +2478,7 @@ def remove_node_from_cluster(cluster_id, node_name):
             try:
                 logging.info(f"[RemoveNode] Cleaning up cluster config on removed node {node_name} ({removed_node_ip})")
                 ssh_cleanup = paramiko.SSHClient()
-                ssh_cleanup.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+                ssh_cleanup.set_missing_host_key_policy(paramiko.WarningPolicy())
                 
                 # Try to connect to the removed node
                 cleanup_connected = False
@@ -2700,6 +2833,9 @@ def vm_action_api(cluster_id, node, vm_type, vmid, action):
     
     NS: Updated Dec 2025 - Now checks VM-specific ACLs
     """
+    ok, err = check_cluster_access(cluster_id)
+    if not ok:
+        return err
     logging.info(f"[VM-ACTION] Received: {action} on {vm_type}/{vmid} at {node}, cluster={cluster_id}")
     
     # check cluster access
@@ -3075,6 +3211,9 @@ def get_vm_rrd_api(cluster_id, node, vm_type, vmid, timeframe):
 @bp.route('/api/clusters/<cluster_id>/vms/<node>/<vm_type>/<int:vmid>/config', methods=['PUT'])
 @require_auth(perms=['vm.config'])
 def update_vm_config_api(cluster_id, node, vm_type, vmid):
+    ok, err = check_cluster_access(cluster_id)
+    if not ok:
+        return err
     
     if cluster_id not in cluster_managers:
         return jsonify({'error': 'Cluster not found'}), 404
@@ -3121,6 +3260,9 @@ def sanitize_boot_order_api(cluster_id, node, vm_type, vmid):
     
     NS: Feb 2026 - Fixes 'invalid bootorder: device does not exist' errors.
     """
+    ok, err = check_cluster_access(cluster_id)
+    if not ok:
+        return err
     if cluster_id not in cluster_managers:
         return jsonify({'error': 'Cluster not found'}), 404
     
@@ -3150,6 +3292,9 @@ def sanitize_boot_order_api(cluster_id, node, vm_type, vmid):
 @require_auth(perms=['node.view'])
 def get_node_pci_devices(cluster_id, node):
     """Get available PCI devices on a node for passthrough"""
+    ok, err = check_cluster_access(cluster_id)
+    if not ok:
+        return err
     manager, error = get_connected_manager(cluster_id)
     if error:
         return error
@@ -3176,6 +3321,9 @@ def get_node_pci_devices(cluster_id, node):
 @require_auth(perms=['node.view'])
 def get_node_usb_devices(cluster_id, node):
     """Get available USB devices on a node for passthrough"""
+    ok, err = check_cluster_access(cluster_id)
+    if not ok:
+        return err
     manager, error = get_connected_manager(cluster_id)
     if error:
         return error
@@ -3326,6 +3474,9 @@ def add_pci_passthrough(cluster_id, node, vmid):
 @require_auth(perms=['vm.config'])
 def add_usb_passthrough(cluster_id, node, vmid):
     """Add a USB device passthrough to a VM"""
+    ok, err = check_cluster_access(cluster_id)
+    if not ok:
+        return err
     manager, error = get_connected_manager(cluster_id)
     if error:
         return error
@@ -3388,6 +3539,9 @@ def add_usb_passthrough(cluster_id, node, vmid):
 @require_auth(perms=['vm.config'])
 def add_serial_port(cluster_id, node, vmid):
     """Add a serial port to a VM"""
+    ok, err = check_cluster_access(cluster_id)
+    if not ok:
+        return err
     manager, error = get_connected_manager(cluster_id)
     if error:
         return error
@@ -3433,6 +3587,9 @@ def add_serial_port(cluster_id, node, vmid):
 @require_auth(perms=['vm.config'])
 def remove_passthrough_device(cluster_id, node, vmid, device_type, key):
     """Remove a passthrough device from a VM"""
+    ok, err = check_cluster_access(cluster_id)
+    if not ok:
+        return err
     manager, error = get_connected_manager(cluster_id)
     if error:
         return error
@@ -3505,6 +3662,9 @@ def _parse_usb_config(config_str):
 @bp.route('/api/clusters/<cluster_id>/vms/<node>/<vm_type>/<int:vmid>/resize', methods=['PUT'])
 @require_auth(perms=['vm.config'])
 def resize_vm_disk_api(cluster_id, node, vm_type, vmid):
+    ok, err = check_cluster_access(cluster_id)
+    if not ok:
+        return err
     
     if cluster_id not in cluster_managers:
         return jsonify({'error': 'Cluster not found'}), 404
@@ -3532,6 +3692,9 @@ def resize_vm_disk_api(cluster_id, node, vm_type, vmid):
 @require_auth(perms=['storage.view'])
 def get_storage_list_api(cluster_id, node):
     """Get available storage on a node"""
+    ok, err = check_cluster_access(cluster_id)
+    if not ok:
+        return err
     if cluster_id not in cluster_managers:
         return jsonify({'error': 'Cluster not found'}), 404
     
@@ -3544,6 +3707,9 @@ def get_storage_list_api(cluster_id, node):
 @require_auth(perms=['node.view'])
 def get_network_list_api(cluster_id, node):
     """Get available networks on a node"""
+    ok, err = check_cluster_access(cluster_id)
+    if not ok:
+        return err
     if cluster_id not in cluster_managers:
         return jsonify({'error': 'Cluster not found'}), 404
     
@@ -3556,6 +3722,9 @@ def get_network_list_api(cluster_id, node):
 @require_auth(perms=['storage.view'])
 def get_iso_list_api(cluster_id, node):
     """Get available ISO images on a node"""
+    ok, err = check_cluster_access(cluster_id)
+    if not ok:
+        return err
     if cluster_id not in cluster_managers:
         return jsonify({'error': 'Cluster not found'}), 404
     
@@ -3569,6 +3738,9 @@ def get_iso_list_api(cluster_id, node):
 @require_auth(perms=['vm.config'])
 def add_disk_api(cluster_id, node, vm_type, vmid):
     """Add a disk to VM or container"""
+    ok, err = check_cluster_access(cluster_id)
+    if not ok:
+        return err
     if cluster_id not in cluster_managers:
         return jsonify({'error': 'Cluster not found'}), 404
     
@@ -3603,6 +3775,9 @@ def add_disk_api(cluster_id, node, vm_type, vmid):
 @require_auth(perms=['vm.config'])
 def remove_disk_api(cluster_id, node, vm_type, vmid, disk_id):
     """Remove disk from VM - boot order cleanup is now handled in remove_disk method"""
+    ok, err = check_cluster_access(cluster_id)
+    if not ok:
+        return err
     
     if cluster_id not in cluster_managers:
         return jsonify({'error': 'Cluster not found'}), 404
@@ -3637,6 +3812,9 @@ def remove_disk_api(cluster_id, node, vm_type, vmid, disk_id):
 @bp.route('/api/clusters/<cluster_id>/vms/<node>/<vm_type>/<int:vmid>/disks/<disk_id>/move', methods=['POST'])
 @require_auth(perms=['vm.config'])
 def move_disk_api(cluster_id, node, vm_type, vmid, disk_id):
+    ok, err = check_cluster_access(cluster_id)
+    if not ok:
+        return err
     
     if cluster_id not in cluster_managers:
         return jsonify({'error': 'Cluster not found'}), 404
@@ -3670,6 +3848,9 @@ def move_disk_api(cluster_id, node, vm_type, vmid, disk_id):
 @require_auth(perms=['vm.config'])
 def set_cdrom_api(cluster_id, node, vmid):
     """Set or eject CD-ROM"""
+    ok, err = check_cluster_access(cluster_id)
+    if not ok:
+        return err
     if cluster_id not in cluster_managers:
         return jsonify({'error': 'Cluster not found'}), 404
     
@@ -3703,6 +3884,9 @@ def set_cdrom_api(cluster_id, node, vmid):
 @require_auth(perms=['vm.config'])
 def add_network_api(cluster_id, node, vm_type, vmid):
     """Add a network interface"""
+    ok, err = check_cluster_access(cluster_id)
+    if not ok:
+        return err
     if cluster_id not in cluster_managers:
         return jsonify({'error': 'Cluster not found'}), 404
     
@@ -3723,6 +3907,9 @@ def add_network_api(cluster_id, node, vm_type, vmid):
 @bp.route('/api/clusters/<cluster_id>/vms/<node>/<vm_type>/<int:vmid>/networks/<net_id>', methods=['PUT'])
 @require_auth(perms=['vm.config'])
 def update_network_api(cluster_id, node, vm_type, vmid, net_id):
+    ok, err = check_cluster_access(cluster_id)
+    if not ok:
+        return err
     
     if cluster_id not in cluster_managers:
         return jsonify({'error': 'Cluster not found'}), 404
@@ -3744,6 +3931,9 @@ def update_network_api(cluster_id, node, vm_type, vmid, net_id):
 @bp.route('/api/clusters/<cluster_id>/vms/<node>/<vm_type>/<int:vmid>/networks/<net_id>', methods=['DELETE'])
 @require_auth(perms=['vm.config'])
 def remove_network_api(cluster_id, node, vm_type, vmid, net_id):
+    ok, err = check_cluster_access(cluster_id)
+    if not ok:
+        return err
     
     if cluster_id not in cluster_managers:
         return jsonify({'error': 'Cluster not found'}), 404
@@ -3769,6 +3959,9 @@ def toggle_network_link_api(cluster_id, node, vm_type, vmid, net_id):
     NS: This is a hot-pluggable operation for QEMU VMs (no reboot needed)
     LW: Very useful for testing network failover scenarios
     """
+    ok, err = check_cluster_access(cluster_id)
+    if not ok:
+        return err
     if cluster_id not in cluster_managers:
         return jsonify({'error': 'Cluster not found'}), 404
     
@@ -3797,6 +3990,9 @@ def toggle_network_link_api(cluster_id, node, vm_type, vmid, net_id):
 @require_auth(perms=['vm.view'])
 def check_snapshot_capability_api(cluster_id, node, vm_type, vmid):
     """Check if VM/CT can create snapshots and why not"""
+    ok, err = check_cluster_access(cluster_id)
+    if not ok:
+        return err
     if cluster_id not in cluster_managers:
         return jsonify({'error': 'Cluster not found'}), 404
     
@@ -3809,6 +4005,9 @@ def check_snapshot_capability_api(cluster_id, node, vm_type, vmid):
 @require_auth(perms=['vm.view'])
 def get_snapshots_api(cluster_id, node, vm_type, vmid):
     """Get list of snapshots for a VM/CT"""
+    ok, err = check_cluster_access(cluster_id)
+    if not ok:
+        return err
     if cluster_id not in cluster_managers:
         return jsonify({'error': 'Cluster not found'}), 404
     
@@ -4164,7 +4363,12 @@ def snapshots_overview_delete():
             if not is_admin and user_clusters and cluster_id not in user_clusters:
                 errors.append(f"No access to cluster {cluster_id}")
                 continue
-            
+
+            # MK Feb 2026 - VM-level ACL check for snapshot delete
+            if not user_can_access_vm(user_data, cluster_id, vmid, 'vm.snapshot', vm_type):
+                errors.append(f"Permission denied: vm.snapshot for VM {vmid}")
+                continue
+
             result = mgr.delete_snapshot(node, vmid, vm_type, snapname)
             
             if result.get('success'):
@@ -4198,6 +4402,9 @@ def snapshots_overview_delete():
 @require_auth(perms=['cluster.view'])
 def get_replication_jobs_api(cluster_id):
     """Get all replication jobs"""
+    ok, err = check_cluster_access(cluster_id)
+    if not ok:
+        return err
     if cluster_id not in cluster_managers:
         return jsonify({'error': 'Cluster not found'}), 404
     
@@ -4211,6 +4418,9 @@ def get_replication_jobs_api(cluster_id):
 @require_auth(perms=['cluster.config'])
 def create_replication_job_api(cluster_id):
     """Create a replication job"""
+    ok, err = check_cluster_access(cluster_id)
+    if not ok:
+        return err
     if cluster_id not in cluster_managers:
         return jsonify({'error': 'Cluster not found'}), 404
     
@@ -4240,6 +4450,9 @@ def create_replication_job_api(cluster_id):
 @bp.route('/api/clusters/<cluster_id>/replication/<job_id>', methods=['DELETE'])
 @require_auth(perms=['cluster.config'])
 def delete_replication_job_api(cluster_id, job_id):
+    ok, err = check_cluster_access(cluster_id)
+    if not ok:
+        return err
     
     if cluster_id not in cluster_managers:
         return jsonify({'error': 'Cluster not found'}), 404
@@ -4264,6 +4477,9 @@ def delete_replication_job_api(cluster_id, job_id):
 @require_auth(perms=['cluster.config'])
 def run_replication_now_api(cluster_id, job_id):
     """Trigger immediate replication"""
+    ok, err = check_cluster_access(cluster_id)
+    if not ok:
+        return err
     if cluster_id not in cluster_managers:
         return jsonify({'error': 'Cluster not found'}), 404
     
@@ -4882,6 +5098,9 @@ def vnc_websocket_route(cluster_id, node, vm_type, vmid):
     
     NS: Auth via query param since WebSocket can't send custom headers
     """
+    ok, err = check_cluster_access(cluster_id)
+    if not ok:
+        return err
     # Auth check via query param
     session_id = request.args.get('session')
     if not session_id:
@@ -5171,9 +5390,9 @@ def start_vnc_websocket_server(port=5001, ssl_cert=None, ssl_key=None, host='0.0
         import logging as ws_logging
         ws_logging.getLogger('websockets').setLevel(ws_logging.CRITICAL)
         
-        # Use the new websockets API
+        # NS: added ping keepalive like ssh server has, was causing random disconnects (#92)
         try:
-            async with websockets.serve(vnc_handler, host, port, ssl=ssl_context):
+            async with websockets.serve(vnc_handler, host, port, ssl=ssl_context, ping_interval=20, ping_timeout=10):
                 print(f"VNC WebSocket Server ready on {proto}://{host}:{port}")
                 server_ready.set()
                 await asyncio.Future()  # Run forever
@@ -5181,7 +5400,7 @@ def start_vnc_websocket_server(port=5001, ssl_cert=None, ssl_key=None, host='0.0
             # Issue #71: IPv6 bind failed, fall back to 0.0.0.0
             if ':' in str(host):
                 print(f"VNC WebSocket: IPv6 bind failed ({bind_err}), falling back to 0.0.0.0")
-                async with websockets.serve(vnc_handler, '0.0.0.0', port, ssl=ssl_context):
+                async with websockets.serve(vnc_handler, '0.0.0.0', port, ssl=ssl_context, ping_interval=20, ping_timeout=10):
                     print(f"VNC WebSocket Server ready on {proto}://0.0.0.0:{port}")
                     server_ready.set()
                     await asyncio.Future()
@@ -5500,8 +5719,10 @@ async def ssh_handler(websocket):
         print("Session validation successful")
     except requests.exceptions.ConnectionError as e:
         print(f"Connection error to main server: {e}")
-        # Allow connection if main server is unreachable (for debugging)
-        print("WARNING: Skipping session validation due to connection error")
+        # NS Feb 2026 - never skip auth, even if main server is unreachable
+        await websocket.send('{"status":"error","message":"Authentifizierung fehlgeschlagen - Server nicht erreichbar"}')
+        await websocket.close(1011, "Auth server unreachable")
+        return
     except Exception as e:
         print(f"Auth error: {e}")
         await websocket.send('{"status":"error","message":"Authentifizierungsfehler"}')
@@ -5620,7 +5841,7 @@ async def ssh_handler(websocket):
     
     # Connect SSH
     ssh = paramiko.SSHClient()
-    ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    ssh.set_missing_host_key_policy(paramiko.WarningPolicy())
     
     try:
         print(f"Connecting SSH to {ssh_user}@{node_ip}...")
@@ -5964,7 +6185,7 @@ def node_shell_websocket_proxy(ws, cluster_id, node):
     try:
         # Create SSH client
         ssh = paramiko.SSHClient()
-        ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        ssh.set_missing_host_key_policy(paramiko.WarningPolicy())
         
         # Connect
         ssh.connect(
@@ -6078,6 +6299,9 @@ def node_shell_websocket_proxy(ws, cluster_id, node):
 @require_auth(perms=['vm.migrate'])
 def migrate_vm_api(cluster_id, node, vm_type, vmid):
     """Migrate a VM or container to another node"""
+    ok, err = check_cluster_access(cluster_id)
+    if not ok:
+        return err
     if cluster_id not in cluster_managers:
         return jsonify({'error': 'Cluster not found'}), 404
     
@@ -6255,6 +6479,9 @@ def bulk_migrate_api(cluster_id):
 @require_auth(perms=['cluster.view'])
 def get_cluster_fingerprint_api(cluster_id):
     """Get cluster SSL fingerprint for remote migration"""
+    ok, err = check_cluster_access(cluster_id)
+    if not ok:
+        return err
     if cluster_id not in cluster_managers:
         return jsonify({'error': 'Cluster not found'}), 404
     
@@ -6271,6 +6498,9 @@ def get_cluster_fingerprint_api(cluster_id):
 @require_auth(perms=['vm.migrate'])
 def remote_migrate_vm_api(cluster_id, node, vm_type, vmid):
     """Cross-cluster remote migration"""
+    ok, err = check_cluster_access(cluster_id)
+    if not ok:
+        return err
     if cluster_id not in cluster_managers:
         return jsonify({'error': 'Cluster not found'}), 404
     
@@ -6348,7 +6578,14 @@ def cross_cluster_migrate_api():
         return jsonify({'error': 'Source cluster not found'}), 404
     if target_cluster_id not in cluster_managers:
         return jsonify({'error': 'Target cluster not found'}), 404
-    
+    # MK Feb 2026 - check access to BOTH source and target cluster
+    ok, err = check_cluster_access(source_cluster_id)
+    if not ok:
+        return err
+    ok, err = check_cluster_access(target_cluster_id)
+    if not ok:
+        return err
+
     source_manager = cluster_managers[source_cluster_id]
     target_manager = cluster_managers[target_cluster_id]
     
@@ -6561,6 +6798,9 @@ def cross_cluster_migrate_api():
 @require_auth(perms=["node.view"])
 def get_cluster_nodes_status_api(cluster_id):
     """Get list of nodes with status info - LW: alternative endpoint with more details"""
+    ok, err = check_cluster_access(cluster_id)
+    if not ok:
+        return err
     if cluster_id not in cluster_managers:
         return jsonify({'error': 'Cluster not found'}), 404
     
@@ -6584,6 +6824,9 @@ def get_cluster_nodes_status_api(cluster_id):
 @bp.route('/api/clusters/<cluster_id>/nodes/<node>/nextid', methods=['GET'])
 @require_auth(perms=['vm.view'])
 def get_next_vmid_for_node_api(cluster_id, node):
+    ok, err = check_cluster_access(cluster_id)
+    if not ok:
+        return err
     
     if cluster_id not in cluster_managers:
         return jsonify({'error': 'Cluster not found'}), 404
@@ -6601,6 +6844,9 @@ def get_next_vmid_for_node_api(cluster_id, node):
 @require_auth(perms=['storage.view'])
 def get_templates_api(cluster_id, node):
     """Get available templates for VM/CT creation"""
+    ok, err = check_cluster_access(cluster_id)
+    if not ok:
+        return err
     if cluster_id not in cluster_managers:
         return jsonify({'error': 'Cluster not found'}), 404
     

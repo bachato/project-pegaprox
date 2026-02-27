@@ -140,7 +140,11 @@ class PegaProxDB:
                 pass
             self.fernet = Fernet(fernet_key)
             logging.info("Generated legacy Fernet key (for compatibility)")
-    
+
+        # NS Feb 2026 - refuse to start without encryption
+        if not self.aesgcm and not self.fernet:
+            raise RuntimeError("FATAL: No encryption backend available. Cannot start safely.")
+
     def _get_connection(self):
         """Get thread-local database connection
         
@@ -1045,9 +1049,8 @@ class PegaProxDB:
             except Exception as e:
                 logging.error(f"fernet failed: {e}")
         
-        # ugh no encryption
-        logging.warning("no encryption, storing plaintext!!")
-        return data
+        # NS Feb 2026 - never store plaintext, fail safely
+        raise RuntimeError("No encryption backend available (neither AES-256-GCM nor Fernet). Cannot store sensitive data.")
     
     def _decrypt(self, data: str) -> str:
         """decrypt - handles both old and new format"""
@@ -2879,7 +2882,7 @@ class PegaProxDB:
                 'vms': vms_list,
                 'vm_ids': vms_list,  # MK: frontend expects vm_ids
                 'enabled': bool(row['enabled']),
-                'enforce': bool(row.get('enforce', 0)),
+                'enforce': bool(row['enforce']) if 'enforce' in row.keys() else False,
             })
 
         return rules

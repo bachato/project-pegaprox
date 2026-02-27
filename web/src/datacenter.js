@@ -1049,12 +1049,14 @@
                                     <div className="bg-proxmox-card border border-proxmox-border rounded-xl p-6">
                                         <h3 className="text-lg font-semibold mb-4 text-green-400">Status</h3>
                                         <div className="flex items-center justify-center">
-                                            <div className={`w-20 h-20 rounded-full flex items-center justify-center text-3xl ${dcStatus.cluster?.quorate ? 'bg-green-500/20 text-green-400' : 'bg-red-500/20 text-red-400'}`}>
-                                                {dcStatus.cluster?.quorate ? '✓' : '✗'}
+                                            <div className={`w-20 h-20 rounded-full flex items-center justify-center text-3xl ${dcStatus.cluster?.standalone ? 'bg-blue-500/20 text-blue-400' : dcStatus.cluster?.quorate ? 'bg-green-500/20 text-green-400' : 'bg-red-500/20 text-red-400'}`}>
+                                                {dcStatus.cluster?.standalone ? '●' : dcStatus.cluster?.quorate ? '✓' : '✗'}
                                             </div>
                                         </div>
                                         <p className="text-center mt-4 text-sm text-gray-400">
-                                            {dcStatus.cluster?.name} | Quorate: {dcStatus.cluster?.quorate ? 'Yes' : 'No'}
+                                            {dcStatus.cluster?.standalone
+                                                ? `${dcStatus.cluster?.name} | Standalone Node`
+                                                : `${dcStatus.cluster?.name} | Quorate: ${dcStatus.cluster?.quorate ? 'Yes' : 'No'}`}
                                         </p>
                                     </div>
                                     <div className="bg-proxmox-card border border-proxmox-border rounded-xl p-6">
@@ -1073,14 +1075,14 @@
                                             <h4 className="font-medium mb-3">Virtual Machines</h4>
                                             <div className="space-y-2 text-sm">
                                                 <div className="flex justify-between"><span className="text-green-400">● Running</span><span>{dcStatus.guests?.vms?.running || 0}</span></div>
-                                                <div className="flex justify-between"><span className="text-gray-400">â—‹ Stopped</span><span>{dcStatus.guests?.vms?.stopped || 0}</span></div>
+                                                <div className="flex justify-between"><span className="text-gray-400">○ Stopped</span><span>{dcStatus.guests?.vms?.stopped || 0}</span></div>
                                             </div>
                                         </div>
                                         <div>
                                             <h4 className="font-medium mb-3">LXC Container</h4>
                                             <div className="space-y-2 text-sm">
                                                 <div className="flex justify-between"><span className="text-green-400">● Running</span><span>{dcStatus.guests?.containers?.running || 0}</span></div>
-                                                <div className="flex justify-between"><span className="text-gray-400">â—‹ Stopped</span><span>{dcStatus.guests?.containers?.stopped || 0}</span></div>
+                                                <div className="flex justify-between"><span className="text-gray-400">○ Stopped</span><span>{dcStatus.guests?.containers?.stopped || 0}</span></div>
                                             </div>
                                         </div>
                                     </div>

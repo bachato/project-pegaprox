@@ -210,6 +210,36 @@ except:
     ARCHIVE=""
 fi
 
+# NS Feb 2026 - verify archive integrity via SHA256 checksum
+if [ -n "$ARCHIVE" ] && [ -f "$ARCHIVE" ]; then
+    echo -n "Verifying archive integrity... "
+    SHA_FILE="$TMPDIR/SHA256SUMS"
+    SHA_VERIFIED=false
+    if curl -sfL "$GITHUB_RAW/SHA256SUMS" -o "$SHA_FILE" 2>/dev/null || \
+       curl -sfL "$MIRROR_URL/SHA256SUMS" -o "$SHA_FILE" 2>/dev/null; then
+        # SHA256SUMS contains lines like: <hash>  <filename>
+        EXPECTED=$(grep -E 'main\.tar\.gz$' "$SHA_FILE" 2>/dev/null | awk '{print $1}')
+        if [ -n "$EXPECTED" ]; then
+            ACTUAL=$(sha256sum "$ARCHIVE" | awk '{print $1}')
+            if [ "$EXPECTED" = "$ACTUAL" ]; then
+                echo -e "${GREEN}OK (SHA256 verified)${NC}"
+                SHA_VERIFIED=true
+            else
+                echo -e "${RED}CHECKSUM MISMATCH${NC}"
+                echo -e "${RED}Expected: $EXPECTED${NC}"
+                echo -e "${RED}Got:      $ACTUAL${NC}"
+                echo -e "${RED}Archive may be corrupted or tampered with. Aborting.${NC}"
+                rm -rf "$TMPDIR"
+                exit 1
+            fi
+        else
+            echo -e "${YELLOW}no matching entry in SHA256SUMS${NC}"
+        fi
+    else
+        echo -e "${YELLOW}SHA256SUMS not available (skipping verification)${NC}"
+    fi
+fi
+
 # Extract archive if we got one
 if [ -n "$ARCHIVE" ] && [ -f "$ARCHIVE" ]; then
     echo -n "Extracting archive... "

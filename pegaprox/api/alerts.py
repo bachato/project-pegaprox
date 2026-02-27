@@ -296,7 +296,7 @@ def load_cluster_affinity_rules():
                 'vms': vms_list,
                 'vm_ids': vms_list,  # NS: alias for frontend compatibility
                 'enabled': bool(row['enabled']),
-                'enforce': bool(row.get('enforce', 0)),
+                'enforce': bool(row['enforce']) if 'enforce' in row.keys() else False,
                 'created_at': row['created_at']
             })
         

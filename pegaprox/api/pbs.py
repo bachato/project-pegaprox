@@ -659,8 +659,10 @@ def download_pbs_file(pbs_id, store):
         if resp is None or resp.status_code != 200:
             status = resp.status_code if resp else 502
             return jsonify({'error': f'Download failed: HTTP {status}'}), status
-        # Extract filename from filepath
+        # Extract filename from filepath + sanitize for Content-Disposition header injection
+        import re as _re
         filename = filepath.rstrip('/').split('/')[-1] or 'download'
+        filename = _re.sub(r'["\r\n\x00-\x1f]', '', filename)  # NS Feb 2026 - strip control chars
         content_type = resp.headers.get('content-type', 'application/octet-stream')
         from flask import Response
         return Response(

@@ -5823,7 +5823,7 @@
                                     <span className="text-red-500 ml-2">✗ {t('hardDiskNotAvailable')}</span>
                                 )}
                                 {!currentDriveInfo && (
-                                    <span className="text-blue-400 ml-2">â—‹ {t('freeSlot')}</span>
+                                    <span className="text-blue-400 ml-2">○ {t('freeSlot')}</span>
                                 )}
                             </div>
                         </div>

@@ -38,7 +38,7 @@ def get_ldap_settings() -> dict:
         'viewer_group': settings.get('ldap_viewer_group', ''),
         'default_role': settings.get('ldap_default_role', ROLE_VIEWER),
         'auto_create_users': settings.get('ldap_auto_create_users', True),
-        'verify_tls': settings.get('ldap_verify_tls', False),  # NS: Feb 2026 - TLS cert verification (default off for backwards compat)
+        'verify_tls': settings.get('ldap_verify_tls', True),  # MK Feb 2026 - TLS cert verification (default on, set ldap_verify_tls=false to disable)
         # MK: Feb 2026 - Custom group→role mappings for custom roles & tenants
         # Format: [{"group_dn": "CN=...", "role": "custom_role_name", "tenant": "tenant_id", "permissions": [...]}]
         'group_mappings': settings.get('ldap_group_mappings', []),

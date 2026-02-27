@@ -127,17 +127,24 @@ def log_audit(user: str, action: str, details: str = None, ip_address: str = Non
     cluster_info = f" [{cluster}]" if cluster else ""
     logging.info(f"Audit: {user} - {action}{cluster_info} - {details}")
 
+def _is_loopback(addr):
+    """Check if address is loopback (trusted proxy)"""
+    return addr in ('127.0.0.1', '::1', '127.0.0.0')
+
 def get_client_ip():
-    """Get client IP address from request"""
+    """Get client IP address from request
+    NS Feb 2026 - only trust X-Forwarded-For from loopback (reverse proxy)
+    """
     # NS Feb 2026 - background threads (scheduler, metrics) have no Flask context
     if not has_request_context():
         return 'system'
-    if request.headers.get('X-Forwarded-For'):
-        return request.headers.get('X-Forwarded-For').split(',')[0].strip()
-    elif request.headers.get('X-Real-IP'):
-        return request.headers.get('X-Real-IP')
-    else:
-        return request.remote_addr
+    # Only trust proxy headers when request comes from loopback
+    if _is_loopback(request.remote_addr):
+        if request.headers.get('X-Forwarded-For'):
+            return request.headers.get('X-Forwarded-For').split(',')[0].strip()
+        elif request.headers.get('X-Real-IP'):
+            return request.headers.get('X-Real-IP')
+    return request.remote_addr
 
 # Global users store (loaded at startup)
 users_db = {}

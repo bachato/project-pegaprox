@@ -130,7 +130,7 @@ def _ssh_exec(host, user, password, cmd, timeout=30):
         import paramiko
         
         client = paramiko.SSHClient()
-        client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        client.set_missing_host_key_policy(paramiko.WarningPolicy())
         
         connected = False
         transport = None
@@ -161,7 +161,7 @@ def _ssh_exec(host, user, password, cmd, timeout=30):
         if not connected:
             try:
                 client2 = paramiko.SSHClient()
-                client2.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+                client2.set_missing_host_key_policy(paramiko.WarningPolicy())
                 
                 transport2 = paramiko.Transport((host, 22))
                 _configure_transport_algorithms(transport2)
@@ -192,7 +192,7 @@ def _ssh_exec(host, user, password, cmd, timeout=30):
         if not connected:
             try:
                 client3 = paramiko.SSHClient()
-                client3.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+                client3.set_missing_host_key_policy(paramiko.WarningPolicy())
                 client3.connect(host, username=user, password=password, timeout=timeout,
                                allow_agent=False, look_for_keys=False)
                 client = client3

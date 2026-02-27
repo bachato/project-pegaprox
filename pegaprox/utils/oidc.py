@@ -157,13 +157,15 @@ def get_oidc_endpoints(config: dict) -> dict:
         }
 
 
-def oidc_build_auth_url(config: dict, state: str) -> str:
+def oidc_build_auth_url(config: dict, state: str) -> tuple:
     """Build the OIDC authorization URL for redirect
-    
+
     MK: state parameter prevents CSRF - stored in session before redirect
+    Returns (url, nonce) tuple so caller can store nonce for later validation
     """
     endpoints = get_oidc_endpoints(config)
-    
+
+    nonce = secrets.token_urlsafe(32)
     params = {
         'client_id': config['client_id'],
         'response_type': 'code',
@@ -171,9 +173,9 @@ def oidc_build_auth_url(config: dict, state: str) -> str:
         'scope': config['scopes'],
         'state': state,
         'response_mode': 'query',
-        'nonce': secrets.token_urlsafe(32),
+        'nonce': nonce,
     }
-    
+
     # Entra-specific: request group claims
     if config.get('provider') == 'entra':
         # Request groups in ID token (up to 200 groups)
@@ -181,9 +183,9 @@ def oidc_build_auth_url(config: dict, state: str) -> str:
         if 'GroupMember.Read.All' not in params['scope']:
             # We'll use graph API for groups instead
             pass
-    
+
     query = '&'.join(f"{k}={requests.utils.quote(str(v))}" for k, v in params.items())
-    return f"{endpoints['authorization']}?{query}"
+    return f"{endpoints['authorization']}?{query}", nonce
 
 
 def oidc_exchange_code(config: dict, code: str) -> dict:
@@ -222,26 +224,39 @@ def oidc_exchange_code(config: dict, code: str) -> dict:
         return {'error': str(e)}
 
 
-def oidc_decode_id_token(id_token: str) -> dict:
-    """Decode JWT ID token without full verification
-    
+def oidc_decode_id_token(id_token: str, expected_nonce: str = None) -> dict:
+    """Decode JWT ID token without full signature verification
+
     MK: We trust the token because it came directly from the token endpoint over HTTPS.
-    For production with untrusted tokens, verify signature against JWKS.
+    LW Feb 2026: Added exp validation and nonce verification.
+    TODO: Full JWKS signature verification for defense-in-depth.
     """
     try:
         # JWT = header.payload.signature - we just need the payload
         parts = id_token.split('.')
         if len(parts) != 3:
             return {'error': 'Invalid JWT format'}
-        
+
         # Base64url decode payload (add padding)
         payload = parts[1]
         padding = 4 - len(payload) % 4
         if padding != 4:
             payload += '=' * padding
-        
+
         decoded = base64.urlsafe_b64decode(payload)
         claims = json.loads(decoded)
+
+        # LW Feb 2026 - validate expiry (5 min clock skew tolerance)
+        exp = claims.get('exp')
+        if exp and time.time() > exp + 300:
+            logging.warning(f"[OIDC] ID token expired: exp={exp}, now={time.time():.0f}")
+            return {'error': 'ID token has expired'}
+
+        # LW Feb 2026 - validate nonce if provided
+        if expected_nonce and claims.get('nonce') != expected_nonce:
+            logging.warning(f"[OIDC] Nonce mismatch: expected={expected_nonce[:8]}..., got={str(claims.get('nonce', ''))[:8]}...")
+            return {'error': 'OIDC nonce mismatch - possible replay attack'}
+
         return claims
     except Exception as e:
         logging.error(f"[OIDC] JWT decode error: {e}")

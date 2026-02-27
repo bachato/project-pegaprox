@@ -80,8 +80,10 @@ async def ssh_handler(websocket):
         print("Session validation successful")
     except requests.exceptions.ConnectionError as e:
         print(f"Connection error to main server: {e}")
-        # Allow connection if main server is unreachable (for debugging)
-        print("WARNING: Skipping session validation due to connection error")
+        # NS Feb 2026 - never skip auth, even if main server is unreachable
+        await websocket.send('{"status":"error","message":"Authentifizierung fehlgeschlagen - Server nicht erreichbar"}')
+        await websocket.close(1011, "Auth server unreachable")
+        return
     except Exception as e:
         print(f"Auth error: {e}")
         await websocket.send('{"status":"error","message":"Authentifizierungsfehler"}')
@@ -200,7 +202,7 @@ async def ssh_handler(websocket):
     
     # Connect SSH
     ssh = paramiko.SSHClient()
-    ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    ssh.set_missing_host_key_policy(paramiko.WarningPolicy())
     
     try:
         print(f"Connecting SSH to {ssh_user}@{node_ip}...")

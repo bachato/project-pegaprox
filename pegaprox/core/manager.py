@@ -24,6 +24,21 @@ from typing import Any, Dict, List, Optional
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
+# MK: requests verify=False doesn't fully kill hostname checking in newer urllib3,
+# had a user report that IP-only clusters fail while DNS works fine (#88)
+import ssl
+from requests.adapters import HTTPAdapter
+from urllib3.util.ssl_ import create_urllib3_context
+
+class _NoHostnameCheckAdapter(HTTPAdapter):
+    """MK: Force-disable hostname verification so IPs work with self-signed certs"""
+    def init_poolmanager(self, *args, **kwargs):
+        ctx = create_urllib3_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        kwargs['ssl_context'] = ctx
+        return super().init_poolmanager(*args, **kwargs)
+
 from pegaprox.constants import SSH_MAX_CONCURRENT, LOG_DIR
 from pegaprox import globals as _g
 from pegaprox.globals import (
@@ -317,7 +332,9 @@ class PegaProxManager:
         """
         session = requests.Session()
         session.verify = self._ssl_verify
-        
+        if not self._ssl_verify:
+            session.mount('https://', _NoHostnameCheckAdapter())  # MK: fix for IP-based hosts
+
         if getattr(self, '_api_token', None):
             # API Token auth - use Authorization header
             session.headers.update({'Authorization': f'PVEAPIToken={self._api_token}'})
@@ -495,7 +512,9 @@ class PegaProxManager:
                     # Create a temporary session just for login
                     session = requests.Session()
                     session.verify = self._ssl_verify
-                    
+                    if not self._ssl_verify:
+                        session.mount('https://', _NoHostnameCheckAdapter())  # MK: #88
+
                     if self._using_api_token:
                         # API Token auth - no ticket needed!
                         # Token goes in Authorization header: PVEAPIToken=user@realm!tokenid=secret
@@ -577,6 +596,11 @@ class PegaProxManager:
                     self.logger.warning(f"Connection timeout to {host}")
                     self.is_connected = False
                     self.connection_error = f"Timeout connecting to {host}"
+                except requests.exceptions.SSLError as ssl_err:
+                    # MK: separate SSL errors so the user actually knows what went wrong
+                    self.logger.warning(f"SSL error connecting to {host}: {ssl_err}")
+                    self.is_connected = False
+                    self.connection_error = f"SSL error connecting to {host} - check certificate or try hostname instead of IP"
                 except requests.exceptions.ConnectionError:
                     self.logger.warning(f"Cannot connect to {host}")
                     self.is_connected = False
@@ -5517,7 +5541,7 @@ echo "AGENT_INSTALLED_OK"
                     self.logger.info(f"Connecting to {host}:{ssh_port} as {username}...")
                 
                 ssh = paramiko.SSHClient()
-                ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+                ssh.set_missing_host_key_policy(paramiko.WarningPolicy())
                 
                 connect_kwargs = {
                     'hostname': host,
@@ -7390,24 +7414,34 @@ echo "AGENT_INSTALLED_OK"
         vg_name = snapshots[0]['vg_name']
 
         # Get LV usage data via SSH
+        # NS: use separator so empty columns don't break the parsing, was causing
+        # false "snapshot lost" status when data_percent was blank on some LVM versions
         exit_code, stdout, stderr = self._node_ssh_exec(
-            node, f'lvs --noheadings --nosuffix --units g -o lv_name,lv_size,data_percent {shlex.quote(vg_name)}'
+            node, f'lvs --noheadings --nosuffix --units g --separator "|" -o lv_name,lv_size,data_percent,snap_percent {shlex.quote(vg_name)}'
         )
         if exit_code != 0:
             return snapshots
 
-        # Parse lvs output into lookup: lv_name -> {size, data_percent}
+        # Parse lvs output: lv_name|size|data_pct|snap_pct
         lv_usage = {}
         for line in stdout.strip().split('\n'):
-            parts = line.split()
-            if len(parts) >= 3:
-                try:
-                    lv_usage[parts[0]] = {
-                        'size': float(parts[1]),
-                        'data_percent': float(parts[2])
-                    }
-                except ValueError:
-                    continue
+            cols = [c.strip() for c in line.split('|')]
+            if len(cols) < 2 or not cols[0]:
+                continue
+            try:
+                size = float(cols[1]) if cols[1] else 0.0
+                # take whichever percent column has a value (data_percent or snap_percent)
+                pct = 0.0
+                for col in cols[2:]:
+                    if col:
+                        try:
+                            pct = float(col)
+                            break
+                        except ValueError:
+                            pass
+                lv_usage[cols[0]] = {'size': size, 'data_percent': pct}
+            except ValueError:
+                continue
 
         # Also get VG free space for auto-extend
         vg_free_gb = 0.0

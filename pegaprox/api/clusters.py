@@ -22,7 +22,7 @@ from pegaprox.utils.rbac import (
 from pegaprox.utils.realtime import broadcast_sse, broadcast_update, push_immediate_update
 from pegaprox.core.config import load_config, save_config
 from pegaprox.core.manager import PegaProxManager
-from pegaprox.api.helpers import load_server_settings, get_connected_manager, check_cluster_access
+from pegaprox.api.helpers import load_server_settings, get_connected_manager, check_cluster_access, safe_error
 
 # MK: this used to be 200 lines down in the monolith, good luck finding anything there
 bp = Blueprint('clusters', __name__)
@@ -113,9 +113,10 @@ def add_cluster():
     # Create and start manager
     manager = PegaProxManager(cluster_id, config)
     
-    # Test connection
+    # Test connection - MK: return actual error instead of generic message (#88)
     if not manager.connect_to_proxmox():
-        return jsonify({'error': 'Failed to connect to Proxmox cluster'}), 400
+        error_detail = manager.connection_error or 'Failed to connect to Proxmox cluster'
+        return jsonify({'error': f'Failed to connect: {error_detail}'}), 400
     
     manager.start()
     cluster_managers[cluster_id] = manager
@@ -251,7 +252,7 @@ def reorder_clusters():
         return jsonify({'message': 'Cluster order updated', 'order': order})
     except Exception as e:
         logging.error(f"Failed to reorder clusters: {e}")
-        return jsonify({'error': str(e)}), 500
+        return jsonify({'error': safe_error(e, 'Operation failed')}), 500
 
 
 @bp.route('/api/clusters/<cluster_id>/sort-order', methods=['PUT'])
@@ -280,7 +281,7 @@ def update_cluster_sort_order(cluster_id):
         return jsonify({'message': 'Sort order updated', 'sort_order': sort_order})
     except Exception as e:
         logging.error(f"Failed to update sort order: {e}")
-        return jsonify({'error': str(e)}), 500
+        return jsonify({'error': safe_error(e, 'Operation failed')}), 500
 
 
 @bp.route('/api/clusters/<cluster_id>/metrics', methods=['GET'])
@@ -512,7 +513,7 @@ def set_excluded_nodes(cluster_id):
         db.conn.commit()
     except Exception as e:
         logging.error(f"Failed to save excluded_nodes: {e}")
-        return jsonify({'error': f'Database error: {str(e)}'}), 500
+        return jsonify({'error': safe_error(e, 'Database operation failed')}), 500
     
     log_audit(request.session['user'], 'cluster.excluded_nodes_changed', 
               f"Cluster {mgr.config.name}: excluded nodes set to {excluded_nodes}")
@@ -552,7 +553,7 @@ def add_excluded_node(cluster_id, node):
             db.conn.commit()
         except Exception as e:
             logging.error(f"Failed to save excluded_nodes: {e}")
-            return jsonify({'error': f'Database error: {str(e)}'}), 500
+            return jsonify({'error': safe_error(e, 'Database operation failed')}), 500
         
         log_audit(request.session['user'], 'cluster.node_excluded', 
                   f"Node {node} excluded from balancing in cluster {mgr.config.name}")
@@ -592,7 +593,7 @@ def remove_excluded_node(cluster_id, node):
             db.conn.commit()
         except Exception as e:
             logging.error(f"Failed to save excluded_nodes: {e}")
-            return jsonify({'error': f'Database error: {str(e)}'}), 500
+            return jsonify({'error': safe_error(e, 'Database operation failed')}), 500
         
         log_audit(request.session['user'], 'cluster.node_included', 
                   f"Node {node} re-included in balancing for cluster {mgr.config.name}")
@@ -664,7 +665,7 @@ def get_excluded_vms(cluster_id):
         })
     except Exception as e:
         logging.error(f"Error getting excluded VMs: {e}")
-        return jsonify({'error': str(e)}), 500
+        return jsonify({'error': safe_error(e, 'Operation failed')}), 500
 
 
 @bp.route('/api/clusters/<cluster_id>/excluded-vms/<int:vmid>', methods=['POST'])
@@ -773,7 +774,7 @@ def set_fallback_hosts(cluster_id):
         db.conn.commit()
     except Exception as e:
         logging.error(f"Failed to save fallback_hosts: {e}")
-        return jsonify({'error': f'Database error: {str(e)}'}), 500
+        return jsonify({'error': safe_error(e, 'Database operation failed')}), 500
     
     log_audit(request.session['user'], 'cluster.fallback_hosts_changed', 
               f"Cluster {mgr.config.name}: fallback hosts set to {fallback_hosts}")
@@ -841,7 +842,7 @@ def cancel_task(cluster_id, node, upid):
         else:
             return jsonify({'error': 'Failed to cancel task'}), 500
     except Exception as e:
-        return jsonify({'error': str(e)}), 500
+        return jsonify({'error': safe_error(e, 'Operation failed')}), 500
 
 
 
@@ -1225,7 +1226,7 @@ def create_proxmox_ha_group(cluster_id):
         else:
             return jsonify({'error': resp.text}), 400
     except Exception as e:
-        return jsonify({'error': str(e)}), 500
+        return jsonify({'error': safe_error(e, 'Operation failed')}), 500
 
 
 # MK: Delete HA Group
@@ -1252,7 +1253,7 @@ def delete_proxmox_ha_group(cluster_id, group_name):
         else:
             return jsonify({'error': resp.text}), 400
     except Exception as e:
-        return jsonify({'error': str(e)}), 500
+        return jsonify({'error': safe_error(e, 'Operation failed')}), 500
 
 
 @bp.route('/api/clusters/<cluster_id>/proxmox-ha/resources', methods=['POST'])

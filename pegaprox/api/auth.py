@@ -31,7 +31,7 @@ from pegaprox.utils.oidc import (
     oidc_get_user_groups, oidc_map_groups_to_role, oidc_provision_user,
 )
 from pegaprox.utils.rbac import get_user_permissions, DEFAULT_TENANT_ID
-from pegaprox.api.helpers import load_server_settings, save_server_settings, get_login_settings, get_session_timeout
+from pegaprox.api.helpers import load_server_settings, save_server_settings, get_login_settings, get_session_timeout, safe_error
 from pegaprox.utils.sanitization import sanitize_identifier
 from pegaprox.utils.ssh import check_auth_action_rate_limit
 from pegaprox.app import add_allowed_origin
@@ -68,14 +68,15 @@ def oidc_authorize():
     
     # MK: Generate state for CSRF protection
     state = secrets.token_urlsafe(32)
-    
+
     # Store state in a temporary way (cookie-based since no session yet)
-    auth_url = oidc_build_auth_url(config, state)
-    
+    auth_url, nonce = oidc_build_auth_url(config, state)
+
     response = make_response(jsonify({'auth_url': auth_url}))  # NS: Don't return state in body - it's in the cookie
     # LW: Store state in secure cookie for callback verification
     is_secure = request.is_secure or request.headers.get('X-Forwarded-Proto') == 'https'
-    response.set_cookie('oidc_state', state, httponly=True, secure=is_secure, samesite='Lax', max_age=600)
+    # MK Feb 2026 - store nonce alongside state for ID token validation
+    response.set_cookie('oidc_state', f"{state}:{nonce}", httponly=True, secure=is_secure, samesite='Lax', max_age=600)
     return response
 
 
@@ -117,30 +118,35 @@ def oidc_callback():
     if not code:
         return jsonify({'error': 'Authorization code is required'}), 400
     
-    # NS: Verify CSRF state
-    stored_state = request.cookies.get('oidc_state', '')
+    # NS: Verify CSRF state + extract nonce (MK Feb 2026)
+    stored_cookie = request.cookies.get('oidc_state', '')
+    stored_nonce = None
+    if ':' in stored_cookie:
+        stored_state, stored_nonce = stored_cookie.split(':', 1)
+    else:
+        stored_state = stored_cookie
     if not stored_state or stored_state != state:
         logging.warning(f"[OIDC] State mismatch - possible CSRF attack")
         return jsonify({'error': 'Invalid state parameter (CSRF protection)'}), 400
-    
+
     # Step 1: Exchange code for tokens
     token_data = oidc_exchange_code(config, code)
     if 'error' in token_data:
         return jsonify({'error': token_data['error']}), 401
-    
+
     access_token = token_data.get('access_token', '')
     id_token_raw = token_data.get('id_token', '')
-    
+
     if not access_token:
         return jsonify({'error': 'No access token received'}), 401
-    
-    # Step 2: Decode ID token for claims
+
+    # Step 2: Decode ID token for claims (with nonce + exp validation - MK Feb 2026)
     id_claims = {}
     if id_token_raw:
-        id_claims = oidc_decode_id_token(id_token_raw)
+        id_claims = oidc_decode_id_token(id_token_raw, expected_nonce=stored_nonce)
         if 'error' in id_claims:
-            logging.warning(f"[OIDC] ID token decode warning: {id_claims['error']}")
-            id_claims = {}
+            logging.warning(f"[OIDC] ID token validation failed: {id_claims['error']}")
+            return jsonify({'error': id_claims['error']}), 401
     
     # Step 3: Get user info from provider
     user_info = oidc_get_user_info(config, access_token)
@@ -306,10 +312,10 @@ def auth_login():
     lockout_time = login_settings['lockout_time']
     attempt_window = login_settings['attempt_window']
     
-    # get ip (handle proxies)
-    client_ip = request.headers.get('X-Forwarded-For', request.remote_addr)
-    if client_ip:
-        client_ip = client_ip.split(',')[0].strip()
+    # NS Feb 2026 - only trust X-Forwarded-For from loopback (reverse proxy)
+    client_ip = request.remote_addr
+    if client_ip in ('127.0.0.1', '::1') and request.headers.get('X-Forwarded-For'):
+        client_ip = request.headers.get('X-Forwarded-For').split(',')[0].strip()
     
     current_time = time.time()
     
@@ -538,13 +544,25 @@ def auth_login():
     
     logging.info(f"User '{username}' logged in successfully")
     log_audit(username, 'user.login', f"User logged in" + (" (with 2FA)" if user.get('totp_enabled') else ""))
-    
+
+    # LW Feb 2026 - enforce force_password_change before granting full session
+    if user.get('force_password_change'):
+        logging.info(f"User '{username}' must change password before proceeding")
+        response = jsonify({
+            'requires_password_change': True,
+            'session_id': session_id
+        })
+        is_secure = request.is_secure or request.headers.get('X-Forwarded-Proto') == 'https'
+        response.set_cookie('session_id', session_id, httponly=True, samesite='Strict',
+                          secure=is_secure, max_age=get_session_timeout())
+        return response, 200
+
     # Auto-allow this origin for CORS (Open Source convenience)
     # Only authenticated users from valid origins get added
     origin = request.headers.get('Origin')
     if origin:
         add_allowed_origin(origin)
-    
+
     # NS: Get default theme for response
     settings = load_server_settings()
     default_theme = settings.get('default_theme', 'proxmoxDark')
@@ -719,7 +737,7 @@ def auth_check():
     
     return jsonify({
         'authenticated': True,
-        'session_id': session_id,  # MK: Return session_id for WebSocket auth
+        # NS Feb 2026 - session_id removed from auth_check (frontend already has it from login)
         'user': {
             'username': session['user'],
             'role': fresh_role,
@@ -1166,8 +1184,8 @@ def list_api_tokens():
             tokens = [dict(row) for row in cursor.fetchall()]
             return jsonify({'tokens': tokens})
         except Exception as e:
-            return jsonify({'error': str(e)}), 500
-    
+            return jsonify({'error': safe_error(e, 'Failed to list tokens')}), 500
+
     tokens = list_user_tokens(username)
     return jsonify({'tokens': tokens})
 
@@ -1242,8 +1260,8 @@ def revoke_api_token_endpoint(token_id):
                 return jsonify({'success': True})
             return jsonify({'error': 'Token not found'}), 404
         except Exception as e:
-            return jsonify({'error': str(e)}), 500
-    
+            return jsonify({'error': safe_error(e, 'Failed to revoke token')}), 500
+
     if revoke_api_token(token_id, username):
         log_audit(username, 'token.revoked', f"Revoked API token id={token_id}")
         return jsonify({'success': True})

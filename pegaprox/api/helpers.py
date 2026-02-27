@@ -254,3 +254,12 @@ def check_cluster_access(cluster_id):
     if allowed is not None and cluster_id not in allowed:
         return False, (jsonify({'error': 'Access denied to this cluster'}), 403)
     return True, None
+
+
+def safe_error(e, default_msg='An internal error occurred'):
+    """Return a safe error message for API responses.
+    MK Feb 2026 - logs full exception but returns generic message to client.
+    Prevents leaking internal paths, stack traces, and DB details.
+    """
+    logging.error(f"[API] {default_msg}: {e}", exc_info=True)
+    return default_msg

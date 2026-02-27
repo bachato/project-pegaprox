@@ -5553,7 +5553,8 @@
                                                                                 {rule.type === 'together' ? t('together') || 'Together' : t('separate') || 'Separate'}
                                                                             </span>
                                                                             {rule.enforce && <span className="px-1.5 py-0.5 text-xs bg-yellow-500/20 text-yellow-400 rounded">{t('enforced') || 'Enforced'}</span>}
-                                                                            <span className="text-sm text-gray-400">IDs: {(rule.vm_ids || rule.vms || []).join(', ')}</span>
+                                                                            <span className="text-sm text-white font-medium">{rule.name || rule.id}</span>
+                                                                            <span className="text-sm text-gray-400">VMs: {(rule.vm_ids || rule.vms || []).join(', ')}</span>
                                                                         </div>
                                                                         <button onClick={() => deleteClusterAffinityRule(rule.id)} className="p-1.5 hover:bg-red-500/20 rounded text-gray-500 hover:text-red-400">
                                                                             <Icons.Trash className="w-4 h-4" />
@@ -9535,11 +9536,16 @@
                                     const form = e.target;
                                     const vmIds = form.vm_ids.value.split(',').map(id => parseInt(id.trim())).filter(Boolean);
                                     await createClusterAffinityRule({
+                                        name: form.rule_name.value || 'New Rule',
                                         type: form.type.value,
                                         vm_ids: vmIds,
                                         enforce: form.enforce.checked
                                     });
                                 }} className="p-4 space-y-4">
+                                    <div>
+                                        <label className="block text-sm text-gray-400 mb-1">{t('ruleName') || 'Rule Name'}</label>
+                                        <input name="rule_name" placeholder="e.g. DB Cluster Affinity" className="w-full px-3 py-2 bg-proxmox-dark border border-proxmox-border rounded-lg" />
+                                    </div>
                                     <div>
                                         <label className="block text-sm text-gray-400 mb-1">{t('ruleType') || 'Rule Type'}</label>
                                         <select name="type" className="w-full px-3 py-2 bg-proxmox-dark border border-proxmox-border rounded-lg">

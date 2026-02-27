@@ -374,25 +374,32 @@ def check_affinity_violation(cluster_id: str, vmid: int, target_node: str) -> di
     return {'violation': False}
 
 @bp.route('/api/affinity-rules', methods=['GET'])
+@bp.route('/api/clusters/<cluster_id>/affinity-rules', methods=['GET'])
 @require_auth(perms=['cluster.view'])
-def get_affinity_rules():
-    """Get all affinity rules"""
-    return jsonify(load_affinity_rules())
+def get_affinity_rules(cluster_id=None):
+    """Get affinity rules, optionally filtered by cluster"""
+    config = load_affinity_rules()
+    if cluster_id:
+        config['rules'] = [r for r in config['rules'] if r.get('cluster_id') == cluster_id]
+    return jsonify(config)
 
 @bp.route('/api/affinity-rules', methods=['POST'])
+@bp.route('/api/clusters/<cluster_id>/affinity-rules', methods=['POST'])
 @require_auth(roles=[ROLE_ADMIN])
-def create_affinity_rule():
+def create_affinity_rule(cluster_id=None):
     """Create a new affinity rule"""
     data = request.json or {}
     config = load_affinity_rules()
-    
+
     import uuid
     # MK: frontend sends vm_ids, db column is vms - accept both
     vms_data = data.get('vm_ids') or data.get('vms', [])
+    # NS: cluster_id from URL takes priority over body
+    rule_cluster_id = cluster_id or data.get('cluster_id', '')
     new_rule = {
         'id': str(uuid.uuid4())[:8],
         'name': data.get('name', 'New Rule'),
-        'cluster_id': data.get('cluster_id', ''),
+        'cluster_id': rule_cluster_id,
         'type': data.get('type', 'together'),  # together, separate
         'vms': vms_data,
         'vm_ids': vms_data,  # keep both so frontend doesn't break
@@ -400,29 +407,30 @@ def create_affinity_rule():
         'enforce': data.get('enforce', False),
         'created': datetime.now().isoformat()
     }
-    
+
     config['rules'].append(new_rule)
     save_affinity_rules(config)
-    
+
     user = request.session.get('user', 'unknown')
     log_audit(user, 'affinity_rule.created', f"Created affinity rule: {new_rule['name']}")
-    
+
     return jsonify(new_rule), 201
 
 @bp.route('/api/affinity-rules/<rule_id>', methods=['PUT'])
+@bp.route('/api/clusters/<cluster_id>/affinity-rules/<rule_id>', methods=['PUT'])
 @require_auth(roles=[ROLE_ADMIN])
-def update_affinity_rule(rule_id):
+def update_affinity_rule(rule_id, cluster_id=None):
     """Update an affinity rule"""
     data = request.json or {}
     config = load_affinity_rules()
-    
+
     for rule in config['rules']:
         if rule['id'] == rule_id:
             # MK: try every possible source for the vm list
             vms_data = data.get('vm_ids') or data.get('vms') or rule.get('vms') or rule.get('vm_ids', [])
             rule.update({
                 'name': data.get('name', rule['name']),
-                'cluster_id': data.get('cluster_id', rule['cluster_id']),
+                'cluster_id': cluster_id or data.get('cluster_id', rule.get('cluster_id', '')),
                 'type': data.get('type', rule['type']),
                 'vms': vms_data,
                 'vm_ids': vms_data,
@@ -431,20 +439,21 @@ def update_affinity_rule(rule_id):
             })
             save_affinity_rules(config)
             return jsonify(rule)
-    
+
     return jsonify({'error': 'Rule not found'}), 404
 
 @bp.route('/api/affinity-rules/<rule_id>', methods=['DELETE'])
+@bp.route('/api/clusters/<cluster_id>/affinity-rules/<rule_id>', methods=['DELETE'])
 @require_auth(roles=[ROLE_ADMIN])
-def delete_affinity_rule(rule_id):
+def delete_affinity_rule(rule_id, cluster_id=None):
     """Delete an affinity rule"""
     config = load_affinity_rules()
     config['rules'] = [r for r in config['rules'] if r['id'] != rule_id]
     save_affinity_rules(config)
-    
+
     user = request.session.get('user', 'unknown')
     log_audit(user, 'affinity_rule.deleted', f"Deleted affinity rule: {rule_id}")
-    
+
     return jsonify({'success': True})
 
 @bp.route('/api/clusters/<cluster_id>/vms/<int:vmid>/check-affinity/<target_node>', methods=['GET'])

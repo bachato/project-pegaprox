@@ -199,6 +199,9 @@ def _run_v2p_migration(task):
         esxi_host = task.esxi_host or vmware_mgr.host
         esxi_user = task.esxi_user or 'root'
         esxi_pass = task.esxi_password
+        # NS Feb 2026 - quote user/host for shell injection prevention
+        esxi_user = shlex.quote(esxi_user)
+        esxi_host = shlex.quote(esxi_host)
         
         if not esxi_pass:
             task.set_phase('failed', 'ESXi SSH password is required for SSHFS-based migration'); return
@@ -1573,7 +1576,7 @@ def _qemu_img_ssh_copy(pve_mgr, task, esxi_host, esxi_user, key_path,
             f"-o ServerAliveInterval=30 -o ServerAliveCountMax=5 "
             f"{ESXI_ALGO_OPTS}"
         )
-        SSH_PREFIX = f"sshpass -p {safe_pass} ssh"
+        SSH_PREFIX = f"SSHPASS={safe_pass} sshpass -e ssh"  # NS Feb 2026 - env var instead of -p (hides from /proc)
     ssh_fast = f"{ssh_base} -o Compression=no -c aes128-gcm@openssh.com"
     
     # nice/ionice: idle priority so VM I/O is never impacted
@@ -3577,7 +3580,7 @@ def _ssh_pipe_transfer(pve_mgr, task, esxi_host, esxi_user, esxi_pass, datastore
         dd_log2 = f"/tmp/v2p-{task.id}-sshdd-{disk_index}.log"
 
         ssh_cmd = (
-            f"sshpass -p {safe_p} ssh -o StrictHostKeyChecking=no "
+            f"SSHPASS={safe_p} sshpass -e ssh -o StrictHostKeyChecking=no "  # NS Feb 2026 - env var instead of -p
             f"-o UserKnownHostsFile=/dev/null -o ConnectTimeout=15 "
             f"-o HostKeyAlgorithms=+ssh-rsa,ssh-ed25519 "
             f"-o KexAlgorithms=+diffie-hellman-group14-sha1,diffie-hellman-group14-sha256 "

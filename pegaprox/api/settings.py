@@ -2405,27 +2405,27 @@ def get_cors_origins():
 @require_auth(roles=[ROLE_ADMIN])
 def add_cors_origin():
     """Manually add a CORS origin (admin only)
-    
+
     Note: This is temporary (until server restart). For permanent origins,
     use the PEGAPROX_ALLOWED_ORIGINS environment variable.
     """
     data = request.json or {}
     origin = data.get('origin', '').strip()
-    
+
     if not origin:
         return jsonify({'error': 'Origin required'}), 400
-    
+
     if not origin.startswith(('http://', 'https://')):
         return jsonify({'error': 'Origin must start with http:// or https://'}), 400
-    
+
     if origin == '*':
         return jsonify({'error': 'Wildcard (*) not allowed for security reasons'}), 400
-    
+
     add_allowed_origin(origin)
-    
+
     usr = getattr(request, 'session', {}).get('user', 'system')
     log_audit(usr, 'security.cors_origin_added', f"Added CORS origin: {origin}")
-    
+
     return jsonify({
         'success': True,
         'message': f'Origin {origin} added',

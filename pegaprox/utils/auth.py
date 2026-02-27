@@ -302,7 +302,8 @@ def create_default_users() -> dict:
             'display_name': 'PegaProx Admin',
             'email': '',
             'enabled': True,
-            'is_default': True  # Flag to identify default admin
+            'is_default': True,  # Flag to identify default admin
+            'force_password_change': True  # MK Feb 2026 - force change on first login
         }
     }
 
