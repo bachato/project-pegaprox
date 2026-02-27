@@ -1,13 +1,7 @@
 #!/bin/bash
 # ============================================================================
-# PegaProx Deploy Script - All-in-One Installation v2.0
-# Downloads, installs, and starts PegaProx on any Linux system
-# 
-# Usage: curl -sSL https://raw.githubusercontent.com/.../deploy.sh | sudo bash
-#    or: sudo ./deploy.sh
-#    or: sudo ./deploy.sh --port=443 --no-interactive
-#
-# Tested on: Debian 12/13, Ubuntu 22.04/24.04 LTS
+# PegaProx Deployment Script
+# Tested on: Debian 13, Ubuntu 22.04/24.04 LTS
 # ============================================================================
 
 set -e
@@ -17,288 +11,182 @@ RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
-CYAN='\033[0;36m'
-BOLD='\033[1m'
 NC='\033[0m'
+
+echo -e "${BLUE}"
+echo "╔══════════════════════════════════════════════════════════════╗"
+echo "║              PegaProx Deployment Script                      ║"
+echo "║                    Version 1.0                               ║"
+echo "╚══════════════════════════════════════════════════════════════╝"
+echo -e "${NC}"
+
+# Check if running as root
+if [ "$EUID" -ne 0 ]; then
+    echo -e "${RED}Please run as root (sudo ./deploy.sh)${NC}"
+    exit 1
+fi
 
 # Configuration
 INSTALL_DIR="/opt/PegaProx"
 SERVICE_USER="pegaprox"
 SERVICE_GROUP="pegaprox"
-GITHUB_REPO="https://github.com/PegaProx/project-pegaprox.git"
+PEGAPROX_PORT=5000
+PEGAPROX_HOST="::"  # Issue #71: dual-stack IPv4+IPv6
 PYTHON_FILE="pegaprox_multi_cluster.py"
 
-# Default options
-ACCESS_PORT=5000
-INTERACTIVE=true
-DOWNLOAD_OFFLINE=true
-
-# ============================================================================
-# Parse Arguments
-# ============================================================================
+# Parse arguments
+SKIP_USER=false
+SKIP_SERVICE=false
 for arg in "$@"; do
     case $arg in
-        --port=*)
-            ACCESS_PORT="${arg#*=}"
-            ;;
-        --no-interactive)
-            INTERACTIVE=false
-            ;;
-        --no-offline)
-            DOWNLOAD_OFFLINE=false
-            ;;
+        --skip-user) SKIP_USER=true ;;
+        --skip-service) SKIP_SERVICE=true ;;
+        --port=*) PEGAPROX_PORT="${arg#*=}" ;;
+        --host=*) PEGAPROX_HOST="${arg#*=}" ;;
         --help|-h)
-            echo "PegaProx Deploy Script"
-            echo ""
-            echo "Usage: sudo ./deploy.sh [options]"
+            echo "Usage: ./deploy.sh [options]"
             echo ""
             echo "Options:"
-            echo "  --port=PORT       Set web port (default: 5000, use 443 for HTTPS)"
-            echo "  --no-interactive  Skip interactive prompts"
-            echo "  --no-offline      Skip offline assets download"
-            echo "  --help            Show this help"
-            echo ""
-            echo "Examples:"
-            echo "  sudo ./deploy.sh                     # Interactive install"
-            echo "  sudo ./deploy.sh --port=443          # Use port 443"
-            echo "  sudo ./deploy.sh --no-interactive    # Non-interactive with defaults"
+            echo "  --skip-user      Don't create pegaprox user"
+            echo "  --skip-service   Don't create systemd service"
+            echo "  --port=PORT      Set default port (default: 5000)"
+            echo "  --host=HOST      Set bind address (default: :: for dual-stack IPv4+IPv6)"
+            echo "                   Use 0.0.0.0 for IPv4-only systems"
+            echo "  --help, -h       Show this help"
             exit 0
             ;;
     esac
 done
 
 # ============================================================================
-# Helper Functions
+# Step 1: System Update & Dependencies
 # ============================================================================
-print_banner() {
-    echo -e "${BLUE}"
-    echo "╔═══════════════════════════════════════════════════════════════════════════╗"
-    echo "║                                                                           ║"
-    echo "║   ██████╗ ███████╗ ██████╗  █████╗ ██████╗ ██████╗  ██████╗ ██╗  ██╗     ║"
-    echo "║   ██╔══██╗██╔════╝██╔════╝ ██╔══██╗██╔══██╗██╔══██╗██╔═══██╗╚██╗██╔╝     ║"
-    echo "║   ██████╔╝█████╗  ██║  ███╗███████║██████╔╝██████╔╝██║   ██║ ╚███╔╝      ║"
-    echo "║   ██╔═══╝ ██╔══╝  ██║   ██║██╔══██║██╔═══╝ ██╔══██╗██║   ██║ ██╔██╗      ║"
-    echo "║   ██║     ███████╗╚██████╔╝██║  ██║██║     ██║  ██║╚██████╔╝██╔╝ ██╗     ║"
-    echo "║   ╚═╝     ╚══════╝ ╚═════╝ ╚═╝  ╚═╝╚═╝     ╚═╝  ╚═╝ ╚═════╝ ╚═╝  ╚═╝     ║"
-    echo "║                                                                           ║"
-    echo "║                    All-in-One Deploy Script v2.0                          ║"
-    echo "╚═══════════════════════════════════════════════════════════════════════════╝"
-    echo -e "${NC}"
-}
+echo -e "\n${YELLOW}[1/6] Installing system dependencies...${NC}"
 
-print_step() {
-    echo -e "\n${BLUE}═══════════════════════════════════════════════════════════════════════════${NC}"
-    echo -e "${BOLD}$1${NC}"
-    echo -e "${BLUE}═══════════════════════════════════════════════════════════════════════════${NC}\n"
-}
+apt-get update -qq
+apt-get install -y -qq \
+    python3 \
+    python3-pip \
+    python3-venv \
+    curl \
+    wget \
+    git \
+    openssl \
+    sshpass \
+    > /dev/null
 
-print_success() { echo -e "${GREEN}✓${NC} $1"; }
-print_info() { echo -e "${CYAN}ℹ${NC} $1"; }
-print_warning() { echo -e "${YELLOW}⚠${NC} $1"; }
-print_error() { echo -e "${RED}✗${NC} $1"; }
+echo -e "${GREEN}✓ System dependencies installed${NC}"
 
 # ============================================================================
-# Main Installation
+# Step 2: Create User
 # ============================================================================
-main() {
-    print_banner
-
-    # Check root
-    if [ "$EUID" -ne 0 ]; then
-        print_error "Please run as root: sudo $0"
-        exit 1
-    fi
-
-    # Check internet
-    if ! ping -c 1 github.com &>/dev/null; then
-        print_error "No internet connection. Cannot download PegaProx."
-        exit 1
-    fi
-
-    # =========================================================================
-    # Step 1: System Dependencies
-    # =========================================================================
-    print_step "Step 1/6: Installing System Dependencies"
-
-    export DEBIAN_FRONTEND=noninteractive
-    apt-get update -qq
-
-    print_info "Installing packages..."
-    apt-get install -y -qq python3 python3-pip python3-venv curl wget git openssl \
-        sshpass ca-certificates sudo sqlite3 > /dev/null 2>&1
-
-    print_success "System dependencies installed"
-
-    # =========================================================================
-    # Step 2: Create User & Directories
-    # =========================================================================
-    print_step "Step 2/6: Creating User & Directories"
-
-    # Service user (system user - no login)
+if [ "$SKIP_USER" = false ]; then
+    echo -e "\n${YELLOW}[2/6] Creating service user...${NC}"
+    
     if id "$SERVICE_USER" &>/dev/null; then
-        print_info "Service user '$SERVICE_USER' already exists"
+        echo -e "${GREEN}✓ User '$SERVICE_USER' already exists${NC}"
     else
         useradd --system --no-create-home --shell /bin/false "$SERVICE_USER"
-        print_success "Service user '$SERVICE_USER' created"
+        echo -e "${GREEN}✓ User '$SERVICE_USER' created${NC}"
     fi
+else
+    echo -e "\n${YELLOW}[2/6] Skipping user creation${NC}"
+fi
 
-    mkdir -p "$INSTALL_DIR"/{config,logs,ssl,static,web,images}
-    print_success "Directory structure created"
+# ============================================================================
+# Step 3: Create Installation Directory
+# ============================================================================
+echo -e "\n${YELLOW}[3/6] Setting up installation directory...${NC}"
 
-    # =========================================================================
-    # Step 3: Download PegaProx from GitHub
-    # =========================================================================
-    print_step "Step 3/6: Downloading PegaProx from GitHub"
+mkdir -p "$INSTALL_DIR"
+mkdir -p "$INSTALL_DIR/config"
+mkdir -p "$INSTALL_DIR/logs"
+mkdir -p "$INSTALL_DIR/ssl"
+mkdir -p "$INSTALL_DIR/static"
+mkdir -p "$INSTALL_DIR/web"
+mkdir -p "$INSTALL_DIR/images"
+mkdir -p "$INSTALL_DIR/pegaprox"
+mkdir -p "$INSTALL_DIR/backups"
 
-    TEMP_DIR=$(mktemp -d)
-    print_info "Cloning repository..."
+echo -e "${GREEN}✓ Directory structure created at $INSTALL_DIR${NC}"
 
-    if git clone --depth 1 --quiet "$GITHUB_REPO" "$TEMP_DIR/pegaprox" 2>/dev/null; then
-        print_success "Repository cloned"
+# ============================================================================
+# Step 4: Install Python Dependencies
+# ============================================================================
+echo -e "\n${YELLOW}[4/6] Installing Python dependencies...${NC}"
 
-        # Copy ALL files from repo
-        cp -r "$TEMP_DIR/pegaprox/"* "$INSTALL_DIR/" 2>/dev/null || true
-        
-        # Move index.html to web folder if exists in root
-        [ -f "$INSTALL_DIR/index.html" ] && mv "$INSTALL_DIR/index.html" "$INSTALL_DIR/web/" 2>/dev/null || true
+pip3 install --break-system-packages -q \
+    flask>=2.3.0 \
+    flask-cors>=4.0.0 \
+    flask-sock>=0.6.0 \
+    requests>=2.28.0 \
+    urllib3>=1.26.0 \
+    cryptography>=41.0.0 \
+    pyopenssl>=23.0.0 \
+    argon2-cffi>=23.0.0 \
+    paramiko>=3.0.0 \
+    websockets>=11.0 \
+    websocket-client>=1.6.0 \
+    gevent>=23.0.0 \
+    gevent-websocket>=0.10.0 \
+    pyotp>=2.9.0 \
+    "qrcode[pil]>=7.4.0"
 
-        # Remove git folder
-        rm -rf "$INSTALL_DIR/.git" 2>/dev/null || true
+echo -e "${GREEN}✓ Python dependencies installed${NC}"
 
-        print_success "All files copied to $INSTALL_DIR"
-    else
-        print_error "Failed to clone repository"
-        rm -rf "$TEMP_DIR"
-        exit 1
-    fi
+# ============================================================================
+# Step 5: Copy Files (placeholder - user copies manually)
+# ============================================================================
+echo -e "\n${YELLOW}[5/6] Preparing for file deployment...${NC}"
 
-    rm -rf "$TEMP_DIR"
+cat > "$INSTALL_DIR/README.txt" << EOF
+PegaProx Installation Directory
+================================
 
-    # =========================================================================
-    # Step 4: Python Virtual Environment & Dependencies
-    # =========================================================================
-    print_step "Step 4/6: Setting up Python Environment"
+Copy your files here:
+  - $PYTHON_FILE   (Entry point)
+  - pegaprox/              (Backend package)
+  - web/index.html         (Frontend)
 
-    print_info "Creating virtual environment..."
-    python3 -m venv "$INSTALL_DIR/venv"
+Start manually:
+  cd $INSTALL_DIR
+  python3 $PYTHON_FILE
 
-    print_info "Installing Python packages..."
-    "$INSTALL_DIR/venv/bin/pip" install --upgrade pip -q 2>/dev/null
+Or use the systemd service:
+  systemctl start pegaprox
+  systemctl enable pegaprox  # Auto-start on boot
+EOF
 
-    # Use requirements.txt from repo if exists
-    if [ -f "$INSTALL_DIR/requirements.txt" ]; then
-        print_info "Installing from requirements.txt..."
-        "$INSTALL_DIR/venv/bin/pip" install -q -r "$INSTALL_DIR/requirements.txt" 2>/dev/null
-    else
-        # Fallback to hardcoded list
-        print_info "No requirements.txt found, using defaults..."
-        "$INSTALL_DIR/venv/bin/pip" install -q \
-            flask flask-cors flask-sock flask-compress \
-            requests urllib3 cryptography pyopenssl \
-            argon2-cffi paramiko websockets websocket-client \
-            gevent gevent-websocket pyotp "qrcode[pil]" 2>/dev/null
-    fi
+echo -e "${GREEN}✓ Directory prepared - copy $PYTHON_FILE and web/index.html here${NC}"
 
-    print_success "Python environment ready"
-
-    # =========================================================================
-    # Step 5: Download Offline Assets (Optional)
-    # =========================================================================
-    if [ "$DOWNLOAD_OFFLINE" = true ]; then
-        print_step "Step 5/6: Downloading Offline Assets"
-
-        cd "$INSTALL_DIR"
-        print_info "Downloading static files for offline mode..."
-
-        if "$INSTALL_DIR/venv/bin/python" "$PYTHON_FILE" --download-static 2>&1 | while read line; do echo -n "."; done; then
-            echo ""
-            print_success "Offline assets downloaded"
-        else
-            echo ""
-            print_warning "Some assets may have failed (non-critical)"
-        fi
-    else
-        print_step "Step 5/6: Skipping Offline Assets"
-        print_info "Use --download-static later if needed"
-    fi
-
-    # =========================================================================
-    # Step 6: Configure & Start Service
-    # =========================================================================
-    print_step "Step 6/6: Configuring Service"
-
-    # Interactive port selection
-    # Check stdin is a terminal (not piped), so curl | bash installs don't hang
-    if [ "$INTERACTIVE" = true ] && [ -t 0 ]; then
-        echo -e "${YELLOW}Select access port:${NC}"
-        echo "  1) Default (5000) - Standard ports"
-        echo "  2) HTTPS (443)    - Professional setup"
-        echo "  3) Custom         - Enter your own"
-        echo ""
-
-        while true; do
-            read -p "Choice [1-3, default=1]: " PORT_CHOICE
-            case "${PORT_CHOICE:-1}" in
-                1)
-                    ACCESS_PORT=5000
-                    break
-                    ;;
-                2)
-                    ACCESS_PORT=443
-                    break
-                    ;;
-                3)
-                    read -p "Enter port (1-65535): " CUSTOM_PORT
-                    # Strip leading zeros so bash arithmetic doesn't treat value as octal
-                    CUSTOM_PORT="${CUSTOM_PORT##+(0)}"
-                    CUSTOM_PORT="${CUSTOM_PORT:-0}"
-                    if [[ "$CUSTOM_PORT" =~ ^[0-9]+$ ]] && [ "$CUSTOM_PORT" -ge 1 ] && [ "$CUSTOM_PORT" -le 65535 ]; then
-                        ACCESS_PORT=$CUSTOM_PORT
-                        if [ "$ACCESS_PORT" -lt 1024 ]; then
-                            echo -e "${YELLOW}  ⚠ Port $ACCESS_PORT is privileged (<1024).${NC}"
-                            echo -e "${YELLOW}    The service will use CAP_NET_BIND_SERVICE to bind it.${NC}"
-                            echo -e "${YELLOW}    Ensure the host grants this capability or run as root.${NC}"
-                        fi
-                        break
-                    else
-                        echo -e "${RED}Invalid port. Please enter a number between 1 and 65535.${NC}"
-                    fi
-                    ;;
-                *)
-                    echo "Please enter 1, 2, or 3"
-                    ;;
-            esac
-        done
-    fi
-
-    echo -e "${GREEN}✓ Using ports: $ACCESS_PORT (Web), $((ACCESS_PORT+1)) (VNC), $((ACCESS_PORT+2)) (SSH)${NC}"
-    [ "$ACCESS_PORT" -lt 1024 ] && echo -e "${CYAN}  (privileged ports via CAP_NET_BIND_SERVICE)${NC}"
-
-    # Create systemd service
+# ============================================================================
+# Step 6: Create Systemd Service
+# ============================================================================
+if [ "$SKIP_SERVICE" = false ]; then
+    echo -e "\n${YELLOW}[6/6] Creating systemd service...${NC}"
+    
     cat > /etc/systemd/system/pegaprox.service << EOF
 [Unit]
 Description=PegaProx - Proxmox Cluster Management
 After=network.target
-Wants=network-online.target
 
 [Service]
 Type=simple
 User=$SERVICE_USER
 Group=$SERVICE_GROUP
 WorkingDirectory=$INSTALL_DIR
-
-# Custom PATH for wrappers
-Environment=PATH=$INSTALL_DIR/bin:/usr/local/bin:/usr/bin:/bin
-
-ExecStart=$INSTALL_DIR/venv/bin/python $INSTALL_DIR/$PYTHON_FILE
+ExecStart=/usr/bin/python3 $INSTALL_DIR/$PYTHON_FILE
 Restart=always
 RestartSec=5
+Environment=PEGAPROX_PORT=$PEGAPROX_PORT
+Environment=PEGAPROX_HOST=$PEGAPROX_HOST
 
-# Allow binding to privileged ports (443, 80)
-AmbientCapabilities=CAP_NET_BIND_SERVICE
-
-# Minimal security
+# Security hardening
+NoNewPrivileges=true
 PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=$INSTALL_DIR
 
 # Logging
 StandardOutput=journal
@@ -309,122 +197,66 @@ SyslogIdentifier=pegaprox
 WantedBy=multi-user.target
 EOF
 
-    # Create wrapper scripts for auto-update
-    mkdir -p "$INSTALL_DIR/bin"
-
-    # systemctl wrapper
-    cat > "$INSTALL_DIR/bin/systemctl" << 'WRAPPEREOF'
-#!/bin/bash
-# Intelligent systemctl wrapper for PegaProx auto-update
-if [ "$1" = "sudo" ]; then
-    shift
-fi
-case "$*" in
-    *pegaprox*)
-        exec /usr/bin/sudo /usr/bin/systemctl "$@"
-        ;;
-    *)
-        exec /usr/bin/systemctl "$@"
-        ;;
-esac
-WRAPPEREOF
-    chmod 755 "$INSTALL_DIR/bin/systemctl"
-
-    # sudo wrapper
-    cat > "$INSTALL_DIR/bin/sudo" << 'SUDOWRAPPER'
-#!/bin/bash
-# Sudo wrapper - prevents double sudo
-if [ "$1" = "sudo" ]; then
-    shift
-fi
-exec /usr/bin/sudo "$@"
-SUDOWRAPPER
-    chmod 755 "$INSTALL_DIR/bin/sudo"
-
-    # Create sudoers rules
-    cat > /etc/sudoers.d/pegaprox << EOF
-# PegaProx service management (for auto-update)
-$SERVICE_USER ALL=(ALL) NOPASSWD: /usr/bin/systemctl restart pegaprox
-$SERVICE_USER ALL=(ALL) NOPASSWD: /usr/bin/systemctl restart pegaprox.service
-$SERVICE_USER ALL=(ALL) NOPASSWD: /usr/bin/systemctl stop pegaprox
-$SERVICE_USER ALL=(ALL) NOPASSWD: /usr/bin/systemctl stop pegaprox.service
-$SERVICE_USER ALL=(ALL) NOPASSWD: /usr/bin/systemctl start pegaprox
-$SERVICE_USER ALL=(ALL) NOPASSWD: /usr/bin/systemctl start pegaprox.service
-$SERVICE_USER ALL=(ALL) NOPASSWD: /usr/bin/systemctl status pegaprox
-$SERVICE_USER ALL=(ALL) NOPASSWD: /usr/bin/systemctl status pegaprox.service
-$SERVICE_USER ALL=(ALL) NOPASSWD: /usr/bin/systemctl is-active pegaprox
-$SERVICE_USER ALL=(ALL) NOPASSWD: /usr/bin/systemctl is-active pegaprox.service
-EOF
-    chmod 440 /etc/sudoers.d/pegaprox
-
-    # Set ownership
-    chown -R "$SERVICE_USER:$SERVICE_GROUP" "$INSTALL_DIR"
-
-    # Enable and start service
+    # Set permissions
+    if [ "$SKIP_USER" = false ]; then
+        chown -R "$SERVICE_USER:$SERVICE_GROUP" "$INSTALL_DIR"
+        # PR #61 (ry-ops): Harden permissions on sensitive directories
+        # config/ holds encrypted DB, ssl/ holds private keys
+        [ -d "$INSTALL_DIR/config" ] && chmod 700 "$INSTALL_DIR/config"
+        [ -d "$INSTALL_DIR/config/ssl" ] && chmod 700 "$INSTALL_DIR/config/ssl"
+        [ -d "$INSTALL_DIR/ssl" ] && chmod 700 "$INSTALL_DIR/ssl"
+    fi
+    
     systemctl daemon-reload
-    systemctl enable pegaprox
-    systemctl start pegaprox
-
-    print_success "Systemd service created and started"
-
-    # Wait for database initialization
-    echo "Waiting for database initialization..."
-    sleep 8
-
-    # Set port in database if not default
-    if [ "$ACCESS_PORT" != 5000 ]; then
-        print_info "Configuring port $ACCESS_PORT..."
-        PEGAPROX_DB="$INSTALL_DIR/config/pegaprox.db"
-
-        if [ -f "$PEGAPROX_DB" ]; then
-            sqlite3 "$PEGAPROX_DB" "INSERT OR REPLACE INTO server_settings (key, value) VALUES ('port', '$ACCESS_PORT');" 2>/dev/null && {
-                echo "Restarting with new port..."
-                systemctl restart pegaprox
-                sleep 5
-                print_success "Port set to $ACCESS_PORT"
-            } || print_warning "Set port manually in Settings > Server"
-        fi
+    
+    echo -e "${GREEN}✓ Systemd service created${NC}"
+else
+    echo -e "\n${YELLOW}[6/6] Skipping service creation${NC}"
+    
+    if [ "$SKIP_USER" = false ]; then
+        chown -R "$SERVICE_USER:$SERVICE_GROUP" "$INSTALL_DIR"
+        # PR #61 (ry-ops): Harden permissions on sensitive directories
+        [ -d "$INSTALL_DIR/config" ] && chmod 700 "$INSTALL_DIR/config"
+        [ -d "$INSTALL_DIR/config/ssl" ] && chmod 700 "$INSTALL_DIR/config/ssl"
+        [ -d "$INSTALL_DIR/ssl" ] && chmod 700 "$INSTALL_DIR/ssl"
     fi
+fi
 
-    # Check if running
-    if systemctl is-active --quiet pegaprox; then
-        print_success "PegaProx is running!"
-    else
-        print_error "PegaProx failed to start - check: journalctl -u pegaprox"
-    fi
+# ============================================================================
+# Done!
+# ============================================================================
+echo -e "\n${BLUE}╔══════════════════════════════════════════════════════════════╗${NC}"
+echo -e "${BLUE}║${NC}              ${GREEN}Installation Complete!${NC}                         ${BLUE}║${NC}"
+echo -e "${BLUE}╚══════════════════════════════════════════════════════════════╝${NC}"
 
-    # =========================================================================
-    # Done!
-    # =========================================================================
-    echo ""
-    echo -e "${GREEN}╔════════════════════════════════════════════════════════════════════════════╗${NC}"
-    echo -e "${GREEN}║                    Installation Complete! 🎉                               ║${NC}"
-    echo -e "${GREEN}╚════════════════════════════════════════════════════════════════════════════╝${NC}"
-    echo ""
-
-    # Get current IP
-    CURRENT_IP=$(hostname -I 2>/dev/null | awk '{print $1}')
-    [ -z "$CURRENT_IP" ] && CURRENT_IP="<your-ip>"
-
-    if [ "$ACCESS_PORT" = 443 ]; then
-        echo -e "  Web Interface: ${CYAN}${BOLD}https://${CURRENT_IP}${NC}"
-        echo -e "  VNC WebSocket: ${CYAN}https://${CURRENT_IP}:444${NC}"
-        echo -e "  SSH WebSocket: ${CYAN}https://${CURRENT_IP}:445${NC}"
-    else
-        echo -e "  Web Interface: ${CYAN}${BOLD}https://${CURRENT_IP}:${ACCESS_PORT}${NC}"
-        echo -e "  VNC WebSocket: ${CYAN}https://${CURRENT_IP}:$((ACCESS_PORT+1))${NC}"
-        echo -e "  SSH WebSocket: ${CYAN}https://${CURRENT_IP}:$((ACCESS_PORT+2))${NC}"
-    fi
-
-    echo ""
-    echo -e "${YELLOW}💡 Tip: Check for updates in PegaProx Web UI${NC}"
-    echo -e "   Settings → Updates → Check for Updates"
-    echo ""
-    echo -e "Commands:"
-    echo -e "  ${CYAN}systemctl status pegaprox${NC}    - Check status"
-    echo -e "  ${CYAN}journalctl -u pegaprox -f${NC}    - View logs"
-    echo -e "  ${CYAN}systemctl restart pegaprox${NC}   - Restart service"
-    echo ""
-}
-
-main "$@"
+echo -e "\n${YELLOW}Next steps:${NC}"
+echo -e "  1. Copy your files to $INSTALL_DIR:"
+echo -e "     ${BLUE}cp $PYTHON_FILE $INSTALL_DIR/${NC}"
+echo -e "     ${BLUE}cp -r pegaprox/ $INSTALL_DIR/${NC}"
+echo -e "     ${BLUE}cp index.html $INSTALL_DIR/web/${NC}"
+echo ""
+echo -e "  2. (Optional) Download static files for offline mode:"
+echo -e "     ${BLUE}cd $INSTALL_DIR && python3 $PYTHON_FILE --download-static${NC}"
+echo ""
+echo -e "  3. Start PegaProx:"
+echo -e "     ${BLUE}systemctl start pegaprox${NC}"
+echo -e "     ${BLUE}systemctl enable pegaprox${NC}  # Auto-start on boot"
+echo ""
+echo -e "  4. Access the web interface:"
+IPV4_ADDR=$(hostname -I 2>/dev/null | awk '{print $1}')
+IPV6_ADDR=$(ip -6 addr show scope global 2>/dev/null | grep -oP '(?<=inet6\s)[0-9a-f:]+' | head -1)
+if [ -n "$IPV4_ADDR" ]; then
+    echo -e "     ${BLUE}https://${IPV4_ADDR}:$PEGAPROX_PORT${NC}  (IPv4)"
+fi
+if [ -n "$IPV6_ADDR" ]; then
+    echo -e "     ${BLUE}https://[${IPV6_ADDR}]:$PEGAPROX_PORT${NC}  (IPv6)"
+fi
+if [ -z "$IPV4_ADDR" ] && [ -z "$IPV6_ADDR" ]; then
+    echo -e "     ${BLUE}https://<your-ip>:$PEGAPROX_PORT${NC}"
+fi
+echo ""
+echo -e "${YELLOW}Useful commands:${NC}"
+echo -e "  Status:   ${BLUE}systemctl status pegaprox${NC}"
+echo -e "  Logs:     ${BLUE}journalctl -u pegaprox -f${NC}"
+echo -e "  Restart:  ${BLUE}systemctl restart pegaprox${NC}"
+echo ""

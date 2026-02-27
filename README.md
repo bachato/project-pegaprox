@@ -15,7 +15,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-0.6.6-blue" alt="Version"/>
+  <img src="https://img.shields.io/badge/version-0.9.0-blue" alt="Version"/>
   <img src="https://img.shields.io/badge/python-3.8+-green" alt="Python"/>
   <img src="https://img.shields.io/badge/license-AGPL--3.0--License-orange" alt="License"/>
 </p>
@@ -34,38 +34,51 @@ PegaProx is a powerful web-based management interface for Proxmox VE clusters. M
 
 ### Multi-Cluster Management
 - 🖥️ **Unified Dashboard** - Manage all your Proxmox clusters from one place
-- 📊 **Live Metrics** - Real-time CPU, RAM, and storage monitoring
+- 📊 **Live Metrics** - Real-time CPU, RAM, and storage monitoring via SSE
 - 🔄 **Live Migration** - Migrate VMs between nodes with one click
+- ⚖️ **Cross-Cluster Load Balancing** - Distribute workloads across clusters
 
 ### VM & Container Management
 - ▶️ **Quick Actions** - Start, stop, restart VMs and containers
 - ⚙️ **VM Configuration** - Edit CPU, RAM, disks, network, EFI, Secure Boot & more
-- 📸 **Snapshots** - Create and restore snapshots
+- 📸 **Snapshots** - Standard and space-efficient LVM snapshots for shared storage
 - 💾 **Backups** - Schedule and manage backups
-- 🖱️ **noVNC Console** - Direct browser-based console access
+- 🖱️ **noVNC / xterm.js Console** - Browser-based console for QEMU and LXC
 - ⚖️ **Load Balancing** - Automatic VM distribution across nodes
-- 🔁 **High Availability** - Auto-restart VMs on node failure
-- 📍 **Affinity Rules** - Keep VMs together or apart on hosts
+- 🔁 **High Availability** - Auto-restart VMs on node failure with configurable timing
+- 📍 **Affinity Rules** - Keep VMs together or apart on hosts (QEMU + LXC)
+
+### ESXi Migration
+- 🔀 **ESXi Import Wizard** - Migrate VMs from ESXi hosts to Proxmox
+- ⚡ **Near-Zero Downtime** - Transfer running VMs with minimal interruption (max. 1 VM recommended)
+- 🔌 **Offline Migration** - Shut down and transfer for maximum reliability
+- 🔑 **SSH Required** - ESXi host must have SSH enabled
 
 ### Security & Access Control
 - 👥 **Multi-User Support** - Role-based access control (Admin, Operator, Viewer)
-- 🛠️ **API Token Management** - Create, list, and revoke Bearer tokens for scripts, CI/CD & monitoring
-- 🔐 **LDAP & OIDC Support** - Connect your existing identity provider
-- 🔐 **2FA Authentication** - TOTP-based two-factor authentication
+- 🛠️ **API Token Management** - Create, list, and revoke Bearer tokens
+- 🔐 **2FA Authentication** - TOTP-based two-factor authentication (with force option)
+- 🏛️ **LDAP / OIDC** - Active Directory, OpenLDAP, Entra ID, Keycloak, Google Workspace
 - 🛡️ **VM-Level ACLs** - Fine-grained permissions per VM
 - 🏢 **Multi-Tenancy** - Isolate clusters for different customers
+- 🚫 **IP Whitelisting / Blacklisting** - Restrict access by IP or CIDR range
+- 🔒 **AES-256-GCM Encryption** - All stored credentials encrypted at rest
 
 ### Automation & Monitoring
 - ⏰ **Scheduled Tasks** - Automate VM actions (start, stop, snapshot, backup)
+- 🔄 **Rolling Node Updates** - Update cluster nodes one by one with automatic evacuation
 - 🚨 **Alerts** - Get notified on high CPU, memory, or disk usage
-- 📜 **Audit Logging** - Track all user actions
+- 📜 **Audit Logging** - Track all user actions with IP addresses
 - 🔧 **Custom Scripts** - Run scripts across nodes
+- 💿 **Ceph Management** - Monitor and manage Ceph storage pools
 
 ### Advanced Features
 - 🌐 **Offline Mode** - Works without internet (local assets)
 - 🎨 **Themes** - Dark mode, Proxmox theme, and more
-- 🌍 **Multi-Language** - English and German language support
+- 🏢 **Corporate Layout** - Tree-based sidebar with dense tables (experimental)
+- 🌍 **Multi-Language** - English and German
 - 📱 **Responsive** - Works on desktop and mobile
+- 📦 **PBS Integration** - Proxmox Backup Server management
 
 ## 📋 Requirements
 
@@ -78,88 +91,52 @@ PegaProx is a powerful web-based management interface for Proxmox VE clusters. M
 ### Option 1: Automated Installation
 
 ```bash
-# Download the deployment script
 curl -O https://raw.githubusercontent.com/PegaProx/project-pegaprox/refs/heads/main/deploy.sh
-
-# Give the deployment script permission
 chmod +x deploy.sh
-
-# Run the deployment script
 sudo ./deploy.sh
-
 ```
 
 ### Option 2: Manual Installation
 
 ```bash
-# Clone the repository
 git clone https://github.com/PegaProx/project-pegaprox.git
 cd project-pegaprox
-
-# Install dependencies
 pip install -r requirements.txt
-
-# Run PegaProx
 python3 pegaprox_multi_cluster.py
 ```
 
-### Option 3: Docker Image (Dev)
-This solution is only for development and testing and you should take special care about
-the sqlite db in the config path.
+### Option 3: Docker
+
 ```bash
-# Clone the repository
 git clone https://github.com/PegaProx/project-pegaprox.git
+cd project-pegaprox
 
-# Build Docker Image
+# Production
 docker build -t pegaprox .
+docker run -d --name pegaprox \
+  -p 5000:5000 \
+  -v pegaprox-config:/app/config \
+  -v pegaprox-logs:/app/logs \
+  --restart unless-stopped \
+  pegaprox
 
-# Run the image
-docker run -p 5000:5000 pegaprox
+# Development
+docker run -p 5000:5000 pegaprox --debug
 ```
 
-## Updating to v0.6.1
+## 🔄 Updating
 
 **Option 1: Update Script (Recommended)**
 ```bash
-#Go in the Folder
 cd /opt/PegaProx
-
-#Download it with this command. 
 curl -O https://raw.githubusercontent.com/PegaProx/project-pegaprox/refs/heads/main/update.sh
-
-#Permissions adjustment for the File so we can run it
 chmod +x update.sh
-
-#Please execute this then
-sudo ./update.sh 
-or
-./update.sh 
+sudo ./update.sh
 ```
 
-**Option 2: Manual**
-```bash
+**Option 2: Web UI**
 
-#Go in the Folder
-cd /opt/PegaProx
-
-curl -O https://raw.githubusercontent.com/PegaProx/project-pegaprox/main/pegaprox_multi_cluster.py
-curl -O web/index.html https://raw.githubusercontent.com/PegaProx/project-pegaprox/main/web/index.html
-curl -O https://raw.githubusercontent.com/PegaProx/project-pegaprox/main/requirements.txt
-
-# Install dependencies (choose one):
-pip3 install -r requirements.txt                # System Python
-./venv/bin/python -m pip install -r requirements.txt      # Virtual environment
-Can also work with: ./venv/bin/pip install -r requirements.txt 
-
-sudo systemctl restart pegaprox
-```
-
-### What's New in v0.6.1
-- Fixed Force Stop for LXC containers
-- Fixed Web Updater
-- Fixed pagination error in pre-compiled builds ([#4](https://github.com/PegaProx/project-pegaprox/issues/4))
-- Added `update.sh` for easy updates
-- Added `build.sh` for JSX pre-compilation (devs only)
+Go to Settings → Updates and click "Check for Updates".
 
 ## 🔧 Configuration
 
@@ -169,14 +146,12 @@ After starting PegaProx, open your browser and navigate to:
 https://your-server-ip:5000
 ```
 
-Please use the following default credentials for the first login:
+Default credentials:
 
 ```
 Username: pegaprox
 Password: admin
 ```
-
-Afterwards, please proceed with the following steps:
 
 1. **First Login**: Create your admin account on the setup page
 2. **Add Cluster**: Go to Settings → Clusters → Add your Proxmox credentials
@@ -186,29 +161,39 @@ Afterwards, please proceed with the following steps:
 
 ```
 /opt/PegaProx/
-├── pegaprox_multi_cluster.py   # Main application
+├── pegaprox_multi_cluster.py   # Entry point
+├── pegaprox/                   # Application package
+│   ├── app.py                  # Flask app factory
+│   ├── constants.py            # Configuration constants
+│   ├── globals.py              # Shared state
+│   ├── api/                    # REST API blueprints
+│   ├── core/                   # Business logic (manager, db, cache)
+│   ├── background/             # Background tasks (scheduler, alerts)
+│   ├── utils/                  # Utilities (auth, RBAC, LDAP, OIDC)
+│   └── models/                 # Data models
 ├── web/
-│   └── index.html              # Frontend
+│   ├── index.html              # Compiled frontend
+│   └── src/                    # Frontend source (JSX)
 ├── config/
-│   ├── pegaprox.db             # SQLite database (credentials encrypted)
-│   └── ssl/                    # SSL certificates
+│   └── pegaprox.db             # SQLite database (credentials encrypted)
+├── static/                     # JS/CSS libraries (offline mode)
 ├── logs/                       # Application logs
-└── static/                     # Offline assets (optional)
+└── update.sh                   # Update script
 ```
 
-## 🔒 Security Notes
+## 🔒 Security
 
 - Credentials (Cluster PW, SSH Keys, TOTP, LDAP Bind) → AES-256-GCM
 - API Tokens → SHA-256 Hash
-- Passwords are hashed with Argon2id
-- HTTPS is required for production use
+- Passwords → Argon2id
+- HTTPS required for production
 - Session tokens expire after inactivity
-- Rate limiting protects against brute force
+- Rate limiting on all endpoints
+- Input sanitization and RBAC enforcement
 
 ## 📖 Documentation
 
 Full documentation is available at **[docs.pegaprox.com](https://docs.pegaprox.com)**
-
 
 ## 📜 License
 
