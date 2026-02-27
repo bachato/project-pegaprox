@@ -568,16 +568,20 @@ def main(debug_mode=False):
     # Load server settings
     server_settings = load_server_settings()
     port = server_settings.get('port', 5000)
-    bind_host = os.environ.get('PEGAPROX_HOST', '0.0.0.0')
+    bind_host = os.environ.get('PEGAPROX_HOST')
 
-    # Issue #71 (FireAmpersand): IPv6 support via PEGAPROX_HOST=::
-    if ':' in bind_host and not _test_ipv6_available():
-        print(f"WARNING: IPv6 bind address '{bind_host}' requested but IPv6 not available on this system")
-        print("         Falling back to 0.0.0.0 (IPv4 only)")
-        bind_host = '0.0.0.0'
-
-    if ':' in bind_host:
-        print(f"Binding to {bind_host} (dual-stack IPv4+IPv6)")
+    if not bind_host:
+        if _test_ipv6_available():
+            bind_host = '::'
+            print("IPv6 available — binding dual-stack (::)")
+        else:
+            bind_host = '0.0.0.0'
+            print("IPv6 not available — binding IPv4 only (0.0.0.0)")
+    else:
+        if ':' in bind_host and not _test_ipv6_available():
+            print(f"WARNING: IPv6 bind address '{bind_host}' requested but IPv6 not available")
+            print("Falling back to 0.0.0.0")
+            bind_host = '0.0.0.0'
 
     ssl_enabled = server_settings.get('ssl_enabled', False)
     domain = server_settings.get('domain', '')
