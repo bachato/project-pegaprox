@@ -204,6 +204,10 @@ This project is licensed under the AGPL-3.0 License - see the [LICENSE](LICENSE)
 - 📧 Email: support@pegaprox.com
 - 🐛 Issues: [GitHub Issues](https://github.com/PegaProx/project-pegaprox/issues)
 
+## 🤖 Development Tools
+
+Like most modern dev teams, we use AI-assisted tooling (code completion, docs generation, review automation). All architecture decisions, implementation, and testing are handled by our three-person team.
+
 ## ⭐ Star History
 
 If you find PegaProx useful, please consider giving it a star! ⭐
