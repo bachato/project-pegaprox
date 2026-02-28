@@ -262,7 +262,7 @@ main() {
         echo ""
 
         while true; do
-            read -p "Choice [1-3, default=1]: " PORT_CHOICE
+            read -p "Choice [1-3, default=1]: " PORT_CHOICE < /dev/tty
             case "${PORT_CHOICE:-1}" in
                 1)
                     ACCESS_PORT=5000
@@ -273,7 +273,7 @@ main() {
                     break
                     ;;
                 3)
-                    read -p "Enter port (1-65535): " CUSTOM_PORT
+                    read -p "Enter port (1-65535): " CUSTOM_PORT < /dev/tty
                     if [[ "$CUSTOM_PORT" =~ ^[0-9]+$ ]] && [ "$CUSTOM_PORT" -ge 1 ] && [ "$CUSTOM_PORT" -le 65535 ]; then
                         ACCESS_PORT=$CUSTOM_PORT
                         break
