@@ -673,7 +673,8 @@ def upload_to_datastore(cluster_id, storage_name):
         
         # Upload to Proxmox
         upload_url = f"https://{host}:8006/api2/json/nodes/{node}/storage/{storage_name}/upload"
-        
+        file.stream.seek(0)  # MK: Mar 2026 - reset after Flask form parsing (#119)
+
         files = {
             'filename': (filename, file.stream, 'application/octet-stream')
         }

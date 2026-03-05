@@ -480,9 +480,11 @@
                 const formData = new FormData();
                 formData.append('file', uploadFile);
                 // MK: Mar 2026 - detect disk images vs ISOs for correct PVE content type (#115)
+                // LW: Mar 2026 - added vztmpl for container templates (#119)
                 const fname = uploadFile.name.toLowerCase();
                 const isDiskImage = fname.endsWith('.vmdk') || fname.endsWith('.qcow2') || fname.endsWith('.img') || fname.endsWith('.raw');
-                formData.append('content', isDiskImage ? 'import' : 'iso');
+                const isTemplate = fname.endsWith('.tar.gz') || fname.endsWith('.tar.xz') || fname.endsWith('.tar.zst');
+                formData.append('content', isDiskImage ? 'import' : isTemplate ? 'vztmpl' : 'iso');
                 if (selectedStorage.node) {
                     formData.append('node', selectedStorage.node);
                 }
@@ -1728,7 +1730,7 @@
                                         <label className="block text-sm text-gray-400 mb-2">{t('selectFile') || 'Select File'}</label>
                                         <input
                                             type="file"
-                                            accept=".iso,.img,.qcow2,.vmdk,.raw"
+                                            accept=".iso,.img,.qcow2,.vmdk,.raw,.tar.gz,.tar.xz,.tar.zst"
                                             onChange={(e) => setUploadFile(e.target.files[0])}
                                             disabled={uploading}
                                             className="w-full px-3 py-2 bg-proxmox-dark border border-proxmox-border rounded-lg text-white disabled:opacity-50"

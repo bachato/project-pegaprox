@@ -104,14 +104,11 @@ def create_app():
             return None
 
         # NS: Feb 2026 - per-route size limits: uploads get the big limit, everything else 10MB
+        # MK: Mar 2026 - removed global config mutation, was causing 413s on subsequent uploads (#119)
         is_upload = request.path.endswith('/upload')
-        if request.content_length:
-            max_size = _upload_max if is_upload else _default_max
-            if request.content_length > max_size:
-                return jsonify({'error': f'Request too large. Max {max_size // (1024*1024)} MB'}), 413
-        elif request.method in ('POST', 'PUT', 'PATCH') and not is_upload:
-            # NS: Feb 2026 - enforce default limit for requests without Content-Length (e.g. chunked transfer)
-            app.config['MAX_CONTENT_LENGTH'] = _default_max
+        max_size = _upload_max if is_upload else _default_max
+        if request.content_length and request.content_length > max_size:
+            return jsonify({'error': f'Request too large. Max {max_size // (1024*1024)} MB'}), 413
 
         if request.path.startswith('/api/'):
             skip_paths = ['/api/auth/login', '/api/auth/check', '/api/events', '/api/health', '/api/sse',
@@ -250,58 +247,78 @@ def download_static_files():
                 print(f"FAILED: {e}")
                 failed += 1
 
-    # Tailwind CSS subset for offline
-    print("\nCreating Tailwind CSS subset...")
-    tailwind_css = '''/* PegaProx Tailwind Offline CSS */
-*, ::before, ::after { box-sizing: border-box; border-width: 0; border-style: solid; }
-html { line-height: 1.5; font-family: ui-sans-serif, system-ui, -apple-system, sans-serif; }
-body { margin: 0; }
-.flex { display: flex; } .grid { display: grid; } .hidden { display: none; } .block { display: block; }
-.inline-flex { display: inline-flex; } .flex-col { flex-direction: column; } .flex-1 { flex: 1 1 0%; }
-.items-center { align-items: center; } .items-start { align-items: flex-start; }
-.justify-center { justify-content: center; } .justify-between { justify-content: space-between; }
-.gap-1 { gap: 0.25rem; } .gap-2 { gap: 0.5rem; } .gap-3 { gap: 0.75rem; } .gap-4 { gap: 1rem; } .gap-6 { gap: 1.5rem; }
-.p-1 { padding: 0.25rem; } .p-2 { padding: 0.5rem; } .p-3 { padding: 0.75rem; } .p-4 { padding: 1rem; } .p-5 { padding: 1.25rem; } .p-6 { padding: 1.5rem; }
-.px-2 { padding-left: 0.5rem; padding-right: 0.5rem; } .px-3 { padding-left: 0.75rem; padding-right: 0.75rem; } .px-4 { padding-left: 1rem; padding-right: 1rem; }
-.py-1 { padding-top: 0.25rem; padding-bottom: 0.25rem; } .py-2 { padding-top: 0.5rem; padding-bottom: 0.5rem; } .py-3 { padding-top: 0.75rem; padding-bottom: 0.75rem; }
-.m-0 { margin: 0; } .mx-auto { margin-left: auto; margin-right: auto; }
-.mt-1 { margin-top: 0.25rem; } .mt-2 { margin-top: 0.5rem; } .mt-4 { margin-top: 1rem; }
-.mb-1 { margin-bottom: 0.25rem; } .mb-2 { margin-bottom: 0.5rem; } .mb-4 { margin-bottom: 1rem; }
-.w-full { width: 100%; } .w-auto { width: auto; } .w-4 { width: 1rem; } .w-5 { width: 1.25rem; } .w-6 { width: 1.5rem; } .w-8 { width: 2rem; }
-.h-full { height: 100%; } .h-4 { height: 1rem; } .h-5 { height: 1.25rem; } .h-6 { height: 1.5rem; } .h-8 { height: 2rem; }
-.min-h-screen { min-height: 100vh; }
-.text-xs { font-size: 0.75rem; } .text-sm { font-size: 0.875rem; } .text-lg { font-size: 1.125rem; } .text-xl { font-size: 1.25rem; } .text-2xl { font-size: 1.5rem; }
-.font-medium { font-weight: 500; } .font-semibold { font-weight: 600; } .font-bold { font-weight: 700; }
-.font-mono { font-family: ui-monospace, monospace; }
-.text-center { text-align: center; } .text-right { text-align: right; }
-.uppercase { text-transform: uppercase; } .truncate { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.rounded { border-radius: 0.25rem; } .rounded-lg { border-radius: 0.5rem; } .rounded-xl { border-radius: 0.75rem; } .rounded-full { border-radius: 9999px; }
-.border { border-width: 1px; } .border-2 { border-width: 2px; } .border-t { border-top-width: 1px; } .border-b { border-bottom-width: 1px; }
-.opacity-50 { opacity: 0.5; } .opacity-75 { opacity: 0.75; }
-.shadow { box-shadow: 0 1px 3px 0 rgb(0 0 0 / 0.1); } .shadow-lg { box-shadow: 0 10px 15px -3px rgb(0 0 0 / 0.1); }
-.overflow-hidden { overflow: hidden; } .overflow-auto { overflow: auto; } .overflow-y-auto { overflow-y: auto; }
-.relative { position: relative; } .absolute { position: absolute; } .fixed { position: fixed; }
-.inset-0 { top: 0; right: 0; bottom: 0; left: 0; } .top-0 { top: 0; } .right-0 { right: 0; } .bottom-0 { bottom: 0; } .left-0 { left: 0; }
-.z-10 { z-index: 10; } .z-50 { z-index: 50; }
-.cursor-pointer { cursor: pointer; }
-.transition { transition-property: all; transition-duration: 150ms; } .transition-all { transition-property: all; transition-duration: 150ms; }
-.animate-spin { animation: spin 1s linear infinite; } .animate-pulse { animation: pulse 2s ease-in-out infinite; }
-@keyframes spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
-@keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.5; } }
-.grid-cols-1 { grid-template-columns: repeat(1, minmax(0, 1fr)); } .grid-cols-2 { grid-template-columns: repeat(2, minmax(0, 1fr)); } .grid-cols-3 { grid-template-columns: repeat(3, minmax(0, 1fr)); }
-.col-span-2 { grid-column: span 2 / span 2; } .col-span-3 { grid-column: span 3 / span 3; }
-.space-y-2 > :not([hidden]) ~ :not([hidden]) { margin-top: 0.5rem; } .space-y-4 > :not([hidden]) ~ :not([hidden]) { margin-top: 1rem; }
-.divide-y > :not([hidden]) ~ :not([hidden]) { border-top-width: 1px; }
-@media (min-width: 768px) { .md\\:grid-cols-2 { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
-@media (min-width: 1280px) { .xl\\:grid-cols-3 { grid-template-columns: repeat(3, minmax(0, 1fr)); } .xl\\:col-span-2 { grid-column: span 2 / span 2; } }
-'''
+    # MK: Mar 2026 - tailwind.min.css is now a full CLI build, don't overwrite it (#118)
+    if os.path.exists('static/css/tailwind.min.css'):
+        sz = os.path.getsize('static/css/tailwind.min.css')
+        print(f"\n  tailwind.min.css already exists ({sz:,} bytes), skipping")
+        print("  (rebuild with: npx tailwindcss -i input.css -o static/css/tailwind.min.css --minify)")
+    else:
+        print("\n  WARNING: static/css/tailwind.min.css missing!")
+        print("  Run: npx tailwindcss -i input.css -o static/css/tailwind.min.css --minify")
+        failed += 1
+
+    # LW: Mar 2026 - download Google Fonts for offline (#118)
+    print("\nDownloading Google Fonts for offline use...")
+    os.makedirs('static/fonts', exist_ok=True)
+
+    _gfonts = {
+        'plus-jakarta-sans': {
+            'family': 'Plus Jakarta Sans',
+            'weights': {
+                '400': 'https://fonts.gstatic.com/s/plusjakartasans/v8/LDIbaomQNQcsA88c7O9yZ4KMCoOg4IA6-91aHEjcWuA_KU7NShXUEKi4Rw.woff2',
+                '500': 'https://fonts.gstatic.com/s/plusjakartasans/v8/LDIbaomQNQcsA88c7O9yZ4KMCoOg4IA6-91aHEjcWuA_AU7NShXUEKi4Rw.woff2',
+                '600': 'https://fonts.gstatic.com/s/plusjakartasans/v8/LDIbaomQNQcsA88c7O9yZ4KMCoOg4IA6-91aHEjcWuA_zUnNShXUEKi4Rw.woff2',
+                '700': 'https://fonts.gstatic.com/s/plusjakartasans/v8/LDIbaomQNQcsA88c7O9yZ4KMCoOg4IA6-91aHEjcWuA_9EnNShXUEKi4Rw.woff2',
+                '800': 'https://fonts.gstatic.com/s/plusjakartasans/v8/LDIbaomQNQcsA88c7O9yZ4KMCoOg4IA6-91aHEjcWuA_KUnNShXUEKi4Rw.woff2',
+            }
+        },
+        'jetbrains-mono': {
+            'family': 'JetBrains Mono',
+            'weights': {
+                '400': 'https://fonts.gstatic.com/s/jetbrainsmono/v18/tDbY2o-flEEny0FZhsfKu5WU4zr3E_BX0PnT8RD8yKxjPVmUsaaDhw.woff2',
+                '500': 'https://fonts.gstatic.com/s/jetbrainsmono/v18/tDbY2o-flEEny0FZhsfKu5WU4zr3E_BX0PnT8RD8-axjPVmUsaaDhw.woff2',
+                '600': 'https://fonts.gstatic.com/s/jetbrainsmono/v18/tDbY2o-flEEny0FZhsfKu5WU4zr3E_BX0PnT8RD8FapjPVmUsaaDhw.woff2',
+                '700': 'https://fonts.gstatic.com/s/jetbrainsmono/v18/tDbY2o-flEEny0FZhsfKu5WU4zr3E_BX0PnT8RD8LapjPVmUsaaDhw.woff2',
+            }
+        }
+    }
+
+    font_css = "/* LW: Mar 2026 - local Google Fonts for offline mode (#118) */\n"
+    for font_id, font_info in _gfonts.items():
+        for weight, url in font_info['weights'].items():
+            fname = f"{font_id}-{weight}.woff2"
+            dest = f"static/fonts/{fname}"
+            print(f"  {fname}...", end=' ')
+            try:
+                req = urllib.request.Request(url, headers={
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+                })
+                with urllib.request.urlopen(req, timeout=30, context=ctx) as response:
+                    data = response.read()
+                with open(dest, 'wb') as f:
+                    f.write(data)
+                print(f"OK ({len(data):,} bytes)")
+                success += 1
+            except Exception as e:
+                print(f"FAILED: {e}")
+                failed += 1
+
+            font_css += f"""@font-face {{
+  font-family: '{font_info['family']}';
+  font-style: normal;
+  font-weight: {weight};
+  font-display: swap;
+  src: url('/static/fonts/{fname}') format('woff2');
+}}
+"""
+
     try:
-        with open('static/css/tailwind.min.css', 'w') as f:
-            f.write(tailwind_css)
-        print("  tailwind.min.css... OK")
+        with open('static/css/fonts.css', 'w') as f:
+            f.write(font_css)
+        print("  fonts.css... OK")
         success += 1
     except Exception as e:
-        print(f"  tailwind.min.css... FAILED: {e}")
+        print(f"  fonts.css... FAILED: {e}")
         failed += 1
 
     # Download noVNC for offline VNC console

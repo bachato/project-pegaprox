@@ -78,11 +78,17 @@
     <title>PegaProx • Cluster Management for Proxmox VE</title>
     <meta name="google" content="notranslate">
     
-    <!-- NS: Preconnect - DNS resolution starts early = faster loading -->
-    <link rel="preconnect" href="https://cdn.jsdelivr.net">
-    <link rel="preconnect" href="https://fonts.googleapis.com">
-    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-    <link rel="dns-prefetch" href="https://cdn.jsdelivr.net">
+    <!-- MK: Mar 2026 - conditional preconnect, skip DNS stalls on air-gapped setups (#118) -->
+    <script>
+        if (navigator.onLine) {
+            ['https://cdn.jsdelivr.net','https://fonts.googleapis.com','https://fonts.gstatic.com'].forEach(function(u) {
+                var l = document.createElement('link');
+                l.rel = 'preconnect'; l.href = u;
+                if (u.includes('gstatic')) l.crossOrigin = '';
+                document.head.appendChild(l);
+            });
+        }
+    </script>
     
     <!-- NS: Preload removed - was causing credential mode mismatch warnings -->
     <!-- Scripts are loaded via loadScriptWithFallback which handles this better -->
@@ -92,13 +98,13 @@
     <link rel="icon" type="image/png" sizes="16x16" href="/images/favicon-16x16.png">
     <link rel="apple-touch-icon" sizes="180x180" href="/images/apple-touch-icon.png">
     
-    <!-- 
-    OFFLINE MODE: For jumphosts without internet access:
-    1. Run: python3 pegaprox_server.py --download-static (on machine WITH internet)
-    2. Copy 'static' folder to jumphost
-    3. The UI will use local files automatically
-    
-    Downloads: React, Babel, xterm.js, noVNC, + generates Tailwind CSS subset
+    <!--
+    OFFLINE MODE: For jumphosts / Docker without internet:
+    1. Tailwind CSS is now a static build (no CDN needed)
+    2. Run: python3 pegaprox_server.py --download-static (downloads React, Babel, fonts, etc.)
+    3. Copy 'static' folder to target machine
+
+    MK: Mar 2026 - reworked for #118, Tailwind is always local now
     -->
     
     <!-- Smart Script Loader - CDN first, local fallback for offline -->
@@ -187,13 +193,8 @@
         });
     </script>
     
-    <!-- Tailwind CSS - CDN with offline fallback -->
-    <script src="https://cdn.tailwindcss.com" onerror="
-        var link = document.createElement('link');
-        link.rel = 'stylesheet';
-        link.href = '/static/css/tailwind.min.css';
-        document.head.appendChild(link);
-    "></script>
+    <!-- LW: Mar 2026 - switched to static Tailwind build (#118), CDN JIT broke offline -->
+    <link rel="stylesheet" href="/static/css/tailwind.min.css">
     
     <!-- noVNC - lazy loaded when needed -->
     <script>
@@ -221,11 +222,24 @@
         :root {
             --font-sans: 'Plus Jakarta Sans', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
             --font-mono: 'JetBrains Mono', 'SF Mono', 'Fira Code', 'Fira Mono', 'Roboto Mono', monospace;
+            /* MK: Mar 2026 - RGB channel defaults for Tailwind opacity modifiers (#118) */
+            --color-primary-rgb: 229, 112, 0;
+            --color-dark-rgb: 15, 20, 25;
+            --color-darker-rgb: 8, 11, 14;
+            --color-card-rgb: 22, 27, 34;
+            --color-border-rgb: 48, 54, 61;
+            --color-hover-rgb: 28, 33, 40;
+            --color-secondary-rgb: 35, 134, 54;
+            --color-success-rgb: 63, 185, 80;
+            --color-warning-rgb: 210, 153, 34;
+            --color-error-rgb: 248, 81, 73;
+            --color-info-rgb: 88, 166, 255;
         }
     </style>
-    <link rel="preconnect" href="https://fonts.googleapis.com">
-    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-    <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+    <!-- LW: Mar 2026 - non-blocking fonts, system fallback kicks in instantly offline (#118) -->
+    <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap"
+          media="print" onload="this.media='all'" onerror="this.remove()">
+    <noscript><link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap"></noscript>
     
     <script>
         // ============================================
@@ -619,13 +633,25 @@
             }
         };
         
+        // MK: Mar 2026 - hex to RGB channels for Tailwind opacity modifiers (#118)
+        function hexToRgb(hex) {
+            hex = hex.replace('#', '');
+            if (hex.length === 3) hex = hex[0]+hex[0]+hex[1]+hex[1]+hex[2]+hex[2];
+            var n = parseInt(hex, 16);
+            return ((n >> 16) & 255) + ', ' + ((n >> 8) & 255) + ', ' + (n & 255);
+        }
+
         // Apply theme by setting CSS variables
         function applyTheme(themeName) {
             const theme = PEGAPROX_THEMES[themeName] || PEGAPROX_THEMES.proxmoxDark;
             const root = document.documentElement;
-            
+
             Object.entries(theme.colors).forEach(([key, value]) => {
                 root.style.setProperty(`--color-${key}`, value);
+                // RGB channels for Tailwind opacity modifiers (bg-proxmox-orange/20 etc)
+                if (value && value.startsWith('#')) {
+                    root.style.setProperty(`--color-${key}-rgb`, hexToRgb(value));
+                }
             });
             
             // Special handling for light theme - only if body exists
@@ -652,6 +678,9 @@
             const theme = PEGAPROX_THEMES[saved] || PEGAPROX_THEMES.proxmoxDark;
             Object.entries(theme.colors).forEach(([key, value]) => {
                 document.documentElement.style.setProperty(`--color-${key}`, value);
+                if (value && value.startsWith('#')) {
+                    document.documentElement.style.setProperty(`--color-${key}-rgb`, hexToRgb(value));
+                }
             });
             // Apply body classes after DOM is ready
             if (document.readyState === 'loading') {
