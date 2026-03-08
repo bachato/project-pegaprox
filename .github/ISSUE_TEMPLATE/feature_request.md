@@ -11,8 +11,8 @@ assignees: ''
 > **A friendly reminder:** PegaProx is built by **volunteers in our spare time**. We can't promise timelines or guarantee every feature will be implemented — but every suggestion helps shape the roadmap!
 >
 > **Want to help move things faster?**
-> - 💖 [Become a Sponsor](https://github.com/sponsors/PegaProx) — sponsored features get prioritized
-> - ⭐ [Star the project](https://pegaprox.com/#sponsor) — helps with visibility
+> - 💖 [Become a Sponsor](https://pegaprox.com/#sponsor) — sponsored features get prioritized
+> - ⭐ [Star the project](https://github.com/PegaProx/project-pegaprox/) — helps with visibility
 > - 🤝 Even better: submit a PR with your idea!
 
 ---
