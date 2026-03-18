@@ -63,7 +63,12 @@ def oidc_authorize():
     # NS: Auto-detect redirect URI if not configured
     # never use Origin header - attacker can spoof it to steal OAuth tokens
     if not config.get('redirect_uri'):
-        config['redirect_uri'] = f"{request.host_url.rstrip('/')}/oidc/callback"
+        base_url = request.host_url.rstrip('/')
+        # MK: behind reverse proxy, trust forwarded headers for correct scheme/host
+        if request.headers.get('X-Forwarded-Proto') == 'https':
+            fwd_host = request.headers.get('X-Forwarded-Host') or request.headers.get('Host') or request.host
+            base_url = f"https://{fwd_host.split(',')[0].strip()}"
+        config['redirect_uri'] = f"{base_url}/oidc/callback"
         logging.info(f"[OIDC] Auto-detected redirect_uri: {config['redirect_uri']}")
     
     # MK: Generate state for CSRF protection
@@ -79,6 +84,13 @@ def oidc_authorize():
     # MK Feb 2026 - store nonce alongside state for ID token validation
     response.set_cookie('oidc_state', f"{state}:{nonce}", httponly=True, secure=is_secure, samesite='Lax', max_age=600)
     return response
+
+
+@bp.route('/api/auth/oidc/callback', methods=['GET'])
+def oidc_callback_redirect():
+    """NS: Safety net - if IdP sends GET to API callback URL, redirect to frontend SPA route"""
+    from flask import redirect as flask_redirect
+    return flask_redirect(f"/oidc/callback?{request.query_string.decode()}")
 
 
 @bp.route('/api/auth/oidc/callback', methods=['POST'])
@@ -107,7 +119,11 @@ def oidc_callback():
     
     # NS: Auto-detect redirect URI if not configured (must match what was sent in authorize!)
     if not config.get('redirect_uri'):
-        config['redirect_uri'] = f"{request.host_url.rstrip('/')}/oidc/callback"
+        base_url = request.host_url.rstrip('/')
+        if request.headers.get('X-Forwarded-Proto') == 'https':
+            fwd_host = request.headers.get('X-Forwarded-Host') or request.headers.get('Host') or request.host
+            base_url = f"https://{fwd_host.split(',')[0].strip()}"
+        config['redirect_uri'] = f"{base_url}/oidc/callback"
     
     data = request.get_json() or {}
     code = data.get('code', '')

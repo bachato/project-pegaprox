@@ -213,9 +213,8 @@ def oidc_exchange_code(config: dict, code: str) -> dict:
         'grant_type': 'authorization_code',
     }
     
-    # NS: Entra needs scope in token request too
-    if config.get('provider') == 'entra':
-        data['scope'] = config['scopes']
+    # NS: scope required by most providers (Authentik, Keycloak, Entra)
+    data['scope'] = config.get('scopes', 'openid profile email')
     
     try:
         resp = requests.post(endpoints['token'], data=data, timeout=15)
