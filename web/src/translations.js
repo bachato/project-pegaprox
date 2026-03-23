@@ -9110,7 +9110,7 @@
                 noIssues: "No se encontraron problemas",
                 noNetworkData: "No hay datos de red disponibles",
                 noScanResults: "Aún no hay resultados de escaneo",
-                noScanResultsDesc: "Haga clic",
+                noScanResultsDesc: "Haga clic en 'Escanear todos los nodos' para buscar paquetes vulnerables",
                 noSnapshotReplJobs: "No hay tareas de replicación de instantáneas",
                 noVmsOnBridge: "No hay VMs asignadas",
                 nodesClean: "Nodos limpios",
