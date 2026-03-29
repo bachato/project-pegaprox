@@ -49,6 +49,7 @@
         // Language Switcher Component
         function LanguageSwitcher() {
             const { language, changeLanguage } = useTranslation();
+            const { isCorporate } = useLayout();
             const langs = [
                 { code: 'de', flag: '🇦🇹', label: 'DE', title: 'Deutsch' },
                 { code: 'en', flag: '🇬🇧', label: 'EN', title: 'English' },
@@ -56,6 +57,31 @@
                 { code: 'es', flag: '🇪🇸', label: 'ES', title: 'Español (LATAM)' },
                 { code: 'pt', flag: '🇧🇷', label: 'PT', title: 'Português' },
             ];
+            const activeLanguage = langs.find(l => l.code === language) || langs[0];
+
+            if (isCorporate) {
+                return(
+                    <div
+                        className="flex items-center gap-2 border border-proxmox-border px-2 py-1.5"
+                        style={{ background: 'var(--corp-surface-1)' }}
+                    >
+                        <span className="text-base leading-none" aria-hidden="true">{activeLanguage.flag}</span>
+                        <select
+                            value={activeLanguage.code}
+                            onChange={(e) => changeLanguage(e.target.value)}
+                            className="bg-transparent text-xs text-gray-200 border-0 p-0 pr-6 focus:ring-0 focus:outline-none"
+                            aria-label="Select language"
+                            title={activeLanguage.title}
+                        >
+                            {langs.map(l => (
+                                <option key={l.code} value={l.code}>
+                                    {l.label} - {l.title}
+                                </option>
+                            ))}
+                        </select>
+                    </div>
+                );
+            }
 
             return(
                 <div className="flex items-center gap-1 bg-proxmox-dark rounded-lg p-1 border border-proxmox-border">
