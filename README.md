@@ -11,7 +11,8 @@
 <p align="center">
   <a href="https://pegaprox.com">Website</a> •
   <a href="https://docs.pegaprox.com">Documentation</a> •
-  <a href="https://github.com/PegaProx/project-pegaprox/releases">Releases</a>
+  <a href="https://github.com/PegaProx/project-pegaprox/releases">Releases</a> •
+  <a href="https://opencollective.com/pegaprox">Sponsoring</a>
 </p>
 
 <p align="center">
@@ -19,7 +20,6 @@
   <img src="https://img.shields.io/badge/python-3.8+-green" alt="Python"/>
   <img src="https://img.shields.io/badge/license-AGPL--3.0--License-orange" alt="License"/>
 </p>
-
 ---
 
 ## 🚀 What is PegaProx?
