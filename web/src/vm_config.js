@@ -140,6 +140,11 @@
             const [backupLoading, setBackupLoading] = useState(false);
             const [showCreateBackup, setShowCreateBackup] = useState(false);
             const [showRestoreBackup, setShowRestoreBackup] = useState(null);
+            const [verifyingBackup, setVerifyingBackup] = useState(null);
+            const [verifyResults, setVerifyResults] = useState({});
+            const verifyPollRef = useRef(null);
+            // cleanup verify poll on unmount
+            useEffect(() => () => { if (verifyPollRef.current) clearInterval(verifyPollRef.current); }, []);
             
             // MK: History states - Jan 2026
             const [vmProxmoxTasks, setVmProxmoxTasks] = useState([]);
@@ -886,6 +891,60 @@
                     addToast(t('connectionError'), 'error');
                 }
                 setBackupLoading(false);
+            };
+
+            // NS: Apr 2026 — Backup Verification
+            const handleVerifyBackup = async (backup) => {
+                if (!confirm(t('confirmVerify') || 'Verify this backup? A temporary VM will be created, booted, checked, and then deleted.')) return;
+                setVerifyingBackup(backup.volid);
+                try {
+                    const response = await authFetch(
+                        `${API_URL}/clusters/${clusterId}/backup-verify`,
+                        {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify({
+                                node: vm.node,
+                                vmid: vm.vmid,
+                                vm_type: vm.type || 'qemu',
+                                vm_name: vm.name || '',
+                                backup_volid: backup.volid,
+                                backup_time: backup.ctime ? new Date(backup.ctime * 1000).toISOString() : '',
+                                storage: storageList.find(s => (s.content || '').includes('images'))?.storage || 'local-lvm',
+                                check_agent: true,
+                                auto_cleanup: true,
+                            })
+                        }
+                    );
+                    if (response && response.ok) {
+                        const data = await response.json();
+                        addToast(t('verificationStarted') || 'Backup verification started', 'info');
+                        const taskId = data.task_id;
+                        if (verifyPollRef.current) clearInterval(verifyPollRef.current);
+                        const poll = setInterval(async () => {
+                            try {
+                                const sr = await authFetch(`${API_URL}/clusters/${clusterId}/backup-verify/${taskId}`);
+                                if (sr && sr.ok) {
+                                    const st = await sr.json();
+                                    setVerifyResults(prev => ({...prev, [backup.volid]: st}));
+                                    if (st.status !== 'running') {
+                                        clearInterval(poll);
+                                        verifyPollRef.current = null;
+                                        setVerifyingBackup(null);
+                                        addToast(st.status === 'passed'
+                                            ? (t('verificationPassed') || '✓ Backup verified — restore + boot OK')
+                                            : (t('verificationFailed') || '✗ Verification failed: ' + (st.error || st.status)), st.status === 'passed' ? 'success' : 'error');
+                                    }
+                                }
+                            } catch(e) { clearInterval(poll); verifyPollRef.current = null; setVerifyingBackup(null); }
+                        }, 3000);
+                        verifyPollRef.current = poll;
+                    } else if (response) {
+                        const err = await response.json();
+                        addToast(err.error || 'Verification failed', 'error');
+                        setVerifyingBackup(null);
+                    }
+                } catch(e) { addToast(t('connectionError'), 'error'); setVerifyingBackup(null); }
             };
 
             // Replication operations
@@ -2556,7 +2615,7 @@
                                             ) : vmBackups.length > 0 ? (
                                                 <div className="space-y-3">
                                                     {vmBackups.map(backup => (
-                                                        <div key={backup.volid} className="p-4 bg-proxmox-dark rounded-lg border border-proxmox-border">
+                                                        <div key={backup.volid} className={`p-4 bg-proxmox-dark rounded-lg border ${verifyResults[backup.volid]?.status === 'passed' ? 'border-green-500/30' : verifyResults[backup.volid]?.status === 'failed' || verifyResults[backup.volid]?.status === 'error' ? 'border-red-500/30' : 'border-proxmox-border'}`}>
                                                             <div className="flex items-center justify-between">
                                                                 <div className="flex items-center gap-3">
                                                                     <div className="p-2 bg-purple-500/10 rounded-lg">
@@ -2578,6 +2637,29 @@
                                                                 </div>
                                                                 <div className="flex items-center gap-2">
                                                                     <button
+                                                                        onClick={() => handleVerifyBackup(backup)}
+                                                                        disabled={verifyingBackup === backup.volid}
+                                                                        className={`p-2 rounded-lg transition-colors disabled:opacity-50 ${
+                                                                            verifyResults[backup.volid]?.status === 'passed' ? 'bg-green-500/10 text-green-400' :
+                                                                            verifyResults[backup.volid]?.status === 'failed' || verifyResults[backup.volid]?.status === 'error' ? 'bg-red-500/10 text-red-400' :
+                                                                            verifyingBackup === backup.volid ? 'bg-yellow-500/10 text-yellow-400' :
+                                                                            'bg-purple-500/10 hover:bg-purple-500/20 text-purple-400'
+                                                                        }`}
+                                                                        title={verifyResults[backup.volid]?.status === 'passed' ? (t('verifiedOk') || 'Verified ✓') :
+                                                                               verifyResults[backup.volid]?.status ? verifyResults[backup.volid].status :
+                                                                               (t('verifyBackup') || 'Verify Backup')}
+                                                                    >
+                                                                        {verifyingBackup === backup.volid ? (
+                                                                            <Icons.RotateCw className="animate-spin" />
+                                                                        ) : verifyResults[backup.volid]?.status === 'passed' ? (
+                                                                            <Icons.CheckCircle />
+                                                                        ) : verifyResults[backup.volid]?.status === 'failed' || verifyResults[backup.volid]?.status === 'error' ? (
+                                                                            <Icons.XCircle />
+                                                                        ) : (
+                                                                            <Icons.Shield />
+                                                                        )}
+                                                                    </button>
+                                                                    <button
                                                                         onClick={() => setShowRestoreBackup(backup)}
                                                                         disabled={backupLoading}
                                                                         className="p-2 rounded-lg bg-blue-500/10 hover:bg-blue-500/20 text-blue-400 transition-colors disabled:opacity-50"
@@ -2595,6 +2677,37 @@
                                                                     </button>
                                                                 </div>
                                                             </div>
+                                                            {/* Verification status bar */}
+                                                            {(verifyingBackup === backup.volid || verifyResults[backup.volid]) && (
+                                                                <div className={`mt-3 pt-3 border-t text-xs flex items-center gap-2 ${
+                                                                    verifyResults[backup.volid]?.status === 'passed' ? 'border-green-500/20 text-green-400' :
+                                                                    verifyResults[backup.volid]?.status === 'failed' || verifyResults[backup.volid]?.status === 'error' ? 'border-red-500/20 text-red-400' :
+                                                                    'border-yellow-500/20 text-yellow-400'
+                                                                }`}>
+                                                                    {verifyingBackup === backup.volid ? (
+                                                                        <>
+                                                                            <Icons.RotateCw className="w-3 h-3 animate-spin" />
+                                                                            <span>{verifyResults[backup.volid]?.phase === 'restoring' ? (t('restoring') || 'Restoring...') :
+                                                                                   verifyResults[backup.volid]?.phase === 'booting' ? (t('booting') || 'Booting...') :
+                                                                                   verifyResults[backup.volid]?.phase === 'verifying' ? (t('verifying') || 'Checking health...') :
+                                                                                   verifyResults[backup.volid]?.phase === 'cleanup' ? (t('cleaningUp') || 'Cleaning up...') :
+                                                                                   (t('verifying') || 'Verifying...')}</span>
+                                                                        </>
+                                                                    ) : verifyResults[backup.volid]?.status === 'passed' ? (
+                                                                        <>
+                                                                            <Icons.CheckCircle className="w-3 h-3" />
+                                                                            <span>{t('backupVerified') || 'Backup verified'} — {t('restoreBootOk') || 'Restore + Boot OK'}</span>
+                                                                            <span className="text-gray-500 ml-auto">{verifyResults[backup.volid]?.duration_seconds}s</span>
+                                                                        </>
+                                                                    ) : (
+                                                                        <>
+                                                                            <Icons.XCircle className="w-3 h-3" />
+                                                                            <span>{verifyResults[backup.volid]?.error?.substring(0, 80) || (t('verificationFailed') || 'Failed')}</span>
+                                                                            <span className="text-gray-500 ml-auto">{verifyResults[backup.volid]?.duration_seconds}s</span>
+                                                                        </>
+                                                                    )}
+                                                                </div>
+                                                            )}
                                                         </div>
                                                     ))}
                                                 </div>

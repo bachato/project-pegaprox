@@ -8280,6 +8280,9 @@
                                                     const onlineCount = Object.values(clusterMetrics).filter(m => m && m.status !== 'offline').length;
                                                     const totalNodes = Object.keys(clusterMetrics).length + Object.entries(knownNodes).filter(([n, d]) => d.status === 'offline' && !clusterMetrics[n]).length;
                                                     const haNodes = Object.values(clusterMetrics).filter(m => m && m.ha_active).length;
+                                                    // #252: use quorate from PVE API (accounts for QDevice votes)
+                                                    const clusterStatus = allClusterMetrics[selectedCluster.id]?.data?.cluster;
+                                                    const isQuorate = clusterStatus?.quorate !== undefined ? clusterStatus.quorate : onlineCount > (totalNodes || onlineCount) / 2;
                                                     return (
                                                         <div className="corp-services-bar">
                                                             <div className="corp-svc-item">
@@ -8290,10 +8293,10 @@
                                                             <span style={{color: 'var(--corp-divider)'}}>|</span>
                                                             <div className="corp-svc-item">
                                                                 <span className="corp-svc-label">Quorum</span>
-                                                                <span className="corp-badge" style={onlineCount > (totalNodes || onlineCount) / 2
+                                                                <span className="corp-badge" style={isQuorate
                                                                     ? {background: 'rgba(96,181,21,0.12)', color: '#60b515', border: '1px solid rgba(96,181,21,0.25)', fontSize: 11, padding: '0 5px'}
                                                                     : {background: 'rgba(245,79,71,0.12)', color: '#f54f47', border: '1px solid rgba(245,79,71,0.25)', fontSize: 11, padding: '0 5px'}
-                                                                }>{onlineCount > (totalNodes || onlineCount) / 2 ? t('quorumOk') : t('quorumLost')}</span>
+                                                                }>{isQuorate ? t('quorumOk') : t('quorumLost')}</span>
                                                             </div>
                                                             {haNodes > 0 && (<>
                                                                 <span style={{color: 'var(--corp-divider)'}}>|</span>

@@ -1164,6 +1164,95 @@ def get_pbs_time(pbs_id):
     return jsonify(result.get('data', {}))
 
 
+# ============================================================================
+# Backup Verification — NS Apr 2026
+# ============================================================================
+
+@bp.route('/api/clusters/<cluster_id>/backup-verify', methods=['POST'])
+@require_auth(perms=['vm.backup'])
+def start_backup_verification(cluster_id):
+    """Start a PBS backup verification (restore → boot → check → cleanup)"""
+    from pegaprox.core.backup_verify import start_verification
+
+    if cluster_id not in cluster_managers:
+        return jsonify({'error': 'Cluster not found'}), 404
+
+    data = request.json or {}
+    required = ['node', 'vmid', 'backup_volid']
+    for f in required:
+        if f not in data:
+            return jsonify({'error': f'Missing: {f}'}), 400
+
+    data['cluster_id'] = cluster_id
+    pve_mgr = cluster_managers[cluster_id]
+
+    if not pve_mgr.is_connected:
+        return jsonify({'error': 'Cluster not connected'}), 503
+
+    try:
+        task_id = start_verification(pve_mgr, data)
+    except Exception as e:
+        return jsonify({'error': str(e)}), 409
+
+    user = request.session.get('user', 'system')
+    log_audit(user, 'backup.verify_started',
+              f"Backup verification started for VM {data.get('vmid')} on {data.get('node')}")
+
+    return jsonify({'success': True, 'task_id': task_id})
+
+
+@bp.route('/api/clusters/<cluster_id>/backup-verify/<task_id>', methods=['GET'])
+@require_auth(perms=['vm.backup'])
+def get_backup_verification_status(cluster_id, task_id):
+    """Get status of a running or completed verification"""
+    from pegaprox.core.backup_verify import get_verification, get_verification_history
+
+    # check active first
+    status = get_verification(task_id)
+    if status:
+        return jsonify(status)
+
+    # check database
+    db = get_db()
+    try:
+        row = db.query_one('SELECT * FROM backup_verifications WHERE id = ?', (task_id,))
+        if row:
+            result = dict(row)
+            import json
+            result['details'] = json.loads(result.get('details', '{}'))
+            result['logs'] = result['details'].get('logs', [])
+            return jsonify(result)
+    except Exception:
+        pass
+
+    return jsonify({'error': 'Verification not found'}), 404
+
+
+@bp.route('/api/clusters/<cluster_id>/backup-verify/history', methods=['GET'])
+@require_auth(perms=['vm.backup'])
+def get_backup_verification_history(cluster_id):
+    """Get verification history, optionally filtered by vmid"""
+    from pegaprox.core.backup_verify import get_verification_history
+
+    vmid = request.args.get('vmid', type=int)
+    limit = request.args.get('limit', 50, type=int)
+
+    results = get_verification_history(cluster_id, vmid, limit)
+    return jsonify(results)
+
+
+@bp.route('/api/clusters/<cluster_id>/backup-verify/active', methods=['GET'])
+@require_auth(perms=['vm.backup'])
+def get_active_verifications(cluster_id):
+    """Get all currently running verifications"""
+    from pegaprox.core.backup_verify import get_active_verifications
+
+    active = get_active_verifications()
+    # filter by cluster
+    cluster_active = {k: v for k, v in active.items() if v.get('cluster_id') == cluster_id}
+    return jsonify(cluster_active)
+
+
 # End PBS API endpoints
 # ============================================================================
 

@@ -1238,6 +1238,35 @@ class PegaProxDB:
         except Exception as e:
             logging.error(f"Error creating plugin_state table: {e}")
 
+        # NS: Apr 2026 - Backup verification results
+        try:
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS backup_verifications (
+                    id TEXT PRIMARY KEY,
+                    cluster_id TEXT NOT NULL,
+                    pbs_id TEXT,
+                    vmid INTEGER NOT NULL,
+                    vm_name TEXT DEFAULT '',
+                    backup_time TEXT,
+                    node TEXT,
+                    test_vmid INTEGER,
+                    started_at TEXT,
+                    completed_at TEXT,
+                    status TEXT DEFAULT 'running',
+                    phase TEXT DEFAULT 'init',
+                    restore_ok INTEGER DEFAULT 0,
+                    boot_ok INTEGER DEFAULT 0,
+                    agent_ok INTEGER DEFAULT 0,
+                    cleanup_ok INTEGER DEFAULT 0,
+                    duration_seconds REAL DEFAULT 0,
+                    error TEXT DEFAULT '',
+                    details TEXT DEFAULT '{}'
+                )
+            ''')
+            logging.info("Ensured backup_verifications table exists")
+        except Exception as e:
+            logging.error(f"Error creating backup_verifications table: {e}")
+
         conn.commit()
         logging.info("DB schema initialized")
     

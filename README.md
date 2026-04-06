@@ -45,6 +45,7 @@ PegaProx is a powerful web-based management interface for Proxmox VE and XCP-ng 
 - 📸 **Snapshots** - Standard and space-efficient LVM snapshots for shared storage
 - 🔁 **Snapshot Replication** - Storage-agnostic replication for clusters without ZFS
 - 💾 **Backups** - Schedule and manage backups
+- ✅ **Backup Verification** *(Experimental)* - Automated restore → boot → health check → cleanup (ISO 27001, SOC 2, HIPAA compliance)
 - 🖱️ **noVNC / xterm.js Console** - Browser-based console for QEMU and LXC
 - ⚖️ **Load Balancing** - Automatic VM distribution across nodes
 - 🔁 **High Availability** - Auto-restart VMs on node failure with configurable timing
@@ -88,9 +89,9 @@ PegaProx is a powerful web-based management interface for Proxmox VE and XCP-ng 
 - 🌐 **Offline Mode** - Works without internet (local assets)
 - 🎨 **Themes** - Dark mode, Proxmox theme, and more
 - 🏢 **Corporate Layout** - Tree-based sidebar with dense tables (experimental)
-- 🌍 **Multi-Language** - English and German
+- 🌍 **Multi-Language** - English, German, French, Spanish, Portuguese, Korean
 - 📱 **Responsive** - Works on desktop and mobile
-- 📦 **PBS Integration** - Proxmox Backup Server management
+- 📦 **PBS Integration** - Proxmox Backup Server management with backup verification
 
 ## 📋 Requirements
 
