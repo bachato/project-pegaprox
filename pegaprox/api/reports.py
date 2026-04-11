@@ -31,7 +31,7 @@ def _syslog_search_terms(search_text):
 def _syslog_escape_fts_term(term):
     sanitized = ''.join(ch for ch in term if ch.isprintable() and ch not in '\x00\r\n\t')
     sanitized = sanitized.replace('"', '""').strip()
-    return f'"{sanitized}"' if sanitized else ''
+    return f'"{sanitized}"*' if sanitized else ''
 
 
 def _syslog_fts_query(search_text):
