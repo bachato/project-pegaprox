@@ -265,7 +265,24 @@ def _run_v2p_migration(task):
         if rc != 0:
             task.set_phase('failed', f'Cannot SSH to ESXi {esxi_host}: {err}'); return
         task.log(f"SSH OK: {out.strip()}")
-        
+
+        # MK: pre-flight check — which disk transfer tools are installed on the PVE node
+        import shutil
+        _preflight = {}
+        for _tool in ['qemu-img', 'qemu-nbd', 'sshfs', 'sshpass']:
+            rc_pf, out_pf, _ = _pve_node_exec(pve_mgr, task.target_node,
+                f"which {_tool} 2>/dev/null", timeout=5)
+            _preflight[_tool] = rc_pf == 0
+        avail = [t for t, ok in _preflight.items() if ok]
+        missing = [t for t, ok in _preflight.items() if not ok]
+        if avail:
+            task.log(f"Tools available: {', '.join(avail)}")
+        if missing:
+            task.log(f"Tools missing: {', '.join(missing)} (install for more transfer methods)")
+        if not _preflight.get('qemu-img'):
+            task.set_phase('failed', 'qemu-img not found on target node. Install qemu-utils: apt install qemu-utils')
+            return
+
         # Find VM directory on ESXi datastore
         datastore = task.esxi_datastore
         vm_dir = task.esxi_vm_dir or vm_data.get('name', '')
@@ -2696,6 +2713,7 @@ def _do_sshfs_boot_migration(pve_mgr, task, vmware_mgr, esxi_host, esxi_user, es
             task.log(f"VM start API error: {e}")
     else:
         task.log("No remote boot method available (QEMU-SSH/SSHFS/NBD all failed)")
+        task.log("Hint: install sshfs and qemu-utils (apt install sshfs qemu-utils) for more transfer options")
     
     if not vm_running_on_ssh:
         task.log("Switching to offline mode: copy first, then start VM")
@@ -3333,7 +3351,7 @@ exit $((S + R))
                 _pve_node_exec(pve_mgr, task.target_node,
                     f"fuser -k {sock} 2>/dev/null; rm -f {sock}", timeout=5)
         _cleanup_temp_ssh_key(pve_mgr, task.target_node, key_path, esxi_host, esxi_user)
-        task.set_phase('failed', 'Disk copy to local storage failed')
+        task.set_phase('failed', 'Disk copy to local storage failed. Check logs above for details. Ensure qemu-utils, sshfs and sshpass are installed on the Proxmox node.')
         return
     
     _cleanup_copy_isolation(pve_mgr, task.target_node, bg_iso)
