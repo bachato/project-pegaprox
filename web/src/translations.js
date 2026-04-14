@@ -838,6 +838,7 @@
                 // VM Creation Wizard
                 node: 'Node',
                 next: 'Nächste',
+                back: 'Zurück',
                 guestOs: 'Gastbetriebssystem',
                 isoImage: 'ISO Image',
                 noIso: 'Kein ISO',
@@ -3962,6 +3963,7 @@
                 // VM Creation Wizard
                 node: 'Node',
                 next: 'Next',
+                back: 'Back',
                 guestOs: 'Guest Operating System',
                 isoImage: 'ISO Image',
                 noIso: 'No ISO',
@@ -7000,6 +7002,7 @@
                 // VM Creation Wizard
                 node: 'Nœud',
                 next: 'Suivant',
+                back: 'Retour',
                 guestOs: 'Système d\'exploitation de l\'hôte',
                 isoImage: 'Image ISO',
                 noIso: 'Aucun ISO',
@@ -9916,6 +9919,7 @@
                 // VM Creation Wizard
                 node: 'Nodo',
                 next: 'Siguiente',
+                back: 'Atrás',
                 guestOs: 'Sistema operativo del huésped',
                 isoImage: 'Imagen ISO',
                 noIso: 'Sin ISO',
@@ -12980,6 +12984,7 @@
 
                 // VM Creation Wizard
                 next: 'Próximo',
+                back: 'Voltar',
                 guestOs: 'Sistema Operacional Convidado',
                 isoImage: 'Imagem ISO',
                 noIso: 'Sem ISO',
@@ -15849,6 +15854,7 @@
                 // VM Creation Wizard
                 node: '노드',
                 next: '다음',
+                back: '뒤로',
                 guestOs: '게스트 운영 체제',
                 isoImage: 'ISO 이미지',
                 noIso: 'ISO 없음',
