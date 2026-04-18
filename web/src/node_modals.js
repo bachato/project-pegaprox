@@ -791,8 +791,13 @@
                 const { type } = diskModal;
                 
                 return (
-                    <div className="fixed inset-0 z-[60] flex items-center justify-center bg-black/70" onClick={() => setDiskModal({ open: false, type: null })}>
-                        <div className="bg-proxmox-card border border-proxmox-border rounded-xl w-full max-w-lg" onClick={e => e.stopPropagation()}>
+                    // NS Apr 2026 (#323): native <select> dropdowns in fixed-position modals
+                    // bubble click events up to the backdrop when an <option> is picked, which
+                    // used to close this modal immediately. Using onMouseDown + currentTarget
+                    // check so only actual backdrop drags trigger close.
+                    <div className="fixed inset-0 z-[60] flex items-center justify-center bg-black/70"
+                         onMouseDown={(e) => { if (e.target === e.currentTarget) setDiskModal({ open: false, type: null }); }}>
+                        <div className="bg-proxmox-card border border-proxmox-border rounded-xl w-full max-w-lg" onMouseDown={e => e.stopPropagation()}>
                             <div className="p-4 border-b border-proxmox-border flex items-center justify-between">
                                 <h3 className="font-semibold text-white">
                                     {type === 'sr' && (t('createSr') || 'Create Storage Repository')}
