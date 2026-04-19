@@ -890,27 +890,49 @@ def get_cluster_creds_internal(cluster_id):
         if not node_ips:
             node_ips['_default'] = cluster_host
     else:
+        # NS Apr 2026 (PR #324): ?node=<name> resolves only the requested node.
+        # The WS shell calls this on every connect; resolving every node on a
+        # big cluster would blow past the WS server's 10s request timeout.
+        requested_node = (request.args.get('node') or '').strip()
+
+        def _resolve_node(nname):
+            try:
+                ip = mgr._get_node_ip(nname)
+            except Exception as e:
+                logging.warning(f"[CLUSTER-CREDS] _get_node_ip({nname}) raised: {e}")
+                ip = None
+            if ip:
+                node_ips[nname] = ip
+                node_ips[nname.lower()] = ip
+                logging.info(f"[CLUSTER-CREDS] {nname} -> {ip}")
+            else:
+                logging.warning(f"[CLUSTER-CREDS] no reachable IP for {nname}")
+
         try:
-            host = cluster_host
-
-            # Method 1: Get from Proxmox cluster status API (has IPs for clustered nodes)
-            status_url = f"https://{host}:8006/api2/json/cluster/status"
-            r = mgr._create_session().get(status_url, timeout=10)
-
-            if r.status_code == 200:
-                status_data = r.json().get('data', [])
-                logging.info(f"[CLUSTER-CREDS] Cluster status returned {len(status_data)} items")
-                for item in status_data:
-                    if item.get('type') == 'node':
-                        node_name = item.get('name', '')
-                        node_ip = item.get('ip')
-                        logging.info(f"[CLUSTER-CREDS] Cluster status node: {node_name}, ip={node_ip}")
-                        if node_name and node_ip:
-                            # Store with original case and lowercase for matching
-                            node_ips[node_name] = node_ip
-                            node_ips[node_name.lower()] = node_ip
-
-
+            if requested_node:
+                _resolve_node(requested_node)
+            else:
+                # Bulk path -- UIs that want the full mapping.
+                # Re-use _cached_nodes populated by get_cluster_nodes(),
+                # otherwise hit /api2/json/nodes directly. mgr.get_nodes()
+                # doesn't exist on Proxmox managers (XCP-ng only).
+                nodes = getattr(mgr, '_cached_nodes', None)
+                if not nodes:
+                    try:
+                        r = mgr._create_session().get(f"https://{cluster_host}:8006/api2/json/nodes", timeout=10)
+                        if r.status_code == 200:
+                            nodes = r.json().get('data', []) or []
+                            try:
+                                mgr._cached_nodes = nodes
+                            except Exception:
+                                pass
+                    except Exception as e:
+                        logging.warning(f"[CLUSTER-CREDS] /nodes REST failed: {e}")
+                        nodes = []
+                for n in (nodes or []):
+                    nn = n.get('node') or n.get('name') or ''
+                    if nn:
+                        _resolve_node(nn)
         except Exception as e:
             logging.error(f"[CLUSTER-CREDS] Error getting node IPs: {e}")
 
@@ -918,12 +940,15 @@ def get_cluster_creds_internal(cluster_id):
         if not node_ips:
             node_ips['_default'] = cluster_host
             logging.info(f"[CLUSTER-CREDS] No nodes found, using default: {cluster_host}")
-    
+
     # NS Feb 2026: Never expose Proxmox password via API - shell proxy handles auth server-side
     # NS Mar 2026: removed user field from response, only SSH proxy needs it internally
+    # NS Apr 2026: expose ssh_port so the WS server can honor non-22 configs
+    ssh_port = getattr(getattr(mgr, 'config', None), 'ssh_port', 22) or 22
     return jsonify({
         'host': cluster_host,
-        'node_ips': node_ips
+        'node_ips': node_ips,
+        'ssh_port': ssh_port
     })
 
 
