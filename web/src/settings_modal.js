@@ -1,3 +1,319 @@
+        // LW 2026-04-24 — grouped permissions grid for Create/Edit Role dialogs.
+        // Old version was a flat 4-column checkbox grid of raw keys (vm.start, pbs.datastore.gc, ...).
+        // That's ~150 entries with no structure. Now: group by the dot-prefix, human-readable
+        // group headers, per-group "select all", description tooltips, and a search box.
+        const PERMISSION_CATEGORY_META = {
+            vm:            { order: 10, title: 'Virtual Machines',      icon: '🖥️' },
+            cluster:       { order: 20, title: 'Cluster',               icon: '🔗' },
+            node:          { order: 30, title: 'Nodes',                 icon: '🏠' },
+            storage:       { order: 40, title: 'Storage',               icon: '💾' },
+            backup:        { order: 50, title: 'Backup Jobs',           icon: '📦' },
+            ha:            { order: 60, title: 'High Availability',     icon: '⚡' },
+            firewall:      { order: 70, title: 'Firewall',              icon: '🛡️' },
+            pool:          { order: 80, title: 'Resource Pools',        icon: '🗂️' },
+            replication:   { order: 90, title: 'Replication',           icon: '🔁' },
+            ceph:          { order: 100, title: 'Ceph',                 icon: '🐙' },
+            sdn:           { order: 110, title: 'Software-Defined Net', icon: '🌐' },
+            alert:         { order: 120, title: 'Alerts',               icon: '🔔' },
+            site_recovery: { order: 130, title: 'Site Recovery',        icon: '🚨' },
+            pbs:           { order: 140, title: 'Proxmox Backup Server',icon: '🗄️' },
+            vmware:        { order: 150, title: 'ESXi / vCenter',       icon: '📡' },
+            xapi:          { order: 160, title: 'XCP-ng',               icon: '🔶' },
+            plugins:       { order: 170, title: 'Plugins',              icon: '🧩' },
+            admin:         { order: 999, title: 'Administration',       icon: '⚙️' },
+        };
+
+        function PermissionsGrid({ allPermissions, selected, onChange, t }) {
+            const [filter, setFilter] = useState('');
+            // category collapsed state; admin category collapsed by default (less-used)
+            const [collapsed, setCollapsed] = useState({ admin: true });
+            const groups = React.useMemo(() => {
+                const q = filter.trim().toLowerCase();
+                const byCat = {};
+                (allPermissions || []).forEach(p => {
+                    if (q && !(p.permission.toLowerCase().includes(q) || (p.description || '').toLowerCase().includes(q))) return;
+                    const c = p.category || p.permission.split('.')[0];
+                    (byCat[c] = byCat[c] || []).push(p);
+                });
+                // sort by meta.order; unknown categories go to the end alphabetically
+                return Object.keys(byCat)
+                    .sort((a, b) => {
+                        const oa = PERMISSION_CATEGORY_META[a]?.order ?? 500;
+                        const ob = PERMISSION_CATEGORY_META[b]?.order ?? 500;
+                        if (oa !== ob) return oa - ob;
+                        return a.localeCompare(b);
+                    })
+                    .map(c => ({ cat: c, perms: byCat[c].sort((x, y) => x.permission.localeCompare(y.permission)) }));
+            }, [allPermissions, filter]);
+
+            const selSet = new Set(selected || []);
+            const toggleOne = (perm, on) => {
+                const next = new Set(selected || []);
+                if (on) next.add(perm); else next.delete(perm);
+                onChange(Array.from(next));
+            };
+            const toggleGroup = (perms, on) => {
+                const next = new Set(selected || []);
+                perms.forEach(p => on ? next.add(p.permission) : next.delete(p.permission));
+                onChange(Array.from(next));
+            };
+
+            return (
+                <div className="bg-proxmox-darker border border-proxmox-border rounded-lg overflow-hidden">
+                    <div className="flex items-center gap-2 p-2 border-b border-proxmox-border bg-proxmox-dark/40">
+                        <Icons.Search className="w-4 h-4 text-gray-500 ml-1" />
+                        <input type="text" value={filter} onChange={e => setFilter(e.target.value)}
+                            placeholder={t('filterPermissions') || 'Filter permissions…'}
+                            className="flex-1 bg-transparent outline-none text-sm text-white placeholder:text-gray-500" />
+                        <span className="text-xs text-gray-500 mr-2">{(selected || []).length} / {(allPermissions || []).length}</span>
+                        <button type="button" onClick={() => onChange([])} className="text-xs px-2 py-0.5 text-gray-400 hover:text-white" title={t('clearAll') || 'Clear all'}>
+                            {t('clearAll') || 'Clear'}
+                        </button>
+                    </div>
+                    <div className="max-h-80 overflow-y-auto p-2 space-y-2" style={{scrollbarWidth: 'thin'}}>
+                        {groups.length === 0 && (
+                            <div className="text-center text-sm text-gray-500 py-6">{t('noMatchingPermissions') || 'No permissions match your filter.'}</div>
+                        )}
+                        {groups.map(({ cat, perms }) => {
+                            const meta = PERMISSION_CATEGORY_META[cat] || { title: cat, icon: '•' };
+                            const checkedCount = perms.filter(p => selSet.has(p.permission)).length;
+                            const allChecked = checkedCount === perms.length && perms.length > 0;
+                            const someChecked = checkedCount > 0 && !allChecked;
+                            const isCollapsed = !!collapsed[cat];
+                            return (
+                                <div key={cat} className="bg-proxmox-dark/40 border border-proxmox-border/60 rounded-md">
+                                    <div className="flex items-center gap-2 px-2 py-1.5 cursor-pointer select-none"
+                                        onClick={() => setCollapsed(c => ({...c, [cat]: !c[cat]}))}>
+                                        <Icons.ChevronDown className={`w-3.5 h-3.5 text-gray-400 transition-transform ${isCollapsed ? '-rotate-90' : ''}`} />
+                                        <span className="text-base">{meta.icon}</span>
+                                        <span className="text-sm font-medium text-white flex-1">{meta.title}</span>
+                                        <span className={`text-xs ${allChecked ? 'text-green-400' : someChecked ? 'text-yellow-400' : 'text-gray-500'}`}>
+                                            {checkedCount}/{perms.length}
+                                        </span>
+                                        <button type="button" onClick={(e) => { e.stopPropagation(); toggleGroup(perms, !allChecked); }}
+                                            className="text-xs px-1.5 py-0.5 rounded bg-proxmox-darker hover:bg-proxmox-hover text-gray-300">
+                                            {allChecked ? (t('deselectAll') || 'None') : (t('selectAll') || 'All')}
+                                        </button>
+                                    </div>
+                                    {!isCollapsed && (
+                                        <div className="grid grid-cols-1 md:grid-cols-2 gap-x-3 gap-y-1 px-3 pb-2 pt-1">
+                                            {perms.map(p => (
+                                                <label key={p.permission} className="flex items-start gap-2 text-xs text-gray-300 cursor-pointer hover:text-white py-0.5">
+                                                    <input type="checkbox" checked={selSet.has(p.permission)}
+                                                        onChange={e => toggleOne(p.permission, e.target.checked)}
+                                                        className="rounded border-gray-600 mt-0.5" />
+                                                    <div className="flex-1 min-w-0">
+                                                        <div className="font-medium leading-tight">{p.description || p.permission}</div>
+                                                        <div className="text-[10px] text-gray-500 font-mono truncate" title={p.permission}>{p.permission}</div>
+                                                    </div>
+                                                </label>
+                                            ))}
+                                        </div>
+                                    )}
+                                </div>
+                            );
+                        })}
+                    </div>
+                </div>
+            );
+        }
+
+        // MK Apr 2026 — Webhook alert channels (Slack/Discord/Teams/ntfy/generic).
+        // Lives in the Alerts card as a sub-section. Urls come back masked from the
+        // server on GET; when editing an entry we re-fetch with ?full=1 so the form
+        // shows the real URL (stays in the browser, never logged).
+        function AlertChannelsPanel({ t, addToast, getAuthHeaders }) {
+            const [channels, setChannels] = useState([]);
+            const [editing, setEditing] = useState(null);   // null | new-template | existing
+            const [loading, setLoading] = useState(false);
+            const [testing, setTesting] = useState({});
+
+            const load = async () => {
+                setLoading(true);
+                try {
+                    const r = await fetch(`${API_URL}/alert-channels`, { credentials: 'include', headers: getAuthHeaders() });
+                    if (r.ok) setChannels(await r.json());
+                } catch(e) { console.error('channels load:', e); }
+                setLoading(false);
+            };
+            useEffect(() => { load(); }, []);
+
+            const newChannel = () => setEditing({ id: null, name: '', type: 'slack', url: '', token: '', topic: '', enabled: true });
+
+            const startEdit = async (ch) => {
+                // Refetch full list to get unmasked secrets for this row
+                try {
+                    const r = await fetch(`${API_URL}/alert-channels?full=1`, { credentials: 'include', headers: getAuthHeaders() });
+                    if (r.ok) {
+                        const full = await r.json();
+                        const row = full.find(c => c.id === ch.id) || ch;
+                        setEditing({...row});
+                        return;
+                    }
+                } catch(e) {}
+                setEditing({...ch});
+            };
+
+            const save = async () => {
+                const body = {...editing};
+                try {
+                    const isNew = !editing.id;
+                    const r = await fetch(
+                        isNew ? `${API_URL}/alert-channels` : `${API_URL}/alert-channels/${editing.id}`,
+                        { method: isNew ? 'POST' : 'PUT', credentials: 'include',
+                          headers: {...getAuthHeaders(), 'Content-Type': 'application/json'},
+                          body: JSON.stringify(body) }
+                    );
+                    if (r.ok) {
+                        addToast?.(t('channelSaved') || 'Channel saved', 'success');
+                        setEditing(null); load();
+                    } else {
+                        const e = await r.json().catch(() => ({}));
+                        addToast?.(e.error || 'Save failed', 'error');
+                    }
+                } catch(e) { addToast?.(e.message || 'Save failed', 'error'); }
+            };
+
+            const del = async (ch) => {
+                if (!window.confirm((t('confirmDeleteChannel') || 'Delete channel') + ' "' + (ch.name || ch.id) + '"?')) return;
+                const r = await fetch(`${API_URL}/alert-channels/${ch.id}`, {
+                    method: 'DELETE', credentials: 'include', headers: getAuthHeaders()
+                });
+                if (r.ok) { addToast?.(t('channelDeleted') || 'Channel deleted', 'success'); load(); }
+                else addToast?.('Delete failed', 'error');
+            };
+
+            const test = async (ch) => {
+                setTesting({...testing, [ch.id]: true});
+                try {
+                    const r = await fetch(`${API_URL}/alert-channels/${ch.id}/test`, {
+                        method: 'POST', credentials: 'include', headers: getAuthHeaders()
+                    });
+                    const d = await r.json().catch(() => ({}));
+                    if (d.success) addToast?.(`✓ ${ch.name}: ${d.detail || 'OK'}`, 'success');
+                    else addToast?.(`✗ ${ch.name}: ${d.detail || 'failed'}`, 'error');
+                } catch(e) { addToast?.(`Test failed: ${e.message}`, 'error'); }
+                setTesting({...testing, [ch.id]: false});
+            };
+
+            const typeLabel = (tp) => ({slack: 'Slack', discord: 'Discord', teams: 'Microsoft Teams', ntfy: 'ntfy', generic: 'Generic JSON'}[tp] || tp);
+
+            return (
+                <div className="bg-proxmox-dark border border-proxmox-border rounded-xl p-4 space-y-3">
+                    <div className="flex items-center justify-between">
+                        <h4 className="font-medium text-white flex items-center gap-2">
+                            <Icons.Bell className="w-4 h-4" />
+                            {t('alertChannels') || 'Alert Channels'}
+                            <span className="text-xs text-gray-500 ml-1">({channels.length})</span>
+                        </h4>
+                        <button onClick={newChannel} className="flex items-center gap-1 px-3 py-1.5 bg-proxmox-orange hover:bg-orange-600 rounded-lg text-sm">
+                            <Icons.Plus className="w-3.5 h-3.5" /> {t('addChannel') || 'Add Channel'}
+                        </button>
+                    </div>
+                    <p className="text-xs text-gray-500">{t('alertChannelsDesc') || 'Send alerts to Slack, Discord, Teams, ntfy, or any JSON webhook. Channels fire in addition to email.'}</p>
+
+                    {loading && channels.length === 0 ? (
+                        <div className="text-center py-4"><Icons.RotateCw className="w-4 h-4 animate-spin text-gray-400 mx-auto" /></div>
+                    ) : channels.length === 0 ? (
+                        <p className="text-sm text-gray-500 text-center py-3">{t('noChannels') || 'No channels configured yet.'}</p>
+                    ) : (
+                        <div className="space-y-2">
+                            {channels.map(ch => (
+                                <div key={ch.id} className={`flex items-center gap-3 p-3 rounded-lg border ${ch.enabled === false ? 'border-proxmox-border opacity-60' : 'border-proxmox-border'} bg-proxmox-secondary`}>
+                                    <div className={`p-1.5 rounded ${ch.enabled === false ? 'bg-gray-500/10' : 'bg-blue-500/10'}`}>
+                                        <Icons.Bell className={`w-4 h-4 ${ch.enabled === false ? 'text-gray-400' : 'text-blue-400'}`} />
+                                    </div>
+                                    <div className="flex-1 min-w-0">
+                                        <div className="flex items-center gap-2 flex-wrap">
+                                            <span className="text-white text-sm font-medium">{ch.name || ch.id}</span>
+                                            <span className="text-xs px-1.5 py-0.5 rounded bg-gray-500/20 text-gray-300">{typeLabel(ch.type)}</span>
+                                            {ch.enabled === false && <span className="text-xs text-gray-500">{t('disabled') || 'disabled'}</span>}
+                                        </div>
+                                        <div className="text-xs text-gray-500 font-mono truncate">{ch.url}</div>
+                                    </div>
+                                    <button onClick={() => test(ch)} disabled={!!testing[ch.id]} className="px-2 py-1 text-xs bg-blue-500/10 text-blue-400 hover:bg-blue-500/20 rounded flex items-center gap-1 disabled:opacity-50">
+                                        {testing[ch.id] ? <Icons.RotateCw className="w-3 h-3 animate-spin" /> : <Icons.Play />}
+                                        {t('testChannel') || 'Test'}
+                                    </button>
+                                    <button onClick={() => startEdit(ch)} className="px-2 py-1 text-xs bg-proxmox-dark text-gray-300 hover:bg-proxmox-hover rounded">
+                                        <Icons.Edit /> {t('edit') || 'Edit'}
+                                    </button>
+                                    <button onClick={() => del(ch)} className="px-2 py-1 text-xs bg-red-500/10 text-red-400 hover:bg-red-500/20 rounded">
+                                        <Icons.Trash />
+                                    </button>
+                                </div>
+                            ))}
+                        </div>
+                    )}
+
+                    {editing && (
+                        <div className="mt-2 p-3 bg-proxmox-darker border border-proxmox-border rounded-lg space-y-3">
+                            <div className="grid grid-cols-2 gap-3">
+                                <div>
+                                    <label className="block text-xs text-gray-400 mb-1">{t('name') || 'Name'}</label>
+                                    <input type="text" value={editing.name}
+                                        onChange={e => setEditing({...editing, name: e.target.value})}
+                                        placeholder="Ops Slack"
+                                        className="w-full px-3 py-1.5 bg-proxmox-secondary border border-proxmox-border rounded text-white text-sm" />
+                                </div>
+                                <div>
+                                    <label className="block text-xs text-gray-400 mb-1">{t('type') || 'Type'}</label>
+                                    <select value={editing.type}
+                                        onChange={e => setEditing({...editing, type: e.target.value})}
+                                        className="w-full px-3 py-1.5 bg-proxmox-secondary border border-proxmox-border rounded text-white text-sm">
+                                        <option value="slack">Slack</option>
+                                        <option value="discord">Discord</option>
+                                        <option value="teams">Microsoft Teams</option>
+                                        <option value="ntfy">ntfy</option>
+                                        <option value="generic">Generic JSON</option>
+                                    </select>
+                                </div>
+                            </div>
+                            <div>
+                                <label className="block text-xs text-gray-400 mb-1">Webhook URL</label>
+                                <input type="text" value={editing.url}
+                                    onChange={e => setEditing({...editing, url: e.target.value})}
+                                    placeholder="https://hooks.slack.com/services/…"
+                                    className="w-full px-3 py-1.5 bg-proxmox-secondary border border-proxmox-border rounded text-white text-sm font-mono" />
+                            </div>
+                            {editing.type === 'ntfy' && (
+                                <div className="grid grid-cols-2 gap-3">
+                                    <div>
+                                        <label className="block text-xs text-gray-400 mb-1">{t('topic') || 'Topic'}</label>
+                                        <input type="text" value={editing.topic || ''}
+                                            onChange={e => setEditing({...editing, topic: e.target.value})}
+                                            placeholder="pegaprox-alerts"
+                                            className="w-full px-3 py-1.5 bg-proxmox-secondary border border-proxmox-border rounded text-white text-sm font-mono" />
+                                    </div>
+                                    <div>
+                                        <label className="block text-xs text-gray-400 mb-1">{t('token') || 'Access token'}</label>
+                                        <input type="password" value={editing.token || ''}
+                                            onChange={e => setEditing({...editing, token: e.target.value})}
+                                            placeholder={t('optional') || '(optional)'}
+                                            className="w-full px-3 py-1.5 bg-proxmox-secondary border border-proxmox-border rounded text-white text-sm font-mono" />
+                                    </div>
+                                </div>
+                            )}
+                            <label className="flex items-center gap-2 cursor-pointer select-none">
+                                <input type="checkbox" checked={editing.enabled !== false}
+                                    onChange={e => setEditing({...editing, enabled: e.target.checked})}
+                                    className="w-4 h-4" />
+                                <span className="text-sm text-white">{t('enabled') || 'Enabled'}</span>
+                            </label>
+                            <div className="flex justify-end gap-2">
+                                <button onClick={() => setEditing(null)} className="px-3 py-1.5 text-sm text-gray-300 hover:text-white">
+                                    {t('cancel') || 'Cancel'}
+                                </button>
+                                <button onClick={save} disabled={!editing.url} className="px-3 py-1.5 bg-proxmox-orange hover:bg-orange-600 rounded text-sm disabled:opacity-50">
+                                    {t('save') || 'Save'}
+                                </button>
+                            </div>
+                        </div>
+                    )}
+                </div>
+            );
+        }
+
         // ═══════════════════════════════════════════════
         // PegaProx - Settings Modal
         // PegaProxSettingsModal (Server, SSL, SMTP, RBAC, Audit, Tenants)
@@ -80,6 +396,7 @@
                 oidc_button_text: 'Sign in with Microsoft',
                 oidc_group_mappings: [],
                 oidc_skip_jwt_verification: false,
+                oidc_skip_ssl_verify: false,
             });
             const [oidcTesting, setOidcTesting] = useState(false);
             const [oidcTestResult, setOidcTestResult] = useState(null);
@@ -154,7 +471,8 @@
                 smtp_tls: true,
                 smtp_ssl: false,
                 alert_email_recipients: [],
-                alert_cooldown: 300
+                alert_cooldown: 300,
+                alert_update_available: false,
             });
             const [serverLoading, setServerLoading] = useState(false);
             const [showRestartConfirm, setShowRestartConfirm] = useState(false);
@@ -949,6 +1267,7 @@
                             // Alert settings
                             alert_email_recipients: data.alert_email_recipients || [],
                             alert_cooldown: data.alert_cooldown || 300,
+                            alert_update_available: !!data.alert_update_available,
                             // Security settings
                             login_max_attempts: data.login_max_attempts || 5,
                             login_lockout_time: data.login_lockout_time || 300,
@@ -1015,6 +1334,7 @@
                             oidc_auto_create_users: data.oidc_auto_create_users !== false,
                             oidc_button_text: data.oidc_button_text || 'Sign in with Microsoft',
                             oidc_skip_jwt_verification: data.oidc_skip_jwt_verification || false,
+                            oidc_skip_ssl_verify: data.oidc_skip_ssl_verify || false,
                             oidc_group_mappings: data.oidc_group_mappings || [],
                         }));
                     }
@@ -1150,6 +1470,7 @@
                     if (serverSettings.alert_cooldown) {
                         formData.append('alert_cooldown', serverSettings.alert_cooldown);
                     }
+                    formData.append('alert_update_available', serverSettings.alert_update_available ? 'true' : 'false');
 
                     if (serverSettings.ssl_cert_file) {
                         formData.append('ssl_cert', serverSettings.ssl_cert_file);
@@ -1260,7 +1581,8 @@
                             smtp_tls: serverSettings.smtp_tls,
                             smtp_ssl: serverSettings.smtp_ssl,
                             alert_email_recipients: serverSettings.alert_email_recipients,
-                            alert_cooldown: serverSettings.alert_cooldown
+                            alert_cooldown: serverSettings.alert_cooldown,
+                            alert_update_available: !!serverSettings.alert_update_available,
                         })
                     });
                     
@@ -1459,10 +1781,18 @@
                     });
                     
                     if (response && response.ok) {
-                        addToast(t('passwordResetSuccess'), 'success');
+                        const data = await response.json().catch(() => ({}));
                         setPasswordResetUser(null);
                         setNewPasswordValue('');
                         fetchAuditLogs();
+                        // NS 2026-04-24 — if admin reset their OWN password, the backend
+                        // killed their session — redirect to login.
+                        if (data.relogin_required) {
+                            addToast(t('passwordChangedReloginRequired') || 'Password changed — please sign in again.', 'success');
+                            setTimeout(() => { window.location.href = '/'; }, 1200);
+                        } else {
+                            addToast(t('passwordResetSuccess'), 'success');
+                        }
                     } else {
                         const data = await response.json();
                         addToast(data.error || 'Error resetting password', 'error');
@@ -3986,28 +4316,15 @@
                                                     </div>
                                                 </div>
                                                 
-                                                {/* Permission checkboxes */}
+                                                {/* Permission checkboxes — grouped with search */}
                                                 <div>
                                                     <label className="block text-sm text-gray-400 mb-2">{t('permissions') || 'Permissions'}</label>
-                                                    <div className="grid grid-cols-4 gap-2 max-h-64 overflow-y-auto bg-proxmox-darker p-3 rounded-lg">
-                                                        {allPermissions.map(p => (
-                                                            <label key={p.permission} className="flex items-center gap-2 text-xs text-gray-300 cursor-pointer hover:text-white">
-                                                                <input
-                                                                    type="checkbox"
-                                                                    checked={newRole.permissions.includes(p.permission)}
-                                                                    onChange={e => {
-                                                                        if(e.target.checked) {
-                                                                            setNewRole({...newRole, permissions: [...newRole.permissions, p.permission]});
-                                                                        } else {
-                                                                            setNewRole({...newRole, permissions: newRole.permissions.filter(x => x !== p.permission)});
-                                                                        }
-                                                                    }}
-                                                                    className="rounded border-gray-600"
-                                                                />
-                                                                {p.permission}
-                                                            </label>
-                                                        ))}
-                                                    </div>
+                                                    <PermissionsGrid
+                                                        t={t}
+                                                        allPermissions={allPermissions}
+                                                        selected={newRole.permissions}
+                                                        onChange={(next) => setNewRole({...newRole, permissions: next})}
+                                                    />
                                                 </div>
                                                 
                                                 <div className="flex gap-2">
@@ -4088,18 +4405,12 @@
                                             </div>
                                             <div>
                                                 <label className="block text-sm text-gray-400 mb-2">{t('permissions') || 'Permissions'}</label>
-                                                <div className="grid grid-cols-4 gap-2 max-h-64 overflow-y-auto bg-proxmox-darker p-3 rounded-lg">
-                                                    {allPermissions.map(p => (
-                                                        <label key={p.permission} className="flex items-center gap-2 text-xs text-gray-300 cursor-pointer hover:text-white">
-                                                            <input type="checkbox" checked={(editingRole.permissions || []).includes(p.permission)}
-                                                                onChange={e => {
-                                                                    if (e.target.checked) setEditingRole({...editingRole, permissions: [...(editingRole.permissions || []), p.permission]});
-                                                                    else setEditingRole({...editingRole, permissions: (editingRole.permissions || []).filter(x => x !== p.permission)});
-                                                                }} className="rounded border-gray-600" />
-                                                            {p.permission}
-                                                        </label>
-                                                    ))}
-                                                </div>
+                                                <PermissionsGrid
+                                                    t={t}
+                                                    allPermissions={allPermissions}
+                                                    selected={editingRole.permissions || []}
+                                                    onChange={(next) => setEditingRole({...editingRole, permissions: next})}
+                                                />
                                             </div>
                                             <div className="flex gap-2">
                                                 <button onClick={() => handleUpdateRole(editingRole.id, { name: editingRole.name, permissions: editingRole.permissions, tenant_id: editingRole.tenant_id })}
@@ -4538,6 +4849,36 @@
                                                 <p className="text-xs text-green-400">✓ {t('jwtVerificationEnabled') || 'JWT signatures are verified via JWKS endpoint. This is the recommended setting.'}</p>
                                             </div>
                                         )}
+                                    </div>
+
+                                    {/* NS Apr 2026 (#188): TLS verify toggle for self-hosted Authentik / Keycloak with self-signed certs */}
+                                    <div className="bg-proxmox-dark border border-proxmox-border rounded-xl p-4 space-y-3">
+                                        <div className="flex items-center justify-between">
+                                            <h4 className="text-white font-medium flex items-center gap-2">
+                                                <Icons.Lock />
+                                                {t('oidcTlsVerification') || 'IdP TLS Verification'}
+                                            </h4>
+                                            <label className="flex items-center gap-2 cursor-pointer">
+                                                <input type="checkbox"
+                                                    checked={oidcConfig.oidc_skip_ssl_verify}
+                                                    onChange={e => setOidcConfig(prev => ({...prev, oidc_skip_ssl_verify: e.target.checked}))}
+                                                    className="rounded border-proxmox-border bg-proxmox-darker" />
+                                                <span className="text-sm text-gray-300">{t('skipTlsVerification') || 'Skip TLS verify'}</span>
+                                            </label>
+                                        </div>
+                                        {oidcConfig.oidc_skip_ssl_verify ? (
+                                            <div className="p-3 bg-red-500/10 border border-red-500/30 rounded-lg">
+                                                <p className="text-sm text-red-400 font-medium mb-1">⚠ {t('securityWarning') || 'Security Warning'}</p>
+                                                <p className="text-xs text-red-400/80">{t('oidcTlsWarning') || 'TLS certificate validation against the OIDC provider is disabled. Use only for self-hosted IdPs (Authentik, Keycloak) with self-signed certs in trusted networks. Anyone on the path can MITM the OIDC handshake.'}</p>
+                                            </div>
+                                        ) : (
+                                            <div className="p-3 bg-green-500/10 border border-green-500/30 rounded-lg">
+                                                <p className="text-xs text-green-400">✓ {t('oidcTlsEnabled') || 'TLS certificates from the OIDC provider are validated against system CA bundle. Required for production.'}</p>
+                                            </div>
+                                        )}
+                                        <p className="text-[11px] text-gray-500 leading-snug">
+                                            {t('oidcTlsHint') || 'Affects: discovery (.well-known/openid-configuration) and authorization-endpoint reachability checks. Token-exchange and JWKS calls also honor this flag.'}
+                                        </p>
                                     </div>
 
                                     {/* NS: Feb 2026 - Unified Group-Role Mapping */}
@@ -5275,7 +5616,25 @@
                                             />
                                             <span className="text-xs text-gray-500 ml-2">(min 60s)</span>
                                         </div>
+
+                                        {/* NS Apr 2026 (#331) — update-available email toggle.
+                                            Uses the same recipients list; dedup handled server-side. */}
+                                        <div className="pt-2 border-t border-proxmox-border">
+                                            <label className="flex items-center gap-2 cursor-pointer select-none">
+                                                <input
+                                                    type="checkbox"
+                                                    checked={!!serverSettings.alert_update_available}
+                                                    onChange={e => setServerSettings({...serverSettings, alert_update_available: e.target.checked})}
+                                                    className="w-4 h-4"
+                                                />
+                                                <span className="text-sm text-white">{t('alertUpdateAvailable') || 'Email me when a PegaProx update is available'}</span>
+                                            </label>
+                                            <p className="text-xs text-gray-500 mt-1 ml-6">{t('alertUpdateAvailableDesc') || 'Polled once a day. Notifies once per new version to the recipients listed above.'}</p>
+                                        </div>
                                     </div>
+
+                                    {/* MK Apr 2026 — webhook alert channels */}
+                                    <AlertChannelsPanel t={t} addToast={addToast} getAuthHeaders={getAuthHeaders} />
                                     
                                     {/* NS: Plugin Management */}
                                     <div className="bg-proxmox-dark border border-proxmox-border rounded-xl p-4 space-y-4">
@@ -5549,10 +5908,23 @@
                                             <button
                                                 onClick={exportAuditLog}
                                                 className="flex items-center gap-2 px-3 py-2 bg-proxmox-orange hover:bg-orange-600 rounded-lg text-sm font-medium transition-colors"
+                                                title={t('exportFilteredHint') || 'Export the rows you see (with current filter applied)'}
                                             >
                                                 <Icons.Download />
                                                 {t('exportAuditLog')}
                                             </button>
+                                            {/* NS Apr 2026 — full server-side CSV export for compliance archives.
+                                                Differs from the button above in two ways: no client filter applied,
+                                                and higher row cap (server honours ?limit=10000). */}
+                                            <a
+                                                href={`${API_URL}/audit?format=csv&limit=10000`}
+                                                download
+                                                className="flex items-center gap-2 px-3 py-2 bg-proxmox-dark hover:bg-proxmox-hover border border-proxmox-border rounded-lg text-sm font-medium transition-colors"
+                                                title={t('exportFullCsvHint') || 'Server-side CSV with all entries (up to 10000)'}
+                                            >
+                                                <Icons.Download />
+                                                {t('exportFullCsv') || 'Export Full CSV'}
+                                            </a>
                                         </div>
                                     </div>
                                     

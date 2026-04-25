@@ -359,8 +359,19 @@ def check_readiness(plan_id):
 
     # check network mappings
     net_maps = plan.get('network_mappings', {})
+    stor_maps = plan.get('storage_mappings', {})
     if not net_maps:
         issues.append({'severity': 'info', 'msg': 'No network mappings configured (VMs will keep original bridge names)'})
+
+    # NS 2026-04-24 — actually verify mapping targets exist on target cluster.
+    # Root cause of most mid-flight failover crashes: admin typo'd a storage name
+    # like `local_lvm` → `local-lvmm`. Proxmox doesn't check until migration starts.
+    if tgt_mgr and tgt_mgr.is_connected:
+        try:
+            from pegaprox.background.site_recovery import validate_mappings
+            issues.extend(validate_mappings(tgt_mgr, stor_maps, net_maps))
+        except Exception as e:
+            issues.append({'severity': 'warning', 'msg': f'Mapping validation failed to run: {e}'})
 
     # update last readiness check timestamp
     now = datetime.utcnow().isoformat()

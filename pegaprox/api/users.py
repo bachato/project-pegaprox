@@ -296,13 +296,24 @@ def admin_change_password(username):
     save_users(users_db)
     
     # Invalidate ALL sessions for this user (security: force re-login)
-    # NS: use helper function which also persists the change
     sessions_removed = invalidate_all_user_sessions(username)
-    
-    logging.info(f"Admin '{request.session['user']}' changed password for user '{username}'")
-    log_audit(request.session['user'], 'user.password_reset', f"Admin reset password for user: {username} ({sessions_removed} sessions invalidated)")
-    
-    return jsonify({'success': True, 'message': f'Password for {username} changed', 'sessions_invalidated': sessions_removed})
+
+    admin_username = request.session['user']
+    logging.info(f"Admin '{admin_username}' changed password for user '{username}'")
+    log_audit(admin_username, 'user.password_reset', f"Admin reset password for user: {username} ({sessions_removed} sessions invalidated)")
+
+    # NS 2026-04-24 — if admin reset their OWN password, their session just died too
+    # and the frontend needs to redirect to /login.
+    relogin_required = (admin_username.lower() == username)
+    resp = jsonify({
+        'success': True,
+        'message': f'Password for {username} changed',
+        'sessions_invalidated': sessions_removed,
+        'relogin_required': relogin_required,
+    })
+    if relogin_required:
+        resp.delete_cookie('session_id')
+    return resp
 
 
 # ============================================

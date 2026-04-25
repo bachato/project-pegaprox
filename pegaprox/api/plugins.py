@@ -34,6 +34,17 @@ _loaded_plugins = {}   # {plugin_id: module}
 _plugin_routes = {}    # {plugin_id: {path: handler_fn}}
 
 
+# NS Apr 2026 — CodeQL flagged plugin_id as a path-injection vector (admin-only
+# endpoints but still). Every endpoint below now passes plugin_id through this
+# validator before touching the filesystem. Allowed chars match what
+# `_discover_plugins` accepts — directory-name-safe ASCII only, no dots.
+import re as _re
+_PLUGIN_ID_RE = _re.compile(r'^[a-z0-9][a-z0-9_-]{0,63}$')
+
+def _valid_plugin_id(pid):
+    return isinstance(pid, str) and bool(_PLUGIN_ID_RE.match(pid))
+
+
 # ---- Plugin Route Registration (used by plugins) ----
 
 def register_plugin_route(plugin_id, path, handler):
@@ -48,6 +59,8 @@ def register_plugin_route(plugin_id, path, handler):
 @require_auth(perms=['plugins.view'])
 def plugin_proxy(plugin_id, subpath):
     """Dispatch API requests to loaded plugins"""
+    if not _valid_plugin_id(plugin_id):
+        return jsonify({'error': 'Invalid plugin id'}), 400
     with _plugin_lock:
         if plugin_id not in _loaded_plugins:
             return jsonify({'error': 'Plugin not loaded'}), 404
@@ -267,6 +280,8 @@ def list_plugins():
 def reload_plugin(plugin_id):
     """Force-reload a plugin (unload + load). Helps when a plugin crashed
     and the user wants to retry without a full server restart."""
+    if not _valid_plugin_id(plugin_id):
+        return jsonify({'error': 'Invalid plugin id'}), 400
     plugins_path = Path(PLUGINS_DIR) / plugin_id
     if not plugins_path.exists() or not (plugins_path / 'manifest.json').exists():
         return jsonify({'error': 'Plugin not found'}), 404
@@ -291,6 +306,8 @@ def reload_plugin(plugin_id):
 @require_auth(perms=['plugins.manage'])
 def enable_plugin(plugin_id):
     """Enable and load a plugin at runtime"""
+    if not _valid_plugin_id(plugin_id):
+        return jsonify({'error': 'Invalid plugin id'}), 400
     plugins_path = Path(PLUGINS_DIR) / plugin_id
     if not plugins_path.exists() or not (plugins_path / 'manifest.json').exists():
         return jsonify({'error': 'Plugin not found'}), 404
@@ -319,6 +336,8 @@ def enable_plugin(plugin_id):
 @require_auth(perms=['plugins.manage'])
 def disable_plugin(plugin_id):
     """Disable and unload a plugin"""
+    if not _valid_plugin_id(plugin_id):
+        return jsonify({'error': 'Invalid plugin id'}), 400
     unload_plugin(plugin_id)
     _set_plugin_state(plugin_id, False)
 
@@ -342,6 +361,8 @@ def rescan_plugins():
 @require_auth(perms=['plugins.manage'])
 def delete_plugin(plugin_id):
     """Unload, remove state, and delete plugin from disk"""
+    if not _valid_plugin_id(plugin_id):
+        return jsonify({'error': 'Invalid plugin id'}), 400
     import shutil
     plugins_path = Path(PLUGINS_DIR) / plugin_id
     if not plugins_path.exists():
@@ -380,6 +401,8 @@ def _safe_plugin_path(plugin_id, filename='config.json'):
 @require_auth(perms=['plugins.manage'])
 def get_plugin_config(plugin_id):
     """Read plugin config.json as raw text"""
+    if not _valid_plugin_id(plugin_id):
+        return jsonify({'error': 'Invalid plugin id'}), 400
     config_path = _safe_plugin_path(plugin_id)
     if not config_path:
         return jsonify({'error': 'Invalid plugin ID'}), 400
@@ -395,6 +418,8 @@ def get_plugin_config(plugin_id):
 @require_auth(perms=['plugins.manage'])
 def save_plugin_config(plugin_id):
     """Write plugin config.json — validates JSON before saving"""
+    if not _valid_plugin_id(plugin_id):
+        return jsonify({'error': 'Invalid plugin id'}), 400
     config_path = _safe_plugin_path(plugin_id)
     if not config_path:
         return jsonify({'error': 'Invalid plugin ID'}), 400

@@ -3204,7 +3204,7 @@
         }
 
         // LW: Feb 2026 - Corporate Node Detail View (experimental)
-        function CorporateNodeDetailView({ node, clusterId, clusterMetrics, clusterResources, onBack, onOpenNodeConfig, onMaintenanceToggle, onNodeAction, onStartUpdate, onSelectVm, addToast }) {
+        function CorporateNodeDetailView({ node, clusterId, clusterHost, clusterMetrics, clusterResources, onBack, onOpenNodeConfig, onMaintenanceToggle, onNodeAction, onStartUpdate, onSelectVm, addToast }) {
             const { t } = useTranslation();
             const { getAuthHeaders, reverseProxyEnabled } = useAuth();
             const [activeDetailTab, setActiveDetailTab] = useState('summary');
@@ -3469,6 +3469,20 @@
                                         <button onClick={() => { onOpenNodeConfig(node); setShowActionsMenu(false); }} className="w-full text-left px-3 py-1.5 text-[13px] flex items-center gap-2" style={{color: 'var(--corp-text-secondary)'}}>
                                             <Icons.Settings className="w-3.5 h-3.5" /> {t('nodeSettings')}
                                         </button>
+                                        {/* LW Apr 2026 (#250) — open PVE web UI on this cluster in a new tab.
+                                            We use the cluster API host; PVE auto-routes to the right node. */}
+                                        {clusterHost && (
+                                            <button
+                                                onClick={() => {
+                                                    const h = (clusterHost || '').replace(/^https?:\/\//i, '').replace(/\/+$/, '').split(':')[0];
+                                                    if (!h) { addToast(t('noHostKnown') || 'No host known for this cluster', 'warning'); return; }
+                                                    window.open(`https://${h}:8006/`, '_blank', 'noopener,noreferrer');
+                                                    setShowActionsMenu(false);
+                                                }}
+                                                className="w-full text-left px-3 py-1.5 text-[13px] flex items-center gap-2" style={{color: 'var(--corp-text-secondary)'}}>
+                                                <Icons.ExternalLink className="w-3.5 h-3.5" /> {t('openWebUI') || 'Open Web UI'}
+                                            </button>
+                                        )}
                                     </div>
                                 )}
                             </div>
@@ -3525,6 +3539,15 @@
                                             { label: 'RAM', percent: ramPercent, used: formatBytes(ramUsed), total: formatBytes(ramTotal), color: '#9b59b6' },
                                             { label: 'Swap', percent: swapPercent, used: formatBytes(swapUsed), total: formatBytes(swapTotal), color: '#ec4899' },
                                             { label: 'Root FS', percent: rootPercent, used: formatBytes(rootUsed), total: formatBytes(rootTotal), color: '#60b515' },
+                                            // NS Apr 2026: KSM share — relative to total RAM (matches native PVE UI).
+                                            // Only surfaces when backend provided the field (non-Linux hosts omit it).
+                                            ...(typeof data.summary?.ksm?.shared === 'number' ? [{
+                                                label: t('ksmSharing') || 'KSM Sharing',
+                                                percent: ramTotal ? (data.summary.ksm.shared / ramTotal) * 100 : 0,
+                                                used: formatBytes(data.summary.ksm.shared),
+                                                total: formatBytes(ramTotal),
+                                                color: '#a855f7',
+                                            }] : []),
                                         ].map(item => (
                                             <div key={item.label}>
                                                 <div className="flex items-center justify-between mb-1">

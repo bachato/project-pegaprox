@@ -2366,12 +2366,15 @@
                     {/* Detail View - Split Panel */}
                     {viewMode === 'detail' && (
                         <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
-                            {/* VM List */}
-                            <div className="lg:col-span-1 bg-proxmox-card border border-proxmox-border rounded-xl overflow-hidden">
-                                <div className="p-3 border-b border-proxmox-border bg-proxmox-dark/50">
+                            {/* VM List — LW 2026-04-24: viewport-proportional height so it
+                                matches the detail panel on the right and never exceeds the
+                                visible area. Header + list scroll independently. */}
+                            <div className="lg:col-span-1 bg-proxmox-card border border-proxmox-border rounded-xl overflow-hidden flex flex-col"
+                                 style={{maxHeight: 'calc(100vh - 260px)', minHeight: '400px'}}>
+                                <div className="p-3 border-b border-proxmox-border bg-proxmox-dark/50 flex-shrink-0">
                                     <h3 className="text-sm font-medium text-gray-300">VMs & Container ({filteredResources.length})</h3>
                                 </div>
-                                <div className="max-h-[600px] overflow-y-auto">
+                                <div className="flex-1 overflow-y-auto" style={{scrollbarWidth: 'thin'}}>
                                     {paginatedResources.map(resource => (
                                         <div
                                             key={resource.vmid}

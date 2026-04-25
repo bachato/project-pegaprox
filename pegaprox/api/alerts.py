@@ -492,8 +492,117 @@ def delete_alert(alert_id):
     
     user = request.session.get('user', 'unknown')
     log_audit(user, 'alert.deleted', f"Deleted alert: {alert_id}")
-    
+
     return jsonify({'success': True})
+
+
+# ─────────────────────────────────────────────────────────
+# MK Apr 2026 — webhook alert channels (Slack, Discord, Teams, ntfy, generic)
+# ─────────────────────────────────────────────────────────
+
+@bp.route('/api/alert-channels', methods=['GET'])
+@require_auth(roles=[ROLE_ADMIN])
+def list_alert_channels():
+    from pegaprox.api.helpers import load_server_settings
+    channels = (load_server_settings() or {}).get('alert_webhooks') or []
+    # MK: scrub url secrets on read — ?full=1 bypasses for edit flows
+    if request.args.get('full', '').lower() in ('1', 'true', 'yes'):
+        return jsonify(channels)
+    masked = []
+    for ch in channels:
+        c = dict(ch)
+        u = c.get('url') or ''
+        if len(u) > 32:
+            c['url'] = u[:24] + '…' + u[-6:]
+        if c.get('token'):
+            c['token'] = '********'
+        masked.append(c)
+    return jsonify(masked)
+
+
+@bp.route('/api/alert-channels', methods=['POST'])
+@require_auth(roles=[ROLE_ADMIN])
+def create_alert_channel():
+    from pegaprox.api.helpers import load_server_settings, save_server_settings
+    from pegaprox.utils.webhooks import new_channel
+    settings = load_server_settings()
+    channels = list(settings.get('alert_webhooks') or [])
+    ch = new_channel(request.get_json() or {})
+    if not ch.get('url'):
+        return jsonify({'error': 'url required'}), 400
+    channels.append(ch)
+    settings['alert_webhooks'] = channels
+    save_server_settings(settings)
+    log_audit(request.session.get('user', 'admin'), 'alerts.channel_create', f"added webhook '{ch.get('name')}' ({ch.get('type')})")
+    return jsonify({'success': True, 'channel': ch})
+
+
+@bp.route('/api/alert-channels/<cid>', methods=['PUT'])
+@require_auth(roles=[ROLE_ADMIN])
+def update_alert_channel(cid):
+    from pegaprox.api.helpers import load_server_settings, save_server_settings
+    settings = load_server_settings()
+    channels = list(settings.get('alert_webhooks') or [])
+    data = request.get_json() or {}
+    for i, ch in enumerate(channels):
+        if ch.get('id') != cid:
+            continue
+        # Merge the allowed fields. Skip url/token if caller sent the masked placeholder
+        # (admin UI shows dots; don't wipe secret because of a round-trip).
+        updated = dict(ch)
+        for k in ('name', 'type', 'enabled', 'topic', 'url', 'token'):
+            if k in data:
+                v = data[k]
+                if k in ('url', 'token') and isinstance(v, str) and ('…' in v or v == '********'):
+                    continue  # untouched
+                updated[k] = v
+        channels[i] = updated
+        settings['alert_webhooks'] = channels
+        save_server_settings(settings)
+        log_audit(request.session.get('user', 'admin'), 'alerts.channel_update', f"updated webhook '{updated.get('name')}'")
+        return jsonify({'success': True, 'channel': updated})
+    return jsonify({'error': 'channel not found'}), 404
+
+
+@bp.route('/api/alert-channels/<cid>', methods=['DELETE'])
+@require_auth(roles=[ROLE_ADMIN])
+def delete_alert_channel(cid):
+    from pegaprox.api.helpers import load_server_settings, save_server_settings
+    settings = load_server_settings()
+    before = settings.get('alert_webhooks') or []
+    after = [c for c in before if c.get('id') != cid]
+    if len(after) == len(before):
+        return jsonify({'error': 'channel not found'}), 404
+    settings['alert_webhooks'] = after
+    save_server_settings(settings)
+    log_audit(request.session.get('user', 'admin'), 'alerts.channel_delete', f"removed webhook {cid}")
+    return jsonify({'success': True})
+
+
+@bp.route('/api/alert-channels/<cid>/test', methods=['POST'])
+@require_auth(roles=[ROLE_ADMIN])
+def test_alert_channel(cid):
+    from pegaprox.api.helpers import load_server_settings
+    from pegaprox.utils.webhooks import send_to_channel
+    channels = (load_server_settings() or {}).get('alert_webhooks') or []
+    ch = next((c for c in channels if c.get('id') == cid), None)
+    if not ch:
+        return jsonify({'error': 'channel not found'}), 404
+    alert = {
+        'alert_name': 'PegaProx test alert',
+        'metric': 'test',
+        'current_value': 42,
+        'threshold': 0,
+        'operator': '>',
+        'target_type': 'server',
+        'target_name': 'pegaprox',
+        'cluster_id': 'test-cluster',
+        'severity': 'info',
+        'message': 'This is a test alert triggered from PegaProx settings.',
+        'timestamp': datetime.now().isoformat(),
+    }
+    ok, detail = send_to_channel(ch, alert)
+    return jsonify({'success': ok, 'detail': detail})
 
 
 # =====================================================

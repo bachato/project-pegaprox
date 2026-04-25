@@ -39,6 +39,12 @@ def load_schedules():
         
         actions = []
         last_id = 0
+        # MK Apr 2026 (#337): name + vm_type are persisted via columns added in the
+        # db migration block. On legacy rows both come back as NULL — fall back
+        # to a sensible default so the frontend form doesn't render blank.
+        row_keys = [d[0] for d in cursor.description] if cursor.description else []
+        has_name = 'name' in row_keys
+        has_vm_type = 'vm_type' in row_keys
         for row in cursor.fetchall():
             if row['id'] > last_id:
                 last_id = row['id']
@@ -46,6 +52,7 @@ def load_schedules():
                 'id': row['id'],
                 'cluster_id': row['cluster_id'],
                 'vmid': row['vmid'],
+                'vm_type': (row['vm_type'] if has_vm_type and row['vm_type'] else 'qemu'),
                 'action': row['action'],
                 'schedule_type': row['schedule_type'],
                 'time': row['schedule_time'],
@@ -53,6 +60,7 @@ def load_schedules():
                 'date': row['schedule_date'],
                 'enabled': bool(row['enabled']),
                 'last_run': row['last_run'],
+                'name': (row['name'] if has_name and row['name'] else ''),
                 'created_by': row['created_by'],
             })
         
@@ -82,16 +90,18 @@ def save_schedules(schedules):
         cursor.execute('DELETE FROM scheduled_actions')
         
         now = datetime.now().isoformat()
+        # MK Apr 2026 (#337): include name + vm_type — previously dropped silently
         for action in schedules.get('actions', []):
             cursor.execute('''
-                INSERT INTO scheduled_actions 
-                (id, cluster_id, vmid, action, schedule_type, schedule_time, 
-                 schedule_days, schedule_date, enabled, last_run, created_by, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO scheduled_actions
+                (id, cluster_id, vmid, vm_type, action, schedule_type, schedule_time,
+                 schedule_days, schedule_date, enabled, last_run, name, created_by, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ''', (
                 action.get('id'),
                 action.get('cluster_id'),
                 action.get('vmid'),
+                action.get('vm_type', 'qemu'),
                 action.get('action', ''),
                 action.get('schedule_type', 'daily'),
                 action.get('time', ''),
@@ -99,6 +109,7 @@ def save_schedules(schedules):
                 action.get('date'),
                 1 if action.get('enabled', True) else 0,
                 action.get('last_run'),
+                action.get('name') or None,
                 action.get('created_by'),
                 now
             ))

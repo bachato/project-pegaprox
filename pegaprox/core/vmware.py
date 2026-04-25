@@ -54,6 +54,13 @@ class VMwareManager:
         self._base_url = f"https://{self.host}:{self.port}"
         self._connect_lock = threading.Lock()  # Prevent concurrent reconnect attempts
         self._connect_fail_count = 0  # Track consecutive failures for log suppression
+        # NS Apr 2026 — session-keepalive plumbing. Customers reported PegaProx
+        # losing the ESXi connection after ~30 min of low UI activity. ESXi defaults
+        # to a 30-min idle timeout on REST/SOAP sessions, so we ping the server
+        # every PING_INTERVAL seconds to keep the session warm and detect stale
+        # sessions early instead of failing the next user action.
+        self._last_ping = 0.0
+        self._last_ping_ok = 0.0
     
     def connect(self) -> bool:
         """Establish session with vCenter/ESXi via REST API.
@@ -295,8 +302,15 @@ class VMwareManager:
     
     def _soap_get_container(self, obj_type, recursive=True):
         """Helper to get all objects of a type via SOAP."""
+        # NS Apr 2026 — self-heal stale SOAP sessions. Long-running V2P jobs
+        # (hours) used to silently fail when the ESXi session expired mid-flight;
+        # we now ensure_connected once before the call, and if the call still
+        # throws NotAuthenticated we mark the manager disconnected so the next
+        # operation reconnects cleanly instead of looping on a dead session.
         if not self._soap_content:
-            return []
+            self.ensure_connected()
+            if not self._soap_content:
+                return []
         try:
             from pyVmomi import vim
             container = self._soap_content.rootFolder
@@ -308,7 +322,13 @@ class VMwareManager:
             container_view.Destroy()
             return objects
         except Exception as e:
-            logging.debug(f"[VMware:{self.id}] SOAP container error: {e}")
+            err = str(e)
+            logging.debug(f"[VMware:{self.id}] SOAP container error: {err}")
+            if 'NotAuthenticated' in err or 'session' in err.lower() or 'expired' in err.lower():
+                logging.info(f"[VMware:{self.id}] SOAP session looks stale - tearing down for reconnect")
+                self.connected = False
+                self._si = None
+                self._soap_content = None
             return []
     
     def _soap_get_managed_object(self, obj_type, moid):
@@ -727,14 +747,92 @@ class VMwareManager:
             return {'error': str(e)}
     
     def create_snapshot(self, vm_id: str, name: str, description: str = '', memory: bool = False, quiesce: bool = True) -> dict:
-        """Create a snapshot"""
+        """Create a snapshot. NS Apr 2026 — added SOAP path; REST returned 200 but did
+        nothing on SOAP-fallback connections, breaking V2P snapshot_zero pre-sync."""
+        if self._connection_type == 'soap':
+            return self._soap_create_snapshot(vm_id, name, description, memory, quiesce)
         return self.api_post(f'/api/vcenter/vm/{vm_id}/snapshots', data={
             'spec': {'name': name, 'description': description, 'memory': memory, 'quiesce': quiesce}
         })
+
+    def _soap_create_snapshot(self, vm_id: str, name: str, description: str = '',
+                                memory: bool = False, quiesce: bool = True) -> dict:
+        """NS Apr 2026 — fire CreateSnapshot_Task and verify by polling get_snapshots
+        instead of polling the task object. pyvmomi's task.info.state caching has been
+        unreliable in our environment — task gets created and snapshot appears, but
+        task.info.state never transitions to 'success' from our viewpoint."""
+        try:
+            from pyVmomi import vim
+            vm = self._soap_get_managed_object(vim.VirtualMachine, vm_id)
+            if not vm:
+                return {'error': 'VM not found'}
+            try:
+                vm.CreateSnapshot_Task(name=name, description=description,
+                                        memory=memory, quiesce=quiesce)
+            except Exception as e:
+                return {'error': f'CreateSnapshot_Task call failed: {e}'}
+            # Poll snapshot tree directly for the named entry (more reliable than task.info)
+            import time as _t
+            def _walk(snaps):
+                for s in snaps:
+                    if s.name == name:
+                        return s
+                    if s.childSnapshotList:
+                        r = _walk(s.childSnapshotList)
+                        if r: return r
+                return None
+            for _ in range(60):  # 60s should be plenty — direct vim-cmd takes ~2s
+                _t.sleep(1)
+                try:
+                    # Re-fetch VM to refresh snapshot tree
+                    vm2 = self._soap_get_managed_object(vim.VirtualMachine, vm_id)
+                    if vm2 and vm2.snapshot:
+                        found = _walk(vm2.snapshot.rootSnapshotList)
+                        if found:
+                            return {'data': {'snapshot_moid': str(found.snapshot._moId), 'name': name}}
+                except Exception:
+                    continue
+            return {'error': f'snapshot "{name}" did not appear within 60s after CreateSnapshot_Task call'}
+        except Exception as e:
+            return {'error': str(e)}
     
     def delete_snapshot(self, vm_id: str, snapshot_id: str) -> dict:
         """Delete a specific snapshot"""
+        if self._connection_type == 'soap':
+            return self._soap_delete_snapshot(vm_id, snapshot_id)
         return self.api_delete(f'/api/vcenter/vm/{vm_id}/snapshots/{snapshot_id}')
+
+    def _soap_delete_snapshot(self, vm_id: str, snapshot_id: str) -> dict:
+        """NS Apr 2026 — SOAP fallback. snapshot_id can be snapshot _moId or name."""
+        try:
+            from pyVmomi import vim
+            vm = self._soap_get_managed_object(vim.VirtualMachine, vm_id)
+            if not vm or not vm.snapshot:
+                return {'error': 'VM or snapshot tree not found'}
+            target = None
+            def _walk(snaps):
+                nonlocal target
+                for s in snaps:
+                    if str(s.snapshot._moId) == snapshot_id or s.name == snapshot_id:
+                        target = s.snapshot
+                        return
+                    if s.childSnapshotList:
+                        _walk(s.childSnapshotList)
+            _walk(vm.snapshot.rootSnapshotList)
+            if not target:
+                return {'error': f'snapshot {snapshot_id} not found'}
+            t = target.RemoveSnapshot_Task(removeChildren=False, consolidate=True)
+            import time as _t
+            for _ in range(120):
+                _t.sleep(1)
+                state = str(t.info.state)
+                if state.endswith('.success'):
+                    return {'data': 'deleted'}
+                if state.endswith('.error'):
+                    return {'error': f'remove failed: {getattr(t.info.error, "msg", t.info.error)}'}
+            return {'error': 'remove timed out'}
+        except Exception as e:
+            return {'error': str(e)}
     
     # -- Hosts --
     
@@ -1338,9 +1436,67 @@ class VMwareManager:
         
         return {'data': summary}
     
+    # NS Apr 2026 — keep idle ESXi sessions alive. ESXi default idle timeout
+    # is 30 minutes; without a periodic touch a "connected" manager will silently
+    # become unusable and the *next* user action absorbs the reconnect latency.
+    PING_INTERVAL = 240  # seconds; well below the 30-min idle timeout
+
+    def _ping_session(self) -> bool:
+        """Cheap session-validity probe. Returns True if the session still works.
+
+        On failure, marks the manager disconnected so ensure_connected() will
+        reconnect on the next call. Doesn't reconnect itself (cheap path).
+        """
+        if not self.connected:
+            return False
+        now = time.time()
+        try:
+            if self._connection_type == 'soap' and self._si is not None:
+                # CurrentTime is the canonical pyvmomi keepalive — almost free,
+                # and refreshes session-idle on the server side
+                _ = self._si.CurrentTime()
+                self._last_ping = now
+                self._last_ping_ok = now
+                return True
+            elif self.session_id:
+                import requests
+                # GET /api/session returns the session token info; very cheap
+                path = '/api/session' if self._api_style == 'modern' else '/rest/com/vmware/cis/session'
+                resp = requests.get(
+                    f"{self._base_url}{path}",
+                    headers=self._headers(),
+                    verify=self.ssl_verify,
+                    timeout=8,
+                )
+                self._last_ping = now
+                if resp.status_code in (200, 201):
+                    self._last_ping_ok = now
+                    return True
+                if resp.status_code in (401, 403, 404):
+                    logging.info(f"[VMware:{self.id}] Session ping returned HTTP {resp.status_code} - marking stale")
+                    self.connected = False
+                    self.session_id = None
+                    return False
+                # Other errors: don't tear down — could be transient
+                return True
+        except Exception as e:
+            self._last_ping = now
+            err = str(e)[:120]
+            # Network/SSL failures: don't tear down on first miss, but log
+            logging.info(f"[VMware:{self.id}] Session ping failed: {err}")
+            # After two consecutive failed pings (>= 2*PING_INTERVAL stale window), force reconnect
+            if self._last_ping_ok and (now - self._last_ping_ok) > (self.PING_INTERVAL * 2):
+                logging.warning(f"[VMware:{self.id}] No successful ping in {int(now - self._last_ping_ok)}s - marking stale")
+                self.connected = False
+                self.session_id = None
+                self._si = None
+                return False
+            return True
+        return True
+
     def ensure_connected(self) -> bool:
         """Ensure we have a valid session, reconnect if needed.
-        
+
         Also detects stale REST sessions (ESXi returns 400/401 for data calls
         even though session was created) and switches to SOAP if needed.
         Thread-safe with lock to prevent concurrent reconnect storms.
@@ -1352,7 +1508,17 @@ class VMwareManager:
                 self._consecutive_400s = 0
                 self._try_soap_fallback()
                 return self.connected
-            return True
+            # Periodic ping to detect stale sessions before user-facing calls fail
+            now = time.time()
+            if (now - getattr(self, '_last_ping', 0)) > self.PING_INTERVAL:
+                self._ping_session()
+                if not self.connected:
+                    # Ping detected a stale session; fall through to reconnect path
+                    pass
+                else:
+                    return True
+            else:
+                return True
         
         # Cooldown check (lock-free fast path)
         now = time.time()

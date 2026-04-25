@@ -4,6 +4,12 @@ on:
   issues:
     types: [opened, edited]
 
+# NS Apr 2026 — CodeQL alert: pin GITHUB_TOKEN scope. We only need to read the
+# issue body and potentially comment/label — no code, no packages, no PRs.
+permissions:
+  issues: write
+  contents: read
+
 jobs:
   validate:
     runs-on: ubuntu-latest

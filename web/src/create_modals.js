@@ -2377,10 +2377,18 @@
                     });
                     
                     if (response && response.ok) {
-                        addToast(t('passwordResetSuccess'), 'success');
-                        setCurrentPassword('');
-                        setNewPassword('');
-                        setConfirmPassword('');
+                        const data = await response.json().catch(() => ({}));
+                        setCurrentPassword(''); setNewPassword(''); setConfirmPassword('');
+                        // NS 2026-04-24 — server now invalidates ALL user sessions on password
+                        // change (incl. the current one). Force a hard redirect to login so the
+                        // user can't keep clicking in a dead UI.
+                        if (data.relogin_required) {
+                            addToast(t('passwordChangedReloginRequired') || 'Password changed — please sign in again.', 'success');
+                            // give the toast a breath, then hard-reload to wash out in-memory state
+                            setTimeout(() => { window.location.href = '/'; }, 1200);
+                        } else {
+                            addToast(t('passwordResetSuccess'), 'success');
+                        }
                     } else {
                         const data = await response.json();
                         addToast(data.error || 'Error', 'error');
@@ -2523,13 +2531,24 @@
                             <button
                                 onClick={() => setActiveTab('tokens')}
                                 className={`flex-1 px-4 py-3 text-sm font-medium transition-colors flex items-center justify-center gap-2 ${
-                                    activeTab === 'tokens' 
-                                        ? 'text-proxmox-orange border-b-2 border-proxmox-orange' 
+                                    activeTab === 'tokens'
+                                        ? 'text-proxmox-orange border-b-2 border-proxmox-orange'
                                         : 'text-gray-400 hover:text-white'
                                 }`}
                             >
                                 <Icons.Key />
                                 API Tokens
+                            </button>
+                            <button
+                                onClick={() => setActiveTab('sessions')}
+                                className={`flex-1 px-4 py-3 text-sm font-medium transition-colors flex items-center justify-center gap-2 ${
+                                    activeTab === 'sessions'
+                                        ? 'text-proxmox-orange border-b-2 border-proxmox-orange'
+                                        : 'text-gray-400 hover:text-white'
+                                }`}
+                            >
+                                <Icons.Monitor />
+                                {t('activeSessions') || 'Sessions'}
                             </button>
                         </div>
                         
@@ -2785,6 +2804,36 @@
                                         </div>
                                     </div>
 
+                                    {/* LW Apr 2026 (#299) — default nodes collapsed in cluster overview */}
+                                    <div className="pt-4 border-t border-proxmox-border">
+                                        <div className="flex items-center justify-between">
+                                            <div className="flex items-center gap-3">
+                                                <Icons.Server className="w-5 h-5 text-gray-400" />
+                                                <div>
+                                                    <p className="text-sm font-medium text-white">{t('collapseNodesDefault') || 'Collapse nodes by default'}</p>
+                                                    <p className="text-xs text-gray-500">{t('collapseNodesDefaultDesc') || 'Cluster overview starts with every node minimized'}</p>
+                                                </div>
+                                            </div>
+                                            <button
+                                                onClick={() => {
+                                                    const cur = localStorage.getItem('pegaprox-nodes-default-collapsed') === '1';
+                                                    const next = !cur;
+                                                    localStorage.setItem('pegaprox-nodes-default-collapsed', next ? '1' : '0');
+                                                    // wipe the per-node overrides so the new default takes effect immediately
+                                                    localStorage.removeItem('pegaprox-collapsed-nodes');
+                                                    // poke the dashboard to re-sync state without requiring a refresh
+                                                    try { window.dispatchEvent(new CustomEvent('pegaprox-node-collapse-pref', { detail: next })); } catch(_) {}
+                                                    addToast(next ? (t('collapseNodesOn') || 'Nodes will start collapsed') : (t('collapseNodesOff') || 'Nodes will start expanded'), 'success');
+                                                }}
+                                                className={`relative w-12 h-6 rounded-full transition-colors ${localStorage.getItem('pegaprox-nodes-default-collapsed') === '1' ? 'bg-proxmox-orange' : 'bg-proxmox-border'}`}
+                                            >
+                                                <span className={`absolute top-1 w-4 h-4 rounded-full bg-white transition-transform ${
+                                                    localStorage.getItem('pegaprox-nodes-default-collapsed') === '1' ? 'left-7' : 'left-1'
+                                                }`} />
+                                            </button>
+                                        </div>
+                                    </div>
+
                                     <p className="text-xs text-gray-500 text-center">
                                         {t('themeNote') || 'Theme changes are applied immediately and saved to your account.'}
                                     </p>
@@ -2924,9 +2973,13 @@
                                             </button>
                                         )}
                                     </div>
+
+                                    {/* NS Apr 2026 — WebAuthn / FIDO2 hardware keys. 2nd-factor only;
+                                        TOTP stays parallel. */}
+                                    <HardwareKeysPanel t={t} addToast={addToast} getAuthHeaders={getAuthHeaders} />
                                 </div>
                             )}
-                            
+
                             {/* MK: Feb 2026 - API Tokens Tab */}
                             {activeTab === 'tokens' && (
                                 <div className="space-y-4">
@@ -2935,7 +2988,7 @@
                                         <div className="p-4 bg-yellow-500/10 border border-yellow-500/40 rounded-xl">
                                             <div className="flex items-start gap-2 mb-2">
                                                 <Icons.AlertTriangle className="w-5 h-5 text-yellow-400 shrink-0 mt-0.5" />
-                                                <p className="text-yellow-400 font-medium text-sm">Copy your token now - it won't be shown again!</p>
+                                                <p className="text-yellow-400 font-medium text-sm">{t('copyTokenNow') || 'Copy your token now - it won\'t be shown again!'}</p>
                                             </div>
                                             <div className="flex items-center gap-2 mt-2">
                                                 <code className="flex-1 bg-proxmox-dark px-3 py-2 rounded text-sm text-green-400 font-mono break-all select-all border border-proxmox-border">{createdToken}</code>
@@ -3069,8 +3122,288 @@
                                     </div>
                                 </div>
                             )}
+
+                            {/* NS Apr 2026 — active-sessions self-service tab */}
+                            {activeTab === 'sessions' && (
+                                <UserSessionsPanel t={t} addToast={addToast} getAuthHeaders={getAuthHeaders} />
+                            )}
                         </div>
                     </div>
+                </div>
+            );
+        }
+
+        // NS Apr 2026 — compact panel showing the caller's own sessions with a revoke button.
+        // Kept as its own component so the hooks don't leak into SettingsModal's render.
+        // NS Apr 2026 — Hardware Keys (WebAuthn/FIDO2) registration + listing.
+        // ─ CBOR-like binary blobs come back as base64url. `fido2` sends/receives them
+        //   as byte strings; browsers work with ArrayBuffers. These two helpers convert
+        //   between base64url and ArrayBuffer on the wire.
+        function _b64urlToBuf(s) {
+            const pad = '='.repeat((4 - s.length % 4) % 4);
+            const b64 = (s + pad).replace(/-/g, '+').replace(/_/g, '/');
+            const bin = atob(b64);
+            const buf = new Uint8Array(bin.length);
+            for (let i = 0; i < bin.length; i++) buf[i] = bin.charCodeAt(i);
+            return buf.buffer;
+        }
+        function _bufToB64url(buf) {
+            const bin = String.fromCharCode(...new Uint8Array(buf));
+            return btoa(bin).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+        }
+
+        function HardwareKeysPanel({ t, addToast, getAuthHeaders }) {
+            const [available, setAvailable] = useState(true);   // optimistic; will flip if server says no
+            const [hostUsable, setHostUsable] = useState(true);
+            const [hostReason, setHostReason] = useState(null);
+            const [creds, setCreds] = useState([]);
+            const [loading, setLoading] = useState(false);
+            const [registering, setRegistering] = useState(false);
+
+            // LW Apr 2026 — WebAuthn forbids IP literals as RP IDs; detect and warn up-front
+            useEffect(() => {
+                fetch(`${API_URL}/webauthn/available`, { credentials: 'include' })
+                    .then(r => r.ok ? r.json() : null)
+                    .then(d => { if (d) { setHostUsable(!!d.host_usable); setHostReason(d.host_reason); } })
+                    .catch(() => {});
+            }, []);
+
+            const fmtTs = (ts) => ts ? new Date(ts).toLocaleString() : '—';
+
+            const load = async () => {
+                setLoading(true);
+                try {
+                    const r = await fetch(`${API_URL}/webauthn/credentials`, { credentials: 'include', headers: getAuthHeaders() });
+                    if (r.ok) {
+                        const d = await r.json();
+                        setAvailable(!!d.available);
+                        setCreds(d.credentials || []);
+                    }
+                } catch (e) { console.error('webauthn list:', e); }
+                setLoading(false);
+            };
+            useEffect(() => { load(); }, []);
+
+            const register = async () => {
+                if (!('credentials' in navigator) || !navigator.credentials.create) {
+                    addToast?.(t('browserNoWebauthn') || 'Browser does not support WebAuthn', 'error');
+                    return;
+                }
+                const name = (window.prompt(t('hardwareKeyNamePrompt') || 'Name this key (e.g. "YubiKey 5C Nano, office")', 'Security Key') || '').trim();
+                if (!name) return;
+                setRegistering(true);
+                try {
+                    // 1) begin
+                    const beginRes = await fetch(`${API_URL}/webauthn/register/begin`, {
+                        method: 'POST', credentials: 'include', headers: {...getAuthHeaders(), 'Content-Type': 'application/json'}
+                    });
+                    if (!beginRes.ok) {
+                        const e = await beginRes.json().catch(() => ({}));
+                        throw new Error(e.error || `begin failed (${beginRes.status})`);
+                    }
+                    const opts = await beginRes.json();
+                    // server's JSON still has base64url for id/challenge fields — convert
+                    const pko = opts.publicKey || opts;
+                    const publicKey = {
+                        ...pko,
+                        challenge: _b64urlToBuf(pko.challenge),
+                        user: { ...pko.user, id: _b64urlToBuf(pko.user.id) },
+                        excludeCredentials: (pko.excludeCredentials || []).map(c => ({ ...c, id: _b64urlToBuf(c.id) })),
+                    };
+                    // 2) browser ceremony
+                    const cred = await navigator.credentials.create({ publicKey });
+                    if (!cred) throw new Error('cancelled');
+                    const response = {
+                        id: cred.id,
+                        rawId: _bufToB64url(cred.rawId),
+                        type: cred.type,
+                        response: {
+                            clientDataJSON: _bufToB64url(cred.response.clientDataJSON),
+                            attestationObject: _bufToB64url(cred.response.attestationObject),
+                        },
+                        transports: (cred.response.getTransports && cred.response.getTransports()) || [],
+                        name,
+                    };
+                    // 3) finish
+                    const finishRes = await fetch(`${API_URL}/webauthn/register/finish`, {
+                        method: 'POST', credentials: 'include',
+                        headers: {...getAuthHeaders(), 'Content-Type': 'application/json'},
+                        body: JSON.stringify(response),
+                    });
+                    const d = await finishRes.json().catch(() => ({}));
+                    if (!finishRes.ok) throw new Error(d.error || `finish failed (${finishRes.status})`);
+                    addToast?.(t('hardwareKeyAdded') || `Security key "${name}" added`, 'success');
+                    load();
+                } catch (e) {
+                    console.error('webauthn register:', e);
+                    addToast?.((e && e.message) || 'Registration failed', 'error');
+                }
+                setRegistering(false);
+            };
+
+            const del = async (c) => {
+                if (!window.confirm(t('confirmRemoveKey') || `Remove "${c.name}"?`)) return;
+                const r = await fetch(`${API_URL}/webauthn/credentials/${c.id}`, {
+                    method: 'DELETE', credentials: 'include', headers: getAuthHeaders()
+                });
+                if (r.ok) { addToast?.(t('hardwareKeyRemoved') || 'Key removed', 'success'); load(); }
+                else addToast?.('Delete failed', 'error');
+            };
+
+            if (!available) {
+                return (
+                    <div className="bg-proxmox-dark border border-proxmox-border rounded-xl p-4">
+                        <h3 className="text-white font-medium mb-2 flex items-center gap-2">
+                            <Icons.Key /> {t('hardwareKeys') || 'Hardware Keys'}
+                        </h3>
+                        <p className="text-sm text-gray-400">{t('webauthnUnavailable') || 'WebAuthn is not available on this server (fido2 library not installed).'}</p>
+                    </div>
+                );
+            }
+
+            return (
+                <div className="bg-proxmox-dark border border-proxmox-border rounded-xl p-4">
+                    <div className="flex items-center justify-between mb-3">
+                        <h3 className="text-white font-medium flex items-center gap-2">
+                            <Icons.Key /> {t('hardwareKeys') || 'Hardware Keys'}
+                            <span className="text-xs text-gray-500 ml-1">({creds.length})</span>
+                        </h3>
+                        <button onClick={register} disabled={registering || !hostUsable}
+                            className="px-3 py-1.5 bg-proxmox-orange hover:bg-orange-600 rounded-lg text-sm font-medium disabled:opacity-50 flex items-center gap-2">
+                            {registering ? <Icons.RotateCw className="w-3.5 h-3.5 animate-spin" /> : <Icons.Plus className="w-3.5 h-3.5" />}
+                            {t('addHardwareKey') || 'Add Security Key'}
+                        </button>
+                    </div>
+                    {!hostUsable && hostReason === 'ip_literal' && (
+                        <div className="mb-3 p-3 rounded-lg flex items-start gap-2" style={{background: 'rgba(239, 192, 6, 0.08)', borderLeft: '3px solid #efc006'}}>
+                            <Icons.AlertTriangle className="w-4 h-4 flex-shrink-0 mt-0.5" style={{color: '#efc006'}} />
+                            <div className="text-xs text-yellow-300">
+                                <div className="font-medium">{t('webauthnIpHostTitle') || 'WebAuthn cannot be used with IP addresses'}</div>
+                                <div className="text-gray-400 mt-0.5">
+                                    {t('webauthnIpHostDesc') || 'Open PegaProx via its hostname (e.g. https://localhost:5000 or https://your-server.local:5000) to register a security key. IP addresses like 127.0.0.1 are not allowed by the WebAuthn spec.'}
+                                </div>
+                            </div>
+                        </div>
+                    )}
+                    <p className="text-xs text-gray-500 mb-3">
+                        {t('hardwareKeysDesc') || 'YubiKey, Nitrokey, Touch ID, Windows Hello. Use as second factor during login. Register multiple keys so you have a backup.'}
+                    </p>
+                    {loading && creds.length === 0 ? (
+                        <div className="text-center py-4"><Icons.RotateCw className="w-4 h-4 animate-spin text-gray-400 mx-auto" /></div>
+                    ) : creds.length === 0 ? (
+                        <p className="text-gray-500 text-sm text-center py-4">{t('noHardwareKeys') || 'No hardware keys registered yet.'}</p>
+                    ) : (
+                        <div className="space-y-2">
+                            {creds.map(c => (
+                                <div key={c.id} className="flex items-center gap-3 p-3 bg-proxmox-secondary border border-proxmox-border rounded-lg">
+                                    <div className="p-2 rounded-lg bg-blue-500/10">
+                                        <Icons.Key className="w-4 h-4 text-blue-400" />
+                                    </div>
+                                    <div className="flex-1 min-w-0">
+                                        <div className="text-sm text-white font-medium truncate">{c.name}</div>
+                                        <div className="text-xs text-gray-500 flex flex-wrap gap-3">
+                                            <span>{t('added') || 'Added'}: {fmtTs(c.created_at)}</span>
+                                            <span>{t('lastUsed') || 'Last used'}: {c.last_used_at ? fmtTs(c.last_used_at) : (t('never') || 'Never')}</span>
+                                            {c.transports?.length > 0 && <span className="text-gray-400">{c.transports.join(', ')}</span>}
+                                        </div>
+                                    </div>
+                                    <button onClick={() => del(c)}
+                                        className="px-2 py-1 bg-red-500/10 hover:bg-red-500/20 text-red-400 rounded text-xs flex items-center gap-1">
+                                        <Icons.Trash /> {t('remove') || 'Remove'}
+                                    </button>
+                                </div>
+                            ))}
+                        </div>
+                    )}
+                </div>
+            );
+        }
+
+        function UserSessionsPanel({ t, addToast, getAuthHeaders }) {
+            const [sessions, setSessions] = useState([]);
+            const [loading, setLoading] = useState(false);
+
+            const load = async () => {
+                setLoading(true);
+                try {
+                    const r = await fetch(`${API_URL}/user/sessions`, { credentials: 'include', headers: getAuthHeaders() });
+                    if (r.ok) {
+                        const d = await r.json();
+                        setSessions(d.sessions || []);
+                    }
+                } catch (e) { console.error('sessions load:', e); }
+                setLoading(false);
+            };
+            useEffect(() => { load(); }, []);
+
+            const revoke = async (s) => {
+                if (s.is_current && !window.confirm(t('confirmRevokeCurrent') || 'Revoking this session will log you out. Continue?')) return;
+                const r = await fetch(`${API_URL}/user/sessions/${encodeURIComponent(s.full_id)}`, {
+                    method: 'DELETE', credentials: 'include', headers: getAuthHeaders()
+                });
+                const d = await r.json().catch(() => ({}));
+                if (r.ok) {
+                    addToast?.(t('sessionRevoked') || 'Session revoked', 'success');
+                    if (d.self_logout) { window.location.href = '/'; return; }
+                    load();
+                } else {
+                    addToast?.(d.error || 'Revoke failed', 'error');
+                }
+            };
+
+            const fmtAgent = (ua) => {
+                if (!ua) return '—';
+                // naive UA shortener: pick a browser family or fallback to first 60 chars
+                const m = ua.match(/(Firefox|Chrome|Safari|Edge|Opera|curl|python-requests)[\/\s]?([\d.]*)/i);
+                return m ? `${m[1]} ${m[2] || ''}`.trim() : ua.substring(0, 60);
+            };
+
+            return (
+                <div className="space-y-4">
+                    <div className="flex items-center justify-between">
+                        <div>
+                            <h3 className="text-lg font-semibold text-white">{t('activeSessions') || 'Active Sessions'}</h3>
+                            <p className="text-sm text-gray-400 mt-1">{t('activeSessionsDesc') || 'Where you are currently signed in. Revoke any session you no longer recognize.'}</p>
+                        </div>
+                        <button onClick={load} className="px-3 py-1.5 bg-proxmox-dark hover:bg-proxmox-hover border border-proxmox-border rounded-lg text-sm flex items-center gap-2">
+                            <Icons.RefreshCw className={loading ? 'animate-spin' : ''} />
+                            {t('refresh') || 'Refresh'}
+                        </button>
+                    </div>
+                    {loading && sessions.length === 0 ? (
+                        <div className="flex items-center justify-center py-8 text-gray-500">
+                            <Icons.RotateCw className="w-5 h-5 animate-spin" />
+                        </div>
+                    ) : sessions.length === 0 ? (
+                        <div className="text-center text-gray-500 py-8">{t('noSessions') || 'No active sessions.'}</div>
+                    ) : (
+                        <div className="space-y-2">
+                            {sessions.map(s => (
+                                <div key={s.full_id} className="bg-proxmox-dark border border-proxmox-border rounded-lg p-3 flex items-center gap-3">
+                                    <div className={`p-2 rounded-lg ${s.is_current ? 'bg-green-500/10' : 'bg-gray-500/10'}`}>
+                                        <Icons.Monitor className={`w-5 h-5 ${s.is_current ? 'text-green-400' : 'text-gray-400'}`} />
+                                    </div>
+                                    <div className="flex-1 min-w-0">
+                                        <div className="flex items-center gap-2">
+                                            <span className="font-mono text-sm text-white">{s.ip || '—'}</span>
+                                            {s.is_current && <span className="text-[10px] px-1.5 py-0.5 rounded bg-green-500/20 text-green-400">{t('currentSession') || 'this browser'}</span>}
+                                            {s.remember && <span className="text-[10px] px-1.5 py-0.5 rounded bg-blue-500/20 text-blue-400">{t('rememberMe') || 'remember me'}</span>}
+                                        </div>
+                                        <div className="text-xs text-gray-400 truncate" title={s.user_agent}>{fmtAgent(s.user_agent)}</div>
+                                        <div className="text-xs text-gray-500">
+                                            {t('lastActive') || 'Last active'}: {s.last_activity ? new Date(s.last_activity * 1000).toLocaleString() : '—'}
+                                        </div>
+                                    </div>
+                                    <button onClick={() => revoke(s)}
+                                        className="px-3 py-1.5 bg-red-500/10 hover:bg-red-500/20 text-red-400 rounded-lg text-sm flex items-center gap-1.5"
+                                        title={t('revokeSession') || 'Revoke this session'}>
+                                        <Icons.Trash />
+                                        {t('revoke') || 'Revoke'}
+                                    </button>
+                                </div>
+                            ))}
+                        </div>
+                    )}
                 </div>
             );
         }

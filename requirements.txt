@@ -26,6 +26,9 @@ gevent-websocket>=0.10.0
 # === Two-Factor Auth ===
 pyotp>=2.9.0
 qrcode[pil]>=7.4.0
+# WebAuthn / FIDO2 hardware tokens (YubiKey, Nitrokey, Touch ID, Windows Hello).
+# Optional at runtime — feature is auto-disabled if import fails.
+fido2>=1.1.0
 
 # === LDAP Auth ===
 ldap3>=2.9.0

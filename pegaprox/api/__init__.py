@@ -28,6 +28,8 @@ def register_blueprints(app):
     from pegaprox.api.xhm import bp as xhm_bp
     from pegaprox.api.site_recovery import bp as site_recovery_bp
     from pegaprox.api.plugins import bp as plugins_bp
+    from pegaprox.api.webauthn import bp as webauthn_bp
+    from pegaprox.api.metrics_exporter import bp as metrics_exporter_bp
 
     app.register_blueprint(auth_bp)
     app.register_blueprint(users_bp)
@@ -51,6 +53,8 @@ def register_blueprints(app):
     app.register_blueprint(xhm_bp)
     app.register_blueprint(site_recovery_bp)
     app.register_blueprint(plugins_bp)
+    app.register_blueprint(webauthn_bp)
+    app.register_blueprint(metrics_exporter_bp)
 
     # Initialize WebSocket support for realtime blueprint
     from pegaprox.api.realtime import sock

@@ -15,7 +15,7 @@ from datetime import datetime, timedelta
 from flask import request, jsonify, send_file, Response
 
 from pegaprox.api.plugins import register_plugin_route
-from pegaprox.globals import cluster_managers
+from pegaprox.globals import cluster_managers, pbs_managers
 from pegaprox.constants import CONFIG_DIR
 
 PLUGIN_NAME = "Public Status Page"
@@ -74,6 +74,8 @@ def _get_config():
         'show_vm_summary': cfg.get('show_vm_summary', True),
         'show_storage': cfg.get('show_storage', True),
         'show_cluster_name': cfg.get('show_cluster_name', True),
+        'show_pbs_backups': cfg.get('show_pbs_backups', True),
+        'pbs_stale_hours': cfg.get('pbs_stale_hours', 48),
         'theme_color': cfg.get('theme_color', '#e57000'),
         'custom_logo_url': cfg.get('custom_logo_url', ''),
         'status_url': f"/status?key={cfg.get('auth_key', '')}",
@@ -88,7 +90,8 @@ def _update_config():
     data = request.get_json() or {}
     cfg = _load_config()
     for k in ['page_title', 'refresh_interval', 'show_node_details', 'show_vm_summary',
-              'show_storage', 'show_cluster_name', 'theme_color', 'custom_logo_url']:
+              'show_storage', 'show_cluster_name', 'theme_color', 'custom_logo_url',
+              'show_pbs_backups', 'pbs_stale_hours']:
         if k in data:
             cfg[k] = data[k]
     _save_config(cfg)
@@ -105,6 +108,101 @@ def _generate_key():
     _save_config(cfg)
     logging.info(f"[PLUGINS] Status page auth key regenerated")
     return {'success': True, 'auth_key': cfg['auth_key']}
+
+
+def _collect_pbs_backup_health(max_stale_hours=48):
+    """MK #309 — compact backup health snapshot per PBS.
+    One call for datastores, two per store (status + groups). Avoids listing every
+    snapshot because that's expensive at any scale — PBS already stores the last-backup
+    timestamp per group so we lean on that.
+    Returns a list of PBS dicts with datastore usage + stale-group counts.
+    """
+    result = []
+    now_ts = datetime.now().timestamp()
+    for pid, pmgr in pbs_managers.items():
+        entry = {
+            'id': pid,
+            'name': getattr(pmgr, 'name', '') or pid,
+            'host': getattr(pmgr, 'host', '') or '',
+            'connected': bool(getattr(pmgr, 'connected', False)),
+            'datastores': [],
+            'stale_groups': [],
+            'total_groups': 0,
+            'stale_count': 0,
+            'failed_verifications': 0,
+        }
+        if not entry['connected']:
+            result.append(entry); continue
+
+        try:
+            ds_resp = pmgr.get_datastores() or {}
+            ds_list = ds_resp.get('data') if isinstance(ds_resp, dict) else ds_resp
+        except Exception as e:
+            entry['error'] = f"datastores: {e}"
+            result.append(entry); continue
+
+        for ds in (ds_list or []):
+            name = ds.get('name') if isinstance(ds, dict) else None
+            if not name:
+                continue
+            ds_info = {'name': name, 'used': None, 'total': None, 'percent': None,
+                       'snapshots': 0, 'groups': 0, 'stale_groups': 0, 'latest_backup': None}
+            # usage / counts
+            try:
+                st = pmgr.get_datastore_status(name) or {}
+                d = st.get('data') or {}
+                ds_info['used'] = d.get('used')
+                ds_info['total'] = d.get('total')
+                if ds_info['total']:
+                    ds_info['percent'] = round((ds_info['used'] or 0) / ds_info['total'] * 100, 1)
+                # snapshot count sometimes reported here
+                counts = d.get('counts') or {}
+                if 'vm' in counts or 'ct' in counts or 'host' in counts:
+                    snap_sum = 0
+                    for k in ('vm', 'ct', 'host'):
+                        v = counts.get(k) or {}
+                        if isinstance(v, dict):
+                            snap_sum += v.get('snapshots', 0)
+                    ds_info['snapshots'] = snap_sum
+            except Exception:
+                pass
+            # groups — for freshness + failed-verification counts
+            try:
+                gr = pmgr.get_groups(name) or {}
+                groups = gr.get('data') if isinstance(gr, dict) else gr
+                ds_info['groups'] = len(groups or [])
+                latest_group_ts = None
+                for g in (groups or []):
+                    last_ts = g.get('last-backup')
+                    if last_ts:
+                        if latest_group_ts is None or last_ts > latest_group_ts:
+                            latest_group_ts = last_ts
+                        age_h = (now_ts - last_ts) / 3600 if isinstance(last_ts, (int, float)) else None
+                        if age_h is not None and age_h > max_stale_hours:
+                            ds_info['stale_groups'] += 1
+                            label = f"{g.get('backup-type', '?')}/{g.get('backup-id', '?')}"
+                            entry['stale_groups'].append({
+                                'store': name, 'group': label,
+                                'last_backup_ts': last_ts,
+                                'age_hours': round(age_h, 1),
+                            })
+                    # rough failed-verification signal
+                    if (g.get('last-verify-state') or g.get('verification', {}).get('state')) == 'failed':
+                        entry['failed_verifications'] += 1
+                if latest_group_ts:
+                    ds_info['latest_backup'] = latest_group_ts
+                entry['total_groups'] += ds_info['groups']
+            except Exception:
+                pass
+
+            entry['datastores'].append(ds_info)
+
+        entry['stale_count'] = len(entry['stale_groups'])
+        # cap the per-server stale list — the UI doesn't need 500 entries
+        entry['stale_groups'] = entry['stale_groups'][:20]
+        result.append(entry)
+
+    return result
 
 
 def _public_status():
@@ -211,16 +309,27 @@ def _public_status():
     for c in clusters:
         uptime_map[c['id']] = _calc_uptime(c['id'], 30)
 
+    # MK #309 — PBS backup health, only when enabled in config
+    pbs_backups = []
+    if cfg.get('show_pbs_backups', True):
+        try:
+            pbs_backups = _collect_pbs_backup_health(cfg.get('pbs_stale_hours', 48))
+        except Exception as e:
+            logging.warning(f"[status_page] pbs backup collection failed: {e}")
+
     return {
         'clusters': clusters,
         'incidents': incidents,
         'uptime': uptime_map,
+        'pbs_backups': pbs_backups,
         'config': {
             'page_title': cfg.get('page_title', 'System Status'),
             'refresh_interval': cfg.get('refresh_interval', 30),
             'show_node_details': cfg.get('show_node_details', True),
             'show_vm_summary': cfg.get('show_vm_summary', True),
             'show_storage': cfg.get('show_storage', True),
+            'show_pbs_backups': cfg.get('show_pbs_backups', True),
+            'pbs_stale_hours': cfg.get('pbs_stale_hours', 48),
             'theme_color': cfg.get('theme_color', '#e57000'),
             'custom_logo_url': cfg.get('custom_logo_url', ''),
             'maintenance_message': cfg.get('maintenance_message', ''),

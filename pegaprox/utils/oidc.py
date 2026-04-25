@@ -90,6 +90,9 @@ def get_oidc_settings() -> dict:
         'button_text': settings.get('oidc_button_text', 'Sign in with Microsoft'),
         # NS: allow disabling JWT sig verification for broken JWKS environments
         'oidc_skip_jwt_verification': settings.get('oidc_skip_jwt_verification', False),
+        # NS Apr 2026 (#188) — let admins disable TLS verification for self-hosted
+        # Authentik / Keycloak with self-signed certs. Default OFF (secure).
+        'oidc_skip_ssl_verify': settings.get('oidc_skip_ssl_verify', False),
     }
 
 
@@ -125,10 +128,12 @@ def get_oidc_endpoints(config: dict) -> dict:
     else:
         # Generic OIDC provider - try .well-known discovery first, fall back to authority URL
         authority = config.get('authority', '').rstrip('/')
-        
-        # NS: Feb 2026 - Try OpenID Connect Discovery (RFC 8414)
-        # This works for Keycloak, Okta, Auth0, Google, and any standard OIDC provider
-        # Cache discovery results for 1 hour to avoid network call on every request
+
+        # NS: Feb 2026 — Try OpenID Connect Discovery (RFC 8414)
+        # This works for Keycloak, Okta, Auth0, Google, Authentik, and any standard OIDC provider.
+        # NS Apr 2026 (#188) — bumped timeout 5→15s; loud-log discovery failures so admins notice
+        # silent fallback (which builds wrong endpoints for Authentik because its issuer URL
+        # is per-application but its authorize endpoint is one path level up).
         discovery_url = f"{authority}/.well-known/openid-configuration"
         cache_entry = _oidc_discovery_cache.get(authority)
         if cache_entry and cache_entry.get('expires', 0) > time.time():
@@ -140,24 +145,51 @@ def get_oidc_endpoints(config: dict) -> dict:
                 'userinfo': disco.get('userinfo_endpoint', f"{authority}/userinfo"),
                 'graph_me': '',
                 'graph_groups': '',
+                '_discovery_used': True,
             }
-        
+
+        skip_ssl = bool(config.get('oidc_skip_ssl_verify', False))
         try:
-            resp = requests.get(discovery_url, timeout=5)
+            resp = requests.get(discovery_url, timeout=15, verify=not skip_ssl)
             if resp.status_code == 200:
-                disco = resp.json()
-                _oidc_discovery_cache[authority] = {'data': disco, 'expires': time.time() + 3600}
-                return {
-                    'authorization': disco.get('authorization_endpoint', f"{authority}/authorize"),
-                    'token': disco.get('token_endpoint', f"{authority}/token"),
-                    'jwks': disco.get('jwks_uri', f"{authority}/.well-known/jwks.json"),
-                    'userinfo': disco.get('userinfo_endpoint', f"{authority}/userinfo"),
-                    'graph_me': '',
-                    'graph_groups': '',
-                }
+                try:
+                    disco = resp.json()
+                except Exception as parse_err:
+                    logging.warning(
+                        f"[OIDC] Discovery URL {discovery_url} returned 200 but invalid JSON: {parse_err}. "
+                        f"Falling back to manual endpoints — this likely BREAKS Authentik / non-trivial issuers."
+                    )
+                    disco = None
+                if disco:
+                    _oidc_discovery_cache[authority] = {'data': disco, 'expires': time.time() + 3600}
+                    return {
+                        'authorization': disco.get('authorization_endpoint', f"{authority}/authorize"),
+                        'token': disco.get('token_endpoint', f"{authority}/token"),
+                        'jwks': disco.get('jwks_uri', f"{authority}/.well-known/jwks.json"),
+                        'userinfo': disco.get('userinfo_endpoint', f"{authority}/userinfo"),
+                        'graph_me': '',
+                        'graph_groups': '',
+                        '_discovery_used': True,
+                    }
+            else:
+                logging.warning(
+                    f"[OIDC] Discovery {discovery_url} returned HTTP {resp.status_code}. "
+                    f"Falling back to issuer-relative endpoints; check that the issuer URL is correct "
+                    f"(Authentik issuers usually end with /application/o/<app-slug>/). "
+                    f"Set oidc_skip_ssl_verify=true if your IdP uses a self-signed cert."
+                )
+        except requests.exceptions.SSLError as e:
+            logging.warning(
+                f"[OIDC] Discovery TLS error for {discovery_url}: {e}. "
+                f"Set oidc_skip_ssl_verify=true if your IdP uses a self-signed cert."
+            )
         except Exception as e:
-            logging.debug(f"[OIDC] Discovery failed for {discovery_url}: {e}, using manual endpoints")
-        
+            logging.warning(
+                f"[OIDC] Discovery failed for {discovery_url}: {e}. "
+                f"Authorization endpoint may be wrong for non-Microsoft providers (Authentik, etc.) — "
+                f"PegaProx will guess {authority}/authorize which is often a 404."
+            )
+
         # Fallback: construct from authority URL directly
         return {
             'authorization': f"{authority}/authorize",
@@ -166,6 +198,7 @@ def get_oidc_endpoints(config: dict) -> dict:
             'userinfo': f"{authority}/userinfo",
             'graph_me': '',
             'graph_groups': '',
+            '_discovery_used': False,
         }
 
 

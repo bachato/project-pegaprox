@@ -111,6 +111,22 @@ def broadcast_resources_loop():
                             mgr.connect_to_proxmox()
                         except Exception as e:
                             logging.warning(f"[SSE] Ticket refresh failed for '{cid}': {e}")
+
+            # NS Apr 2026 — VMware keepalive. Customers reported PegaProx losing
+            # the ESXi connection over time; ESXi defaults to a 30-min idle session
+            # timeout. Run ensure_connected() (which now includes a cheap session
+            # ping) every ~4 min on a worker thread so a slow vCenter can't stall
+            # the broadcast loop.
+            if vmware_managers and loop_count % 240 == 0:
+                def _vmware_keepalive_tick():
+                    for vmw_id, vmw_mgr in list(vmware_managers.items()):
+                        try:
+                            ok = vmw_mgr.ensure_connected()
+                            if not ok:
+                                logging.debug(f"[VMware:{vmw_id}] keepalive: not connected")
+                        except Exception as e:
+                            logging.debug(f"[VMware:{vmw_id}] keepalive error: {e}")
+                threading.Thread(target=_vmware_keepalive_tick, daemon=True).start()
             
             def broadcast_for_cluster(cid, mgr):
                 """Broadcast updates for a single cluster - runs in own thread"""
@@ -235,7 +251,14 @@ def broadcast_resources_loop():
                         for vmw_id, vmw_mgr in list(vmware_managers.items()):
                             try:
                                 if not getattr(vmw_mgr, 'connected', False):
-                                    continue
+                                    # NS Apr 2026 — auto-reconnect mirrors Proxmox path.
+                                    # Otherwise a transient ESXi blip leaves us "disconnected"
+                                    # forever until the user restarts PegaProx.
+                                    try:
+                                        if not vmw_mgr.ensure_connected():
+                                            continue
+                                    except Exception:
+                                        continue
                                 result = vmw_mgr.get_vms()
                                 if 'error' not in result:
                                     broadcast_sse('vmware_vms', {

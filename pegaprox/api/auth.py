@@ -22,6 +22,7 @@ from pegaprox.utils.auth import (
     generate_api_token, create_api_token, validate_api_token,
     list_user_tokens, revoke_api_token, require_auth,
     generate_session_id, mark_admin_initialized, ensure_api_tokens_table,
+    dummy_verify_password,
     ARGON2_AVAILABLE, TOTP_AVAILABLE,
 )
 from pegaprox.utils.audit import log_audit, get_client_ip
@@ -292,21 +293,37 @@ def oidc_test_connection():
             config[short_key] = data[key]
     
     results = []
-    
+
     # Step 1: Check endpoints exist
     endpoints = get_oidc_endpoints(config)
     cloud_env = config.get('cloud_environment', 'commercial')
     env_label = {'commercial': 'Commercial', 'gcc': 'GCC', 'gcc_high': 'GCC High', 'dod': 'DoD'}.get(cloud_env, cloud_env)
     results.append({'step': 'Configuration', 'status': 'ok', 'detail': f"Provider: {config['provider']}, Tenant: {config.get('tenant_id', 'N/A')}, Cloud: {env_label}"})
-    
+
+    # NS Apr 2026 (#188) — surface whether discovery succeeded so admins immediately see when
+    # PegaProx is using the (often wrong) issuer-relative fallback.
+    if config.get('provider') != 'entra':
+        if endpoints.get('_discovery_used'):
+            results.append({'step': 'Discovery', 'status': 'ok',
+                            'detail': f"OIDC discovery succeeded — using endpoints from .well-known"})
+        else:
+            results.append({'step': 'Discovery', 'status': 'warning',
+                            'detail': f"Discovery doc not reachable at {config.get('authority','').rstrip('/')}/.well-known/openid-configuration; "
+                                      f"using issuer-relative guesses. If this is Authentik/Keycloak/non-Entra, the auth endpoint will likely be wrong."})
+
     # Step 2: Test authorization endpoint
     try:
-        resp = requests.get(endpoints['authorization'], allow_redirects=False, timeout=10)
+        skip_ssl = bool(config.get('oidc_skip_ssl_verify', False))
+        resp = requests.get(endpoints['authorization'], allow_redirects=False, timeout=10, verify=not skip_ssl)
         # Auth endpoint should return 200 or redirect
         if resp.status_code in [200, 302, 400]:
             results.append({'step': 'Authorization Endpoint', 'status': 'ok', 'detail': endpoints['authorization']})
         else:
-            results.append({'step': 'Authorization Endpoint', 'status': 'error', 'detail': f"HTTP {resp.status_code}"})
+            hint = ''
+            if resp.status_code == 404 and not endpoints.get('_discovery_used'):
+                hint = ' (discovery failed → using issuer-relative URL; for Authentik the authorize endpoint is one path level above the issuer)'
+            results.append({'step': 'Authorization Endpoint', 'status': 'error',
+                            'detail': f"HTTP {resp.status_code}{hint}"})
     except Exception as e:
         results.append({'step': 'Authorization Endpoint', 'status': 'error', 'detail': str(e)})
     
@@ -359,11 +376,16 @@ def auth_login():
         if attempt_info.get('locked_until', 0) > current_time:
             remaining = int(attempt_info['locked_until'] - current_time)
             logging.warning(f"locked ip tried to login: {client_ip}")
-            return jsonify({
-                'error': f'Too many failed attempts. Try again in {remaining} seconds.',
+            # NS 2026-04-24 — uniform 401 (audit #5 applied here too). Previously
+            # returned 429 with a distinctive body, which let an observer distinguish
+            # IP-lockout vs. user-lockout vs. bad credentials.
+            resp = jsonify({
+                'error': 'Invalid credentials',
                 'locked': True,
                 'retry_after': remaining
-            }), 429
+            })
+            resp.headers['Retry-After'] = str(remaining)
+            return resp, 401
         # cleanup old attempts
         attempt_info['attempts'] = [t for t in attempt_info.get('attempts', []) 
                                     if current_time - t < attempt_window]
@@ -376,6 +398,8 @@ def auth_login():
     username = sanitize_username(data.get('username', '').strip().lower(), max_length=64)
     password = data.get('password', '')[:256]  # limit to prevent DoS
     totp_code = sanitize_identifier(data.get('totp_code', ''), max_length=10)
+    # NS Apr 2026 — WebAuthn proof token from a prior /api/webauthn/auth/finish
+    webauthn_proof = (data.get('webauthn_proof') or '')[:256]
     
     # print(f"login: {username}")  # DEBUG - remove before commit!! - NS
     
@@ -385,17 +409,24 @@ def auth_login():
     if len(username) < 2:
         return jsonify({'error': 'Username too short'}), 400
     
-    # Check if username is locked out (additional protection against distributed attacks)
+    # Check if username is locked out (additional protection against distributed attacks).
+    # NS 2026-04-24 — security audit: uniform 401 response here prevents username
+    # enumeration. Previously returned 429 "Account temporarily locked" which let an
+    # attacker probe whether a username existed (locked vs unknown gave different
+    # status codes). Now looks identical to "invalid credentials" to the caller;
+    # Retry-After header + retry_after body key tell the UI to show a cooldown timer.
     if username in login_attempts_by_user:
         user_attempt_info = login_attempts_by_user[username]
         if user_attempt_info.get('locked_until', 0) > current_time:
             remaining = int(user_attempt_info['locked_until'] - current_time)
             logging.warning(f"Login attempt for locked user: {username} from {client_ip}, {remaining}s remaining")
-            return jsonify({
-                'error': f'Account temporarily locked. Try again in {remaining} seconds.',
-                'locked': True,
+            resp = jsonify({
+                'error': 'Invalid credentials',
+                'locked': True,          # UI hint — not status-code-leaky
                 'retry_after': remaining
-            }), 429
+            })
+            resp.headers['Retry-After'] = str(remaining)
+            return resp, 401
         # Clean up old attempts
         user_attempt_info['attempts'] = [t for t in user_attempt_info.get('attempts', []) 
                                           if current_time - t < attempt_window]
@@ -473,10 +504,10 @@ def auth_login():
                 logging.warning(f"[LDAP] Failed login for LDAP user '{username}' from {client_ip}")
                 locked = record_failed_attempt(username)
                 if locked:
-                    return jsonify({
-                        'error': f'Too many failed attempts. Try again in {lockout_time} seconds.',
-                        'locked': True, 'retry_after': lockout_time
-                    }), 429
+                    # NS: uniform 401 — retry timing via header, not status code (audit #5)
+                    resp = jsonify({'error': 'Invalid credentials', 'locked': True, 'retry_after': lockout_time})
+                    resp.headers['Retry-After'] = str(lockout_time)
+                    return resp, 401
                 return jsonify({'error': 'Invalid credentials'}), 401
             # Else: user exists locally too, fall through to local auth
         else:
@@ -495,25 +526,31 @@ def auth_login():
     if not ldap_authenticated:
         # check user exists
         if username not in users_db:
+            # NS 2026-04-24 — equalize login timing. Without this the unknown-user branch
+            # returns in <1ms while verify_password() takes ~100ms, which is a free
+            # username-enumeration oracle via response-time measurement.
+            dummy_verify_password(password)
             logging.warning(f"Login attempt for unknown user: {username} from {client_ip}")
             locked = record_failed_attempt()  # Don't track by username for unknown users
             if locked:
-                return jsonify({
-                    'error': f'Too many failed attempts. Try again in {lockout_time} seconds.',
-                    'locked': True,
-                    'retry_after': lockout_time
-                }), 429
+                # NS: uniform 401 — retry via header (audit #5, username enum prevention)
+                resp = jsonify({'error': 'Invalid credentials', 'locked': True, 'retry_after': lockout_time})
+                resp.headers['Retry-After'] = str(lockout_time)
+                return resp, 401
             return jsonify({'error': 'Invalid credentials'}), 401
-        
+
         user = users_db[username]
-        
+
         # check user is enabled
         if not user.get('enabled', True):
+            # burn the same ~100ms even on disabled accounts so existence isn't leaked
+            dummy_verify_password(password)
             logging.warning(f"Login attempt for disabled user: {username} from {client_ip}")
-            return jsonify({'error': 'Account is disabled'}), 401
-        
+            return jsonify({'error': 'Invalid credentials'}), 401
+
         # NS: LDAP-only users cannot login with local password
         if user.get('auth_source') == 'ldap' and not user.get('password_hash'):
+            dummy_verify_password(password)
             logging.warning(f"LDAP user '{username}' tried local login but has no local password")
             return jsonify({'error': 'Please use LDAP credentials to sign in'}), 401
         
@@ -522,11 +559,14 @@ def auth_login():
             logging.warning(f"Failed login attempt for user: {username} from {client_ip}")
             locked = record_failed_attempt(username)
             if locked:
-                return jsonify({
-                    'error': f'Too many failed attempts. Try again in {lockout_time} seconds.',
+                # uniform 401 — same body as IP-lockout + unknown-user paths (audit #5)
+                resp = jsonify({
+                    'error': 'Invalid credentials',
                     'locked': True,
                     'retry_after': lockout_time
-                }), 429
+                })
+                resp.headers['Retry-After'] = str(lockout_time)
+                return resp, 401
             return jsonify({'error': 'Invalid credentials'}), 401
     else:
         user = users_db[username]
@@ -534,32 +574,67 @@ def auth_login():
         # check user is enabled (even LDAP users can be disabled locally)
         if not user.get('enabled', True):
             logging.warning(f"LDAP user '{username}' is disabled locally")
-            return jsonify({'error': 'Account is disabled'}), 401
+            return jsonify({'error': 'Invalid credentials'}), 401
     
-    # check 2FA is required
-    if user.get('totp_enabled') and user.get('totp_secret'):
-        if not totp_code:
-            # Return that 2FA is required
-            return jsonify({
-                'requires_2fa': True,
-                'message': '2FA code required'
-            }), 200
-        
-        # Verify TOTP code
-        if TOTP_AVAILABLE:
-            totp = pyotp.TOTP(user['totp_secret'])
-            if not totp.verify(totp_code, valid_window=1):  # MK: security audit — accept current + 1 previous window only
-                logging.warning(f"Invalid 2FA code for user: {username} from {client_ip}")
+    # NS Apr 2026 — 2FA: TOTP and/or WebAuthn. If a user has EITHER registered,
+    # they must pass ONE of them. WebAuthn short-circuits TOTP when a fresh
+    # proof token is supplied.
+    has_totp = bool(user.get('totp_enabled') and user.get('totp_secret'))
+    has_webauthn = False
+    try:
+        _db_probe = get_db()
+        _cnt_row = _db_probe.query_one(
+            'SELECT COUNT(*) AS n FROM webauthn_credentials WHERE username = ?', (username,)
+        )
+        has_webauthn = bool(_cnt_row and _cnt_row['n'] > 0)
+    except Exception:
+        has_webauthn = False
+
+    if has_totp or has_webauthn:
+        # Path A: caller submitted a WebAuthn proof (from /api/webauthn/auth/finish)
+        if webauthn_proof and has_webauthn:
+            from pegaprox.api.webauthn import consume_webauthn_proof
+            if not consume_webauthn_proof(username, webauthn_proof):
+                logging.warning(f"Invalid WebAuthn proof for user: {username} from {client_ip}")
                 locked = record_failed_attempt(username)
                 if locked:
-                    return jsonify({
-                        'error': f'Too many failed attempts. Try again in {lockout_time} seconds.',
+                    resp = jsonify({
+                        'error': 'Invalid credentials',
                         'locked': True,
                         'retry_after': lockout_time
-                    }), 429
-                return jsonify({'error': 'Invalid 2FA code'}), 401
+                    })
+                    resp.headers['Retry-After'] = str(lockout_time)
+                    return resp, 401
+                return jsonify({'error': 'Invalid hardware-key proof'}), 401
+            # proof OK — skip TOTP entirely
+        # Path B: caller submitted a TOTP code
+        elif totp_code and has_totp:
+            if TOTP_AVAILABLE:
+                totp = pyotp.TOTP(user['totp_secret'])
+                if not totp.verify(totp_code, valid_window=1):
+                    logging.warning(f"Invalid 2FA code for user: {username} from {client_ip}")
+                    locked = record_failed_attempt(username)
+                    if locked:
+                        resp = jsonify({
+                            'error': 'Invalid credentials',
+                            'locked': True,
+                            'retry_after': lockout_time
+                        })
+                        resp.headers['Retry-After'] = str(lockout_time)
+                        return resp, 401
+                    return jsonify({'error': 'Invalid 2FA code'}), 401
+            else:
+                return jsonify({'error': '2FA is enabled but pyotp is not installed on server'}), 500
+        # Path C: nothing provided yet — tell the UI what's possible
         else:
-            return jsonify({'error': '2FA is enabled but pyotp is not installed on server'}), 500
+            methods = []
+            if has_totp: methods.append('totp')
+            if has_webauthn: methods.append('webauthn')
+            return jsonify({
+                'requires_2fa': True,
+                'message': '2FA required',
+                'methods': methods,
+            }), 200
     
     # Clear failed attempts on successful login (both IP and username)
     if client_ip in login_attempts_by_ip:
@@ -654,6 +729,66 @@ def auth_login():
     )
     
     return response
+
+# NS Apr 2026 — session self-service. Admins could see all sessions via the users API
+# already, but regular users had no way to find "where am I still logged in" or revoke
+# a lost browser. These two endpoints scope strictly to the caller's own username.
+
+@bp.route('/api/user/sessions', methods=['GET'])
+def list_own_sessions():
+    """Return the caller's active sessions, newest first."""
+    session_id = request.headers.get('X-Session-ID') or request.cookies.get('session_id')
+    current = validate_session(session_id)
+    if not current:
+        return jsonify({'error': 'not authenticated'}), 401
+    from pegaprox.utils.auth import active_sessions, sessions_lock
+    username = current['user']
+    out = []
+    with sessions_lock:
+        for sid, sess in active_sessions.items():
+            if sess.get('user') != username:
+                continue
+            out.append({
+                # show a short prefix only — full sid is a credential
+                'id': sid[:8] + '…',
+                'full_id': sid,
+                'ip': sess.get('ip'),
+                'user_agent': sess.get('user_agent'),
+                'created_at': sess.get('created_at'),
+                'last_activity': sess.get('last_activity'),
+                'remember': bool(sess.get('remember')),
+                'is_current': sid == session_id,
+            })
+    out.sort(key=lambda s: s.get('last_activity') or 0, reverse=True)
+    return jsonify({'sessions': out, 'total': len(out)})
+
+
+@bp.route('/api/user/sessions/<sid>', methods=['DELETE'])
+def revoke_own_session(sid):
+    """Revoke one of the caller's own sessions. sid = full session id."""
+    session_id = request.headers.get('X-Session-ID') or request.cookies.get('session_id')
+    current = validate_session(session_id)
+    if not current:
+        return jsonify({'error': 'not authenticated'}), 401
+    from pegaprox.utils.auth import active_sessions, sessions_lock
+    username = current['user']
+    with sessions_lock:
+        target = active_sessions.get(sid)
+        if not target:
+            return jsonify({'error': 'session not found'}), 404
+        if target.get('user') != username:
+            # MK: deliberate 404, not 403 — don't leak whether a sid belongs to someone else
+            return jsonify({'error': 'session not found'}), 404
+    invalidate_session(sid)
+    try:
+        log_audit(username, 'user.session_revoke', f"revoked session {sid[:8]}…")
+    except Exception:
+        pass
+    resp = jsonify({'success': True, 'revoked': sid[:8] + '…', 'self_logout': sid == session_id})
+    if sid == session_id:
+        resp.delete_cookie('session_id')
+    return resp
+
 
 @bp.route('/api/auth/logout', methods=['POST'])
 def auth_logout():
@@ -1062,17 +1197,23 @@ def auth_change_password():
 
     save_users(users_db)
     
-    # Invalidate sessions — admins lose ALL sessions (security: hijacked session can't persist)
+    # NS 2026-04-24 — security audit finding #1: invalidate ALL sessions including the
+    # caller's current one. If a stolen cookie is the one changing the password, we don't
+    # want it to keep access. Frontend reads relogin_required and redirects to /login.
     current_session_id = request.cookies.get('session_id') or request.headers.get('X-Session-ID')
-    if user.get('role') == ROLE_ADMIN:
-        sessions_removed = invalidate_all_user_sessions(username)  # no exception, force re-login
-    else:
-        sessions_removed = invalidate_all_user_sessions(username, except_session=current_session_id)
-    
-    logging.info(f"User '{username}' changed their password")
-    log_audit(username, 'user.password_changed', f"Password changed, {sessions_removed} other sessions invalidated")
-    
-    return jsonify({'success': True, 'sessions_invalidated': sessions_removed})
+    sessions_removed = invalidate_all_user_sessions(username)  # no except_session — all go
+
+    logging.info(f"User '{username}' changed their password — all sessions invalidated")
+    log_audit(username, 'user.password_changed', f"Password changed, {sessions_removed} session(s) invalidated (incl. current)")
+
+    resp = jsonify({
+        'success': True,
+        'sessions_invalidated': sessions_removed,
+        'relogin_required': True,       # UI hint
+    })
+    # drop the session cookie so the browser stops sending the now-dead SID
+    resp.delete_cookie('session_id')
+    return resp
 
 
 # ============================================

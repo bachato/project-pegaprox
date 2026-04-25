@@ -142,6 +142,26 @@ def verify_password(password: str, salt_b64: str, hash_b64: str) -> bool:
         return False
 
 
+# NS 2026-04-24 — timing-safe unknown-user branch. Without this the login endpoint
+# returns 100× faster on an unknown user than on a real one (dict miss vs. argon2 verify),
+# which is a free username-enumeration oracle. Burn the same ~100ms by verifying the
+# attacker-supplied password against a fixed dummy hash that never matches.
+_DUMMY_ARGON2_HASH = None
+
+def dummy_verify_password(password: str) -> None:
+    """Run an Argon2 verify that always fails, to equalize login timing."""
+    global _DUMMY_ARGON2_HASH
+    if not ARGON2_AVAILABLE:
+        return
+    try:
+        if _DUMMY_ARGON2_HASH is None:
+            _DUMMY_ARGON2_HASH = PasswordHasher().hash('timing-equalizer-not-a-real-password')
+        PasswordHasher().verify(_DUMMY_ARGON2_HASH, password if isinstance(password, str) else '')
+    except Exception:
+        # VerifyMismatchError is the expected outcome; swallow everything else too
+        pass
+
+
 def needs_password_rehash(salt_b64: str, hash_b64: str) -> bool:
     """check if pw needs upgrade to argon2"""
     if not ARGON2_AVAILABLE:
@@ -462,15 +482,37 @@ def validate_session(session_id: str) -> dict:
         save_sessions()
         return None
 
-    # MK: security audit — optional IP binding, log if IP changed (session hijack indicator)
+    # MK: security audit — IP binding. Default: log-only (mobile roaming friendly).
+    # NS 2026-04-24: when `strict_session_ip` is enabled in server settings, invalidate
+    # the session on IP change so a hijacked cookie can't be used from a different
+    # network. Default stays false — breaks mobile users otherwise.
     try:
         from flask import request as _req
         if _req and hasattr(_req, 'remote_addr'):
             current_ip = _req.remote_addr
             session_ip = session.get('ip')
             if session_ip and current_ip and session_ip != current_ip:
-                logging.warning(f"[SECURITY] Session IP changed: {session_ip} → {current_ip} (user={session.get('user')})")
-    except: pass
+                # MK: treat IPv4 vs IPv4-mapped-IPv6 of the same host as equal
+                # so a dual-stack proxy flipping doesn't punt the user
+                def _norm(ip):
+                    if not ip: return ''
+                    return ip[7:] if ip.startswith('::ffff:') else ip
+                if _norm(session_ip) != _norm(current_ip):
+                    strict = False
+                    try:
+                        from pegaprox.api.helpers import load_server_settings
+                        strict = bool((load_server_settings() or {}).get('strict_session_ip', False))
+                    except Exception:
+                        pass
+                    if strict:
+                        logging.warning(f"[SECURITY] strict_session_ip: invalidating session for {session.get('user')} — IP changed {session_ip} → {current_ip}")
+                        with sessions_lock:
+                            active_sessions.pop(session_id, None)
+                        save_sessions()
+                        return None
+                    logging.warning(f"[SECURITY] Session IP changed: {session_ip} → {current_ip} (user={session.get('user')})")
+    except Exception:
+        pass
 
     return session
 

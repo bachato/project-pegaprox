@@ -1,16 +1,14 @@
 {
-    "version": "0.9.7",
-    "build": "2026.04.19",
-    "release_date": "2026-04-19",
+    "version": "0.9.7.1",
+    "build": "2026.04.23",
+    "release_date": "2026-04-23",
     "changelog": [
-        "SSH reachability: corosync-VLAN setups now resolve the real mgmt IP for all node ops (#324)",
-        "Node Hardening: PDF/PNG export of CIS/Lynis/STIG/PegaProx audit reports",
-        "KSM Sharing visible in Node Summary, always shown (matches native PVE UI)",
-        "CVE Scanner: failed-scan nodes no longer show as green '0 CVEs' — grey dash with failed count",
-        "CVE Scanner: breathing room in corporate layout (taller stat cards, bigger gap)",
-        "Corporate dashboard: single-node clusters show 'Standalone' badge instead of 'Quorum verloren' (#326)",
-        "Disk Create modal: dropdown click no longer dismisses the modal (#323)",
-        "Translations: verbose audit, KSM sharing, snooze controls across DE/EN/FR/ES/PT/KO"
+        "Italian translation — thanks @fabriziosalmi (#332)",
+        "PBS Reports tab: executive summary, inventory, gap analysis + PDF/PNG export (#273)",
+        "Rolling update: optional --with-local-disks evacuation, HA-rerouted migrations no longer false-fail (#330, #340)",
+        "Scheduled actions: name and vm_type actually persist now (#337)",
+        "Site Recovery: OVS bridges + SDN vnets show up in the network mapping dropdown (#329)",
+        "misc: excluded-VMs button clipping, extra VNC keepalive on the RFB layer (#335, #312)"
     ],
     "min_python": "3.8",
     "download_url": "https://github.com/PegaProx/project-pegaprox/releases/latest",
@@ -190,15 +188,14 @@
         "plugins/status_page/status.html"
     ],
     "prev_changelog": [
-        "PBS Update Manager — check APT updates on Backup Servers (#240)",
-        "24h/12h time format toggle in user profile (#215)",
-        "VM wizard: filter disk formats by storage type, ZFS/LVM show raw only (#307)",
-        "VM wizard: searchable ISO dropdown, tab validation, scsihw fix (#304, #305, #306)",
-        "Email-style usernames now allowed for login (#228)",
-        "OIDC multi-group role mapping picks highest role (#293)",
-        "ESXi migration: pre-flight tool check + clearer error messages (#311)",
-        "Corporate Dark: fix gray-on-gray inputs, global search background (#303, #308)",
-        "Remove light theme from Modern Layout, auto-apply corporate theme on switch"
+        "SSH reachability: corosync-VLAN setups now resolve the real mgmt IP for all node ops (#324)",
+        "Node Hardening: PDF/PNG export of CIS/Lynis/STIG/PegaProx audit reports",
+        "KSM Sharing visible in Node Summary, always shown (matches native PVE UI)",
+        "CVE Scanner: failed-scan nodes no longer show as green '0 CVEs' — grey dash with failed count",
+        "CVE Scanner: breathing room in corporate layout (taller stat cards, bigger gap)",
+        "Corporate dashboard: single-node clusters show 'Standalone' badge instead of 'Quorum verloren' (#326)",
+        "Disk Create modal: dropdown click no longer dismisses the modal (#323)",
+        "Translations: verbose audit, KSM sharing, snooze controls across DE/EN/FR/ES/PT/KO"
     ],
     "breaking_changes": []
 }

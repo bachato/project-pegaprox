@@ -420,6 +420,251 @@
         // State management is a bit messy but it works // shrug
         // LW: Password Expiry Warning Banner - Dec 2025
         // Shows a warning when user's password is about to expire or has expired
+        // MK Apr 2026 — Capacity Outlook card. Shows the cluster's predictive forecast
+        // (pega-wma-v2 engine). At-a-glance: how many nodes the WMA projects will cross
+        // the configured threshold soon. Click to expand per-node breakdown.
+        function CapacityOutlookCard({ clusterId, t, getAuthHeaders }) {
+            const [data, setData] = useState(null);
+            const [expanded, setExpanded] = useState(false);
+
+            useEffect(() => {
+                if (!clusterId) { setData(null); return; }
+                let aborted = false;
+                const load = async () => {
+                    try {
+                        const r = await fetch(`${API_URL}/clusters/${clusterId}/predictive-analysis`, {
+                            credentials: 'include', headers: getAuthHeaders()
+                        });
+                        if (!aborted && r.ok) setData(await r.json());
+                    } catch(e) {}
+                };
+                load();
+                // refresh with the rest of the dashboard — every 30s feels right
+                const iv = setInterval(load, 30000);
+                return () => { aborted = true; clearInterval(iv); };
+            }, [clusterId]);
+
+            const byNode = data?.nodes || {};
+            const entries = Object.entries(byNode).map(([name, d]) => ({name, ...d}));
+            const risky = entries.filter(e => e.trend === 'critical' || e.trend === 'rising');
+            const worst = entries.reduce((a, b) => (a && a.score > b.score) ? a : b, null);
+            const threshold = data?.threshold || 75;
+
+            // trend → color
+            const trendColor = (tr) => tr === 'critical' ? 'var(--color-error)'
+                                     : tr === 'rising' ? 'var(--color-warning)'
+                                     : tr === 'stable' ? 'var(--color-success)'
+                                     : 'var(--corp-text-muted)';
+            const headline = risky.length > 0
+                ? `${risky.length} ${risky.length === 1 ? (t('nodeAtRisk') || 'node at risk') : (t('nodesAtRisk') || 'nodes at risk')}`
+                : (entries.length > 0 ? (t('allNodesStable') || 'all nodes stable') : '—');
+
+            return (
+                <div className="corp-overview-card" style={{cursor: entries.length > 0 ? 'pointer' : 'default'}}
+                     onClick={() => entries.length > 0 && setExpanded(v => !v)}>
+                    <div style={{width: 48, height: 48, display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0}}>
+                        <Icons.Activity className="w-6 h-6" style={{color: risky.length > 0 ? trendColor(worst?.trend) : 'var(--corp-accent)'}} />
+                    </div>
+                    <div style={{flex: 1, minWidth: 0}}>
+                        <div className="corp-overview-label">{t('capacityOutlook') || 'Capacity Outlook'}</div>
+                        <div className="corp-overview-value" style={{fontSize: 16, color: risky.length > 0 ? trendColor(worst?.trend) : 'var(--corp-text-primary, #e9ecef)'}}>
+                            {headline}
+                        </div>
+                        <div className="corp-overview-sub">
+                            {data == null ? (t('loading') || 'loading…')
+                                : worst ? `${t('peakScore') || 'peak'}: ${worst.name} ${worst.score}` : ''}
+                        </div>
+                        {expanded && entries.length > 0 && (
+                            <div onClick={e => e.stopPropagation()} style={{marginTop: 8, paddingTop: 8, borderTop: '1px solid var(--corp-border-subtle, #283844)', maxHeight: 180, overflowY: 'auto'}}>
+                                {entries.sort((a, b) => (b.score || 0) - (a.score || 0)).map(e => (
+                                    <div key={e.name} className="flex items-center justify-between py-1" style={{fontSize: 11}}>
+                                        <span style={{color: 'var(--corp-text-primary, #e9ecef)', fontFamily: 'monospace'}}>{e.name}</span>
+                                        <div className="flex items-center gap-2">
+                                            <span style={{color: 'var(--corp-text-muted)'}}>CPU~{e.cpu_forecast}% · RAM~{e.mem_forecast}%</span>
+                                            <span style={{color: trendColor(e.trend), fontWeight: 600, minWidth: 52, textAlign: 'right'}}>{e.score}</span>
+                                            <span style={{color: trendColor(e.trend), fontSize: 9, textTransform: 'uppercase', letterSpacing: 0.5}}>{e.trend}</span>
+                                        </div>
+                                    </div>
+                                ))}
+                                <div className="text-[10px] mt-2" style={{color: 'var(--corp-text-muted)'}}>
+                                    {t('wmaEngine') || 'Forecast'}: pega-wma-v2 · {t('threshold') || 'threshold'}: {threshold}
+                                </div>
+                            </div>
+                        )}
+                    </div>
+                </div>
+            );
+        }
+
+        // LW Apr 2026 — Global command palette. Opens on Ctrl/Cmd+K.
+        // Indexes: clusters, VMs, storage (from resources), and a curated action list.
+        // Keyboard-first: ↑/↓ to move, enter to pick, esc to close.
+        function CommandPalette({ t, clusters, clusterResources, clusterMetrics, selectedCluster,
+                                   onClose, onPickCluster, onPickVm, onAction }) {
+            const [query, setQuery] = useState('');
+            const [highlight, setHighlight] = useState(0);
+            const inputRef = useRef(null);
+            useEffect(() => { inputRef.current?.focus(); }, []);
+
+            // Base catalog — regenerated whenever inputs change
+            const catalog = React.useMemo(() => {
+                const out = [];
+                // Clusters
+                (clusters || []).forEach(c => {
+                    out.push({
+                        kind: 'cluster', id: `cluster-${c.id}`,
+                        title: c.name || c.id,
+                        subtitle: `${c.host || '—'}  ·  ${c.type || 'proxmox'}`,
+                        icon: 'Database',
+                        score: 0,
+                        pick: () => onPickCluster(c),
+                    });
+                });
+                // VMs — rely on loaded clusterResources for the active cluster
+                (clusterResources || []).forEach(r => {
+                    if (r.type !== 'qemu' && r.type !== 'lxc') return;
+                    out.push({
+                        kind: 'vm', id: `vm-${r.vmid}`,
+                        title: r.name || `${r.type === 'qemu' ? 'VM' : 'CT'} ${r.vmid}`,
+                        subtitle: `VMID ${r.vmid} · ${r.node || '—'} · ${r.status || ''}`,
+                        icon: r.type === 'qemu' ? 'VM' : 'Container',
+                        score: 0,
+                        pick: () => onPickVm({...r, _clusterId: selectedCluster?.id}),
+                    });
+                });
+                // Nodes (derived from clusterMetrics)
+                Object.keys(clusterMetrics || {}).forEach(n => {
+                    out.push({
+                        kind: 'node', id: `node-${n}`,
+                        title: n,
+                        subtitle: selectedCluster ? `${t('node') || 'Node'} · ${selectedCluster.name}` : (t('node') || 'Node'),
+                        icon: 'Server',
+                        score: 0,
+                        pick: () => { onPickCluster(selectedCluster || clusters[0]); },
+                    });
+                });
+                // Quick nav actions
+                const nav = [
+                    ['goto-overview', t('overview') || 'Overview', 'Home'],
+                    ['goto-resources', t('resources') || 'Resources', 'Box'],
+                    ['goto-datacenter', t('datacenter') || 'Datacenter', 'Server'],
+                    ['goto-automation', t('automation') || 'Automation', 'Zap'],
+                    ['goto-reports', t('reports') || 'Reports', 'FileText'],
+                    ['goto-plugins', t('plugins') || 'Plugins', 'Package'],
+                    ['settings',      t('settings') || 'Settings', 'Settings'],
+                    ['profile',       t('userProfile') || 'Profile', 'User'],
+                    ['logout',        t('logout') || 'Log out', 'Power'],
+                ];
+                nav.forEach(([id, title, icon]) => {
+                    out.push({
+                        kind: 'action', id: `action-${id}`, title, subtitle: t('action') || 'Action',
+                        icon, score: 0, pick: () => onAction(id),
+                    });
+                });
+                return out;
+            }, [clusters, clusterResources, clusterMetrics, selectedCluster, onPickCluster, onPickVm, onAction, t]);
+
+            // Fuzzy-ish scoring: substring > prefix > word boundary. Simple but fast.
+            const results = React.useMemo(() => {
+                const q = query.trim().toLowerCase();
+                if (!q) return catalog.slice(0, 40);
+                const scored = [];
+                for (const item of catalog) {
+                    const t1 = (item.title || '').toLowerCase();
+                    const t2 = (item.subtitle || '').toLowerCase();
+                    let s = 0;
+                    if (t1 === q) s += 100;
+                    else if (t1.startsWith(q)) s += 70;
+                    else if (t1.includes(q)) s += 40;
+                    if (t2.includes(q)) s += 10;
+                    // token-based
+                    const tokens = q.split(/\s+/).filter(Boolean);
+                    if (tokens.length > 1 && tokens.every(tok => (t1 + ' ' + t2).includes(tok))) s += 30;
+                    if (s > 0) scored.push({...item, score: s});
+                }
+                scored.sort((a, b) => b.score - a.score);
+                return scored.slice(0, 50);
+            }, [query, catalog]);
+
+            // reset highlight on query change
+            useEffect(() => { setHighlight(0); }, [query]);
+
+            const onKeyDown = (e) => {
+                if (e.key === 'Escape') { e.preventDefault(); onClose(); return; }
+                if (e.key === 'ArrowDown') { e.preventDefault(); setHighlight(h => Math.min(h + 1, results.length - 1)); return; }
+                if (e.key === 'ArrowUp') { e.preventDefault(); setHighlight(h => Math.max(h - 1, 0)); return; }
+                if (e.key === 'Enter' && results[highlight]) { e.preventDefault(); results[highlight].pick(); return; }
+            };
+
+            const IconFor = ({name}) => {
+                const I = Icons[name] || Icons.Box;
+                return <I />;
+            };
+
+            // scroll the highlighted item into view
+            useEffect(() => {
+                const el = document.querySelector(`[data-cmdpal-idx="${highlight}"]`);
+                if (el?.scrollIntoView) el.scrollIntoView({block: 'nearest'});
+            }, [highlight]);
+
+            return (
+                <div className="fixed inset-0 z-[100] flex items-start justify-center pt-20 px-4"
+                     style={{background: 'rgba(0,0,0,0.55)', backdropFilter: 'blur(4px)'}}
+                     onClick={onClose}>
+                    <div className="w-full max-w-2xl bg-proxmox-card border border-proxmox-border rounded-xl shadow-2xl overflow-hidden"
+                         onClick={e => e.stopPropagation()}
+                         style={{maxHeight: '70vh', display: 'flex', flexDirection: 'column'}}>
+                        <div className="flex items-center gap-3 p-3 border-b border-proxmox-border">
+                            <Icons.Search className="w-4 h-4 text-gray-400" />
+                            <input
+                                ref={inputRef}
+                                value={query}
+                                onChange={e => setQuery(e.target.value)}
+                                onKeyDown={onKeyDown}
+                                placeholder={t('commandPalettePlaceholder') || 'Type to search clusters, VMs, actions…'}
+                                className="flex-1 bg-transparent text-white outline-none text-base placeholder:text-gray-500"
+                            />
+                            <span className="text-xs text-gray-500">ESC</span>
+                        </div>
+                        <div className="flex-1 overflow-y-auto" style={{scrollbarWidth: 'thin'}}>
+                            {results.length === 0 ? (
+                                <div className="text-center text-sm text-gray-500 py-10">
+                                    {t('commandPaletteNoResults') || 'Nothing matches that query.'}
+                                </div>
+                            ) : results.map((r, idx) => {
+                                const kindColor = r.kind === 'cluster' ? '#49afd9'
+                                                : r.kind === 'vm' ? '#60b515'
+                                                : r.kind === 'node' ? '#e57000'
+                                                : r.kind === 'action' ? '#a178d9'
+                                                : '#728b9a';
+                                return (
+                                    <div key={r.id} data-cmdpal-idx={idx}
+                                        className={`flex items-center gap-3 px-4 py-2 cursor-pointer ${idx === highlight ? 'bg-proxmox-hover' : 'hover:bg-proxmox-dark/50'}`}
+                                        onMouseEnter={() => setHighlight(idx)}
+                                        onClick={() => r.pick()}>
+                                        <div className="p-1.5 rounded" style={{background: `${kindColor}22`, color: kindColor}}>
+                                            <IconFor name={r.icon} />
+                                        </div>
+                                        <div className="flex-1 min-w-0">
+                                            <div className="text-sm text-white truncate">{r.title}</div>
+                                            <div className="text-xs text-gray-500 truncate">{r.subtitle}</div>
+                                        </div>
+                                        <span className="text-[10px] uppercase tracking-wider px-1.5 py-0.5 rounded"
+                                              style={{color: kindColor, background: `${kindColor}15`}}>{r.kind}</span>
+                                    </div>
+                                );
+                            })}
+                        </div>
+                        <div className="border-t border-proxmox-border px-3 py-1.5 text-[11px] text-gray-500 flex items-center gap-4">
+                            <span><kbd className="px-1.5 py-0.5 rounded bg-proxmox-dark border border-proxmox-border">↑</kbd> <kbd className="px-1.5 py-0.5 rounded bg-proxmox-dark border border-proxmox-border">↓</kbd> {t('navigate') || 'navigate'}</span>
+                            <span><kbd className="px-1.5 py-0.5 rounded bg-proxmox-dark border border-proxmox-border">↵</kbd> {t('select') || 'select'}</span>
+                            <span className="ml-auto">{results.length} {t('results') || 'results'}</span>
+                        </div>
+                    </div>
+                </div>
+            );
+        }
+
         function PasswordExpiryBanner({ onChangePassword }) {
             const { t } = useTranslation();
             const { passwordExpiry, user } = useAuth();
@@ -652,10 +897,16 @@
 
             // card view state (legacy)
             const [hoveredNode, setHoveredNode] = useState(null);
-            // LW: #299 — persist node collapse state in localStorage, default all collapsed
+            // LW #299: node collapse state. Default comes from the user pref
+            // (Settings → Display → "Collapse nodes by default"); per-node overrides
+            // live alongside the marker key in the same object so we can save once.
             const [collapsedNodes, setCollapsedNodes] = useState(() => {
-                try { const saved = localStorage.getItem('pegaprox-collapsed-nodes'); if (saved) return JSON.parse(saved); } catch(e) {}
-                return { _defaultCollapsed: true };
+                try {
+                    const saved = localStorage.getItem('pegaprox-collapsed-nodes');
+                    if (saved) return JSON.parse(saved);
+                } catch(e) {}
+                const startCollapsed = localStorage.getItem('pegaprox-nodes-default-collapsed') === '1';
+                return { _defaultCollapsed: startCollapsed };
             });
             const [expandedVmLists, setExpandedVmLists] = useState({});
             const [connectors, setConnectors] = useState([]);
@@ -673,6 +924,22 @@
             const dragStartRef = useRef(null);
             const [tooltip, setTooltip] = useState(null);
             const [networkData, setNetworkData] = useState(null);
+            // LW: legend starts collapsed to avoid covering small diagrams, user can pop it open
+            const [showLegend, setShowLegend] = useState(() => {
+                try { return localStorage.getItem('pegaprox-topo-legend') === '1'; } catch(_) { return false; }
+            });
+            const toggleLegend = () => {
+                setShowLegend(v => {
+                    const n = !v;
+                    try { localStorage.setItem('pegaprox-topo-legend', n ? '1' : '0'); } catch(_) {}
+                    return n;
+                });
+            };
+            // #297 LW: free-text filter dims non-matching nodes/VMs instead of hiding them
+            const [searchQuery, setSearchQuery] = useState('');
+            // NS: cluster-wide affinity rules (fetched lazily — only when diagram is open)
+            const [affinityRules, setAffinityRules] = useState([]);
+            const [showAffinity, setShowAffinity] = useState(false);
 
             // ── common data from frozen snapshot ──
             const nodeGroups = {};
@@ -700,19 +967,23 @@
             const totalGuests = frozenResources.filter(r => r.type === 'qemu' || r.type === 'lxc').length;
 
             // ── card view helpers ──
+            // The dict stores "deviations from default": presence of a node name = toggled
+            // relative to whatever _defaultCollapsed says. So the two modes collapse into
+            // the same toggle op.
             const toggleNode = (name) => setCollapsedNodes(prev => {
                 const next = {...prev};
-                // LW: #299 — if _defaultCollapsed is set, first toggle expands (removes from dict)
-                if (next._defaultCollapsed) {
-                    // in default-collapsed mode: node NOT in dict = collapsed, IN dict = expanded
-                    next[name] ? delete next[name] : next[name] = true;
-                } else {
-                    // explicit mode: node IN dict = collapsed
-                    next[name] ? delete next[name] : next[name] = true;
-                }
+                if (next[name]) delete next[name]; else next[name] = true;
                 try { localStorage.setItem('pegaprox-collapsed-nodes', JSON.stringify(next)); } catch(e) {}
                 return next;
             });
+
+            // LW: pick up pref changes from the Settings toggle (same tab — storage event
+            // doesn't fire for own writes, hence a custom event)
+            React.useEffect(() => {
+                const onPrefChange = (e) => setCollapsedNodes({ _defaultCollapsed: !!e.detail });
+                window.addEventListener('pegaprox-node-collapse-pref', onPrefChange);
+                return () => window.removeEventListener('pegaprox-node-collapse-pref', onPrefChange);
+            }, []);
 
             const fmtMem = (bytes) => {
                 if (!bytes) return '0';
@@ -812,7 +1083,14 @@
             const nodeCount = allNodes.length;
             const pbsCount = connectedPbs.length;
             const totalCols = Math.max(nodeCount + pbsCount, 1);
-            const colSpacing = Math.max(160, 900 / (totalCols + 1));
+            // NS Apr 2026: colSpacing has to account for the per-node VM band,
+            // otherwise VMs from adjacent nodes collide horizontally. Band width
+            // is ceil-cols × VM_COL_W + optional stagger offset when rows >1.
+            const maxVmsAnyNode = Math.max(0, ...Object.values(nodeGroups || {}).map(v => (v || []).length));
+            const bandCols = Math.min(VM_COLS, Math.max(1, maxVmsAnyNode));
+            const bandStagger = maxVmsAnyNode > VM_COLS ? VM_COL_W / 2 : 0;
+            const vmBandW = maxVmsAnyNode > 0 ? bandCols * VM_COL_W + bandStagger : 0;
+            const colSpacing = Math.max(160, vmBandW + 30, 900 / (totalCols + 1));
             const svgW = Math.max(800, (totalCols + 1) * colSpacing);
 
             // position nodes centered horizontally
@@ -925,6 +1203,85 @@
             const handleMouseUp = React.useCallback(() => setIsDragging(false), []);
             const resetView = () => { setZoom(1); setPan({ x: 0, y: 0 }); };
 
+            // LW: text-based filter — compare against VM name, vmid, and node name.
+            // Returns an opacity value rather than a bool so we can dim rather than hide.
+            const matchOpacity = React.useCallback((...needles) => {
+                const q = (searchQuery || '').trim().toLowerCase();
+                if (!q) return 1;
+                const hay = needles.filter(Boolean).join(' ').toLowerCase();
+                return hay.includes(q) ? 1 : 0.2;
+            }, [searchQuery]);
+
+            // LW Apr 2026: SVG colors — the diagram was dark-mode-only and unreadable
+            // in Corporate Light. We can't use CSS vars directly inside <text fill>
+            // reliably so we switch palettes JS-side. Re-reads localStorage on each
+            // render, which is cheap.
+            const isLightCorp = isCorporate && (() => {
+                try { return localStorage.getItem('corp-theme') === 'light'; } catch(_) { return false; }
+            })();
+            const topoColor = React.useMemo(() => (isLightCorp ? {
+                text:    '#2d3a48',
+                muted:   '#617280',
+                bg:      '#ffffff',
+                accent:  '#005b8f',
+                edge:    'rgba(0,0,0,0.18)',
+                barBg:   'rgba(0,0,0,0.08)',
+                nodeIcon:'#2d3a48',
+                vmQemu:  '#005b8f',
+                vmLxc:   '#7c3aed',
+                pbsBg:   'rgba(124,58,237,0.08)',
+            } : {
+                text:    '#e9ecef',
+                muted:   '#728b9a',
+                bg:      '#12181f',
+                accent:  '#e57000',
+                edge:    'rgba(114,139,154,0.3)',
+                barBg:   'rgba(255,255,255,0.06)',
+                nodeIcon:'#e9ecef',
+                vmQemu:  '#49afd9',
+                vmLxc:   '#a178d9',
+                pbsBg:   'rgba(164,120,217,0.15)',
+            }), [isLightCorp]);
+
+            // LW Apr 2026: snap back to a centered/fit view when the topology first renders
+            // or when the user switches between cards and diagram (without this, big clusters
+            // started scrolled off-screen on first open).
+            React.useEffect(() => {
+                if (viewMode !== 'diagram') return;
+                // reset lives in a timeout so svgRef is definitely wired up
+                const t = setTimeout(() => resetView(), 0);
+                return () => clearTimeout(t);
+            }, [viewMode, topoRevision, clusterId]);
+
+            // LW: keyboard navigation on the diagram. Only fires when the diagram wrapper
+            // has focus (tabindex=0 on the wrapper) — so typing in the search box or
+            // anywhere outside doesn't steal keys.
+            React.useEffect(() => {
+                const el = diagramWrapRef.current;
+                if (!el || viewMode !== 'diagram') return;
+                const PAN = 50;
+                const onKey = (e) => {
+                    const tag = (e.target.tagName || '').toLowerCase();
+                    if (tag === 'input' || tag === 'textarea' || e.target.isContentEditable) return;
+                    switch (e.key) {
+                        case '+':
+                        case '=':
+                            e.preventDefault(); setZoom(z => Math.min(3, z * 1.15)); break;
+                        case '-':
+                        case '_':
+                            e.preventDefault(); setZoom(z => Math.max(0.3, z * 0.85)); break;
+                        case '0':
+                            e.preventDefault(); resetView(); break;
+                        case 'ArrowUp':    e.preventDefault(); setPan(p => ({...p, y: p.y + PAN})); break;
+                        case 'ArrowDown':  e.preventDefault(); setPan(p => ({...p, y: p.y - PAN})); break;
+                        case 'ArrowLeft':  e.preventDefault(); setPan(p => ({...p, x: p.x + PAN})); break;
+                        case 'ArrowRight': e.preventDefault(); setPan(p => ({...p, x: p.x - PAN})); break;
+                    }
+                };
+                el.addEventListener('keydown', onKey);
+                return () => el.removeEventListener('keydown', onKey);
+            }, [viewMode]);
+
             // ── diagram tooltips ──
             const showTooltip = (e, title, lines) => {
                 if (isDragging) return;
@@ -1030,8 +1387,14 @@
                         if (!nodeGrp[r.node]) nodeGrp[r.node] = [];
                         nodeGrp[r.node].push(r);
                     });
-                    const w = Math.max(clNodes.length, 1) * colSpacing;
-                    return { ...cl, nodeCount: clNodes.length, width: w, nodeGrp, clRes,
+                    // NS: per-cluster spacing based on the biggest node in this cluster
+                    const maxV = Math.max(0, ...Object.values(nodeGrp).map(v => v.length));
+                    const bC = Math.min(VM_COLS, Math.max(1, maxV));
+                    const bS = maxV > VM_COLS ? VM_COL_W / 2 : 0;
+                    const bandW = maxV > 0 ? bC * VM_COL_W + bS : 0;
+                    const clSpacing = Math.max(160, bandW + 30);
+                    const w = Math.max(clNodes.length, 1) * clSpacing;
+                    return { ...cl, nodeCount: clNodes.length, width: w, nodeGrp, clRes, clSpacing,
                         totalGuests: clRes.length, connPbs: (cl.pbsServers || []).filter(p => p.status !== 'disconnected') };
                 });
                 const totalW = layouts.reduce((s, c) => s + c.width, 0) + (layouts.length - 1) * 40;
@@ -1111,6 +1474,33 @@
                                 </button>
                             )}
 
+                            {viewMode === 'diagram' && !isMultiCluster && (() => {
+                                // NS: warn when offline nodes put quorum at risk.
+                                // Proxmox corosync needs >50% of configured nodes to stay quorate.
+                                // We compare online count vs total *configured* (online + offline),
+                                // NOT total connected, since a node we can still see via API but
+                                // that corosync considers down also loses its vote.
+                                const total = activeNodes.length + offlineNodes.length;
+                                if (total < 3) return null;  // 2-node and standalone don't care
+                                const online = activeNodes.length;
+                                const lost = total - online;
+                                const atRisk = online * 2 <= total;  // ≤ 50% → quorum lost
+                                if (!lost && !atRisk) return null;
+                                return (
+                                    <span title={atRisk
+                                        ? 'Cluster has lost quorum with current offline nodes.'
+                                        : 'One or more nodes offline — quorum still held.'}
+                                        style={{
+                                            display: 'inline-flex', alignItems: 'center', gap: 4,
+                                            fontSize: 11, padding: '2px 6px', borderRadius: 3, marginRight: 4,
+                                            background: atRisk ? 'rgba(245,79,71,0.15)' : 'rgba(239,192,6,0.12)',
+                                            color: atRisk ? '#f54f47' : '#efc006',
+                                            border: `1px solid ${atRisk ? 'rgba(245,79,71,0.35)' : 'rgba(239,192,6,0.3)'}`,
+                                        }}>
+                                        ⚠ {atRisk ? (t('quorumAtRisk') || 'quorum at risk') : (t('nodesOffline') || `${lost}/${total} offline`)}
+                                    </span>
+                                );
+                            })()}
                             {viewMode === 'diagram' && (
                                 <>
                                     <div className="w-px h-4 bg-gray-700 mx-2" />
@@ -1147,8 +1537,73 @@
 
                     {/* ═══ DIAGRAM VIEW ═══ */}
                     {viewMode === 'diagram' && (
-                        <div ref={diagramWrapRef} style={{position: 'relative', overflow: 'hidden', minHeight: '400px'}}>
+                        <div ref={diagramWrapRef} tabIndex={0}
+                            style={{position: 'relative', overflow: 'hidden', minHeight: '400px', outline: 'none'}}>
+                            {/* LW: inline search + toggles above the canvas. search filter dims non-matches;
+                                affinity toggle fetches rules on-demand (first toggle triggers the load). */}
+                            <div style={{
+                                display: 'flex', gap: 8, alignItems: 'center', marginBottom: 8, flexWrap: 'wrap'
+                            }}>
+                                <div style={{position: 'relative', flex: '1 1 240px', maxWidth: 360}}>
+                                    <input
+                                        type="text"
+                                        value={searchQuery}
+                                        onChange={e => setSearchQuery(e.target.value)}
+                                        placeholder={t('filterNodesVms') || 'Filter nodes or VMs…'}
+                                        aria-label="Filter topology"
+                                        style={{
+                                            width: '100%', padding: '4px 28px 4px 8px', fontSize: 12,
+                                            background: isCorporate ? 'var(--corp-surface-2, #0e141b)' : 'rgba(255,255,255,0.04)',
+                                            border: '1px solid rgba(255,255,255,0.1)', borderRadius: 4, color: '#e9ecef'
+                                        }}
+                                    />
+                                    {searchQuery && (
+                                        <button onClick={() => setSearchQuery('')}
+                                            aria-label="Clear filter"
+                                            style={{
+                                                position: 'absolute', right: 4, top: '50%', transform: 'translateY(-50%)',
+                                                background: 'transparent', border: 'none', color: '#728b9a',
+                                                cursor: 'pointer', padding: '2px 6px', fontSize: 14, lineHeight: 1
+                                            }}>×</button>
+                                    )}
+                                </div>
+                                <button
+                                    onClick={() => {
+                                        // lazy-fetch affinity rules the first time the user opens the toggle
+                                        if (!showAffinity && affinityRules.length === 0 && clusterId) {
+                                            authFetch(`${API_URL}/clusters/${clusterId}/affinity-rules`)
+                                                .then(r => r && r.ok ? r.json() : null)
+                                                .then(d => setAffinityRules(Array.isArray(d) ? d : (d?.rules || [])))
+                                                .catch(() => {});
+                                        }
+                                        setShowAffinity(v => !v);
+                                    }}
+                                    style={{
+                                        padding: '3px 8px', fontSize: 11, borderRadius: 3,
+                                        background: showAffinity ? 'rgba(229,112,0,0.18)' : 'transparent',
+                                        border: '1px solid rgba(255,255,255,0.1)',
+                                        color: showAffinity ? '#e57000' : '#728b9a', cursor: 'pointer',
+                                    }}
+                                    title={t('toggleAffinityEdges') || 'Show / hide affinity rule connections'}>
+                                    {showAffinity ? '●' : '○'} {t('affinity') || 'Affinity'}
+                                </button>
+                                <button
+                                    onClick={toggleLegend}
+                                    style={{
+                                        padding: '3px 8px', fontSize: 11, borderRadius: 3,
+                                        background: showLegend ? 'rgba(229,112,0,0.18)' : 'transparent',
+                                        border: '1px solid rgba(255,255,255,0.1)',
+                                        color: showLegend ? '#e57000' : '#728b9a', cursor: 'pointer',
+                                    }}
+                                    title={t('toggleLegend') || 'Show / hide legend'}>
+                                    {showLegend ? '●' : '○'} {t('legend') || 'Legend'}
+                                </button>
+                            </div>
                             <svg ref={svgRef}
+                                role="img"
+                                aria-label={isMultiCluster
+                                    ? `PegaProx multi-cluster topology diagram (${frozenMultiCluster.length} clusters)`
+                                    : `Cluster topology for ${clusterName} — ${allNodes.length} node(s), ${totalGuests} guests`}
                                 viewBox={`${vbX.toFixed(1)} ${vbY.toFixed(1)} ${vbW.toFixed(1)} ${vbH.toFixed(1)}`}
                                 xmlns="http://www.w3.org/2000/svg"
                                 style={{width: '100%', height: Math.min(effSvgH, 700), cursor: isDragging ? 'grabbing' : 'grab', userSelect: 'none'}}
@@ -1157,12 +1612,14 @@
                                 onMouseUp={handleMouseUp}
                                 onMouseLeave={() => { handleMouseUp(); hideTooltip(); }}
                             >
+                                <title>{isMultiCluster ? 'Multi-Cluster Topology' : `Cluster Topology: ${clusterName}`}</title>
+                                <desc>Interactive cluster topology. Drag to pan, scroll to zoom, hover over nodes or guests for details.</desc>
                                 {/* ── Multi-cluster unified diagram ── */}
                                 {isMultiCluster && mcLayout && (
                                     <React.Fragment>
                                         {/* PegaProx brand at top */}
                                         <text x={mcLayout.mcW / 2} y={MC_TIER.brand} textAnchor="middle" fill="#e57000" fontSize="16" fontWeight="700" letterSpacing="1.5">PegaProx</text>
-                                        <text x={mcLayout.mcW / 2} y={MC_TIER.brand + 14} textAnchor="middle" fill="#728b9a" fontSize="9">Multi-Cluster Topology</text>
+                                        <text x={mcLayout.mcW / 2} y={MC_TIER.brand + 14} textAnchor="middle" fill={topoColor.muted} fontSize="9">Multi-Cluster Topology</text>
 
                                         {/* edges: brand center → each cluster */}
                                         {mcLayout.layouts.map((cl, ci) => {
@@ -1194,9 +1651,9 @@
                                                         <line x1={-14} y1={6} x2={-20} y2={12} stroke="#e57000" strokeWidth={1.5} />
                                                         <line x1={14} y1={6} x2={20} y2={12} stroke="#e57000" strokeWidth={1.5} />
                                                         <circle cx={0} cy={0} r={3} fill="#e57000" />
-                                                        <text y={ICON / 2 + 14} textAnchor="middle" fill="#e9ecef" fontSize="12" fontWeight="600">{cl.name}</text>
-                                                        <text y={ICON / 2 + 26} textAnchor="middle" fill="#728b9a" fontSize="9">
-                                                            {totalN} {totalN === 1 ? 'Node' : 'Nodes'} / {cl.totalGuests} VMs
+                                                        <text y={ICON / 2 + 14} textAnchor="middle" fill={topoColor.text} fontSize="12" fontWeight="600">{cl.name}</text>
+                                                        <text y={ICON / 2 + 26} textAnchor="middle" fill={topoColor.muted} fontSize="9">
+                                                            {totalN} {totalN === 1 ? 'Node' : 'Nodes'} / {cl.totalGuests} VMs{cl.connPbs.length > 0 ? ` · ${cl.connPbs.length} PBS` : ''}
                                                         </text>
                                                     </g>
 
@@ -1229,14 +1686,14 @@
                                                                     fill="none" stroke={node.isOnline ? '#e9ecef' : '#f54f47'} strokeWidth={1.5} strokeLinecap="round" strokeLinejoin="round" />
                                                             </g>
                                                             <circle cx={22} cy={-16} r={4} fill={node.isOnline ? '#60b515' : '#f54f47'} />
-                                                            <text y={ICON / 2 + 6} textAnchor="middle" fill="#e9ecef" fontSize="11" fontWeight="500">{node.name}</text>
+                                                            <text y={ICON / 2 + 6} textAnchor="middle" fill={topoColor.text} fontSize="11" fontWeight="500">{node.name}</text>
                                                             {node.isOnline && (
                                                                 <React.Fragment>
-                                                                    <text x={-26} y={ICON / 2 + 18} fill="#728b9a" fontSize="7" textAnchor="end">CPU</text>
+                                                                    <text x={-26} y={ICON / 2 + 18} fill={topoColor.muted} fontSize="7" textAnchor="end">CPU</text>
                                                                     <rect x={-24} y={ICON / 2 + 13} width={48} height={3} rx={1.5} fill="rgba(255,255,255,0.06)" />
                                                                     <rect x={-24} y={ICON / 2 + 13} width={Math.max(1, 48 * node.cpuPct / 100)} height={3} rx={1.5} fill={barColor(node.cpuPct)} />
                                                                     <text x={27} y={ICON / 2 + 18} fill={barColor(node.cpuPct)} fontSize="8">{node.cpuPct.toFixed(0)}%</text>
-                                                                    <text x={-26} y={ICON / 2 + 27} fill="#728b9a" fontSize="7" textAnchor="end">RAM</text>
+                                                                    <text x={-26} y={ICON / 2 + 27} fill={topoColor.muted} fontSize="7" textAnchor="end">RAM</text>
                                                                     <rect x={-24} y={ICON / 2 + 22} width={48} height={3} rx={1.5} fill="rgba(255,255,255,0.06)" />
                                                                     <rect x={-24} y={ICON / 2 + 22} width={Math.max(1, 48 * node.ramPct / 100)} height={3} rx={1.5} fill={barColor(node.ramPct)} />
                                                                     <text x={27} y={ICON / 2 + 27} fill={barColor(node.ramPct)} fontSize="8">{node.ramPct.toFixed(0)}%</text>
@@ -1286,11 +1743,11 @@
                                                                     )}
                                                                     <circle cx={vm.type === 'qemu' ? 16 : 16} cy={-10} r={3}
                                                                         fill={vm.status === 'running' ? '#60b515' : '#728b9a'} />
-                                                                    <text y={22} textAnchor="middle" fill="#e9ecef" fontSize="10">
+                                                                    <text y={22} textAnchor="middle" fill={topoColor.text} fontSize="10">
                                                                         <title>{vm.name || `${vm.type === 'qemu' ? 'VM' : 'CT'} ${vm.vmid}`}</title>
-                                                                        {(vm.name || `${vm.type === 'qemu' ? 'VM' : 'CT'} ${vm.vmid}`).substring(0, 24)}{(vm.name || '').length > 24 ? '…' : ''}
+                                                                        {(vm.name || `${vm.type === 'qemu' ? 'VM' : 'CT'} ${vm.vmid}`).substring(0, 16)}{(vm.name || '').length > 16 ? '…' : ''}
                                                                     </text>
-                                                                    <text y={33} textAnchor="middle" fill="#728b9a" fontSize="9">{vm.vmid}</text>
+                                                                    <text y={33} textAnchor="middle" fill={topoColor.muted} fontSize="9">{vm.vmid}</text>
                                                                 </g>
                                                             ))}
                                                         </React.Fragment>
@@ -1327,7 +1784,7 @@
 
                                 {/* PegaProx branding */}
                                 <text x={clusterX} y={28} textAnchor="middle" fill="#e57000" fontSize="16" fontWeight="700" letterSpacing="1.5">PegaProx</text>
-                                <text x={clusterX} y={42} textAnchor="middle" fill="#728b9a" fontSize="9">Cluster Topology</text>
+                                <text x={clusterX} y={42} textAnchor="middle" fill={topoColor.muted} fontSize="9">Cluster Topology</text>
 
                                 {/* cluster root - router icon */}
                                 <g transform={`translate(${clusterX}, ${TIER_Y.cluster})`}
@@ -1345,14 +1802,14 @@
                                     <line x1={-14} y1={6} x2={-20} y2={12} stroke="#e57000" strokeWidth={1.5} />
                                     <line x1={14} y1={6} x2={20} y2={12} stroke="#e57000" strokeWidth={1.5} />
                                     <circle cx={0} cy={0} r={3} fill="#e57000" />
-                                    <text y={ICON / 2 + 14} textAnchor="middle" fill="#e9ecef" fontSize="13" fontWeight="600">{clusterName}</text>
+                                    <text y={ICON / 2 + 14} textAnchor="middle" fill={topoColor.text} fontSize="13" fontWeight="600">{clusterName}</text>
                                     <text y={ICON / 2 + 28} textAnchor="middle" fill="#60b515" fontSize="10">ONLINE</text>
                                 </g>
 
                                 {/* node icons - switch style */}
                                 {diagramNodes.map(node => (
                                     <g key={node.name} transform={`translate(${node.x}, ${TIER_Y.nodes})`}
-                                        style={{cursor: 'pointer'}}
+                                        style={{cursor: 'pointer', opacity: matchOpacity(node.name), transition: 'opacity 0.2s'}}
                                         onMouseEnter={(e) => showTooltip(e, node.name, [
                                             node.isOnline ? 'Online' : 'Offline',
                                             node.isOnline ? `CPU ${node.cpuPct.toFixed(0)}%` : null,
@@ -1366,15 +1823,15 @@
                                                 fill="none" stroke={node.isOnline ? '#e9ecef' : '#f54f47'} strokeWidth={1.5} strokeLinecap="round" strokeLinejoin="round" />
                                         </g>
                                         <circle cx={22} cy={-16} r={4} fill={node.isOnline ? '#60b515' : '#f54f47'} />
-                                        <text y={ICON / 2 + 6} textAnchor="middle" fill="#e9ecef" fontSize="12" fontWeight="500">{node.name}</text>
+                                        <text y={ICON / 2 + 6} textAnchor="middle" fill={topoColor.text} fontSize="12" fontWeight="500">{node.name}</text>
                                         {/* CPU/RAM utilization bars */}
                                         {node.isOnline && (
                                             <React.Fragment>
-                                                <text x={-26} y={ICON / 2 + 18} fill="#728b9a" fontSize="7" textAnchor="end">CPU</text>
+                                                <text x={-26} y={ICON / 2 + 18} fill={topoColor.muted} fontSize="7" textAnchor="end">CPU</text>
                                                 <rect x={-24} y={ICON / 2 + 13} width={48} height={3} rx={1.5} fill="rgba(255,255,255,0.06)" />
                                                 <rect x={-24} y={ICON / 2 + 13} width={Math.max(1, 48 * node.cpuPct / 100)} height={3} rx={1.5} fill={barColor(node.cpuPct)} />
                                                 <text x={27} y={ICON / 2 + 18} fill={barColor(node.cpuPct)} fontSize="8">{node.cpuPct.toFixed(0)}%</text>
-                                                <text x={-26} y={ICON / 2 + 27} fill="#728b9a" fontSize="7" textAnchor="end">RAM</text>
+                                                <text x={-26} y={ICON / 2 + 27} fill={topoColor.muted} fontSize="7" textAnchor="end">RAM</text>
                                                 <rect x={-24} y={ICON / 2 + 22} width={48} height={3} rx={1.5} fill="rgba(255,255,255,0.06)" />
                                                 <rect x={-24} y={ICON / 2 + 22} width={Math.max(1, 48 * node.ramPct / 100)} height={3} rx={1.5} fill={barColor(node.ramPct)} />
                                                 <text x={27} y={ICON / 2 + 27} fill={barColor(node.ramPct)} fontSize="8">{node.ramPct.toFixed(0)}%</text>
@@ -1384,17 +1841,51 @@
                                             <text y={ICON / 2 + 19} textAnchor="middle" fill="#f54f47" fontSize="10">OFFLINE</text>
                                         )}
                                         {node.totalVms === 0 && (
-                                            <text y={ICON / 2 + 38} textAnchor="middle" fill="#728b9a" fontSize="9" fontStyle="italic">
+                                            <text y={ICON / 2 + 38} textAnchor="middle" fill={topoColor.muted} fontSize="9" fontStyle="italic">
                                                 {t('noGuests') || 'no guests'}
                                             </text>
                                         )}
                                     </g>
                                 ))}
 
+                                {/* NS: affinity edges — together = green solid, separate = red dashed.
+                                    Draws all-pairs within a rule; with large rules this gets busy, but
+                                    it correctly reflects Proxmox semantics (rule applies pairwise). */}
+                                {showAffinity && !isMultiCluster && (() => {
+                                    const vmPosById = {};
+                                    diagramNodes.forEach(n => n.vms.forEach(v => { vmPosById[String(v.vmid)] = {x: v.x, y: v.y, node: n.name, name: v.name}; }));
+                                    const edges = [];
+                                    (affinityRules || []).forEach(rule => {
+                                        const ids = (rule.vms || rule.vm_ids || []).map(String);
+                                        const dashed = rule.type === 'separate';
+                                        const color = dashed ? '#f54f47' : '#60b515';
+                                        for (let i = 0; i < ids.length; i++) {
+                                            for (let j = i + 1; j < ids.length; j++) {
+                                                const a = vmPosById[ids[i]];
+                                                const b = vmPosById[ids[j]];
+                                                if (!a || !b) continue;
+                                                const fade = Math.min(matchOpacity(a.name, ids[i], a.node), matchOpacity(b.name, ids[j], b.node));
+                                                edges.push({a, b, color, dashed, fade, key: `aff-${rule.id}-${ids[i]}-${ids[j]}`});
+                                            }
+                                        }
+                                    });
+                                    return edges.map(e => (
+                                        <line key={e.key}
+                                            x1={e.a.x} y1={e.a.y} x2={e.b.x} y2={e.b.y}
+                                            stroke={e.color} strokeWidth={1.5}
+                                            strokeDasharray={e.dashed ? '5,4' : undefined}
+                                            opacity={0.6 * e.fade} />
+                                    ));
+                                })()}
+
                                 {/* VM/CT icons grouped under their node */}
                                 {diagramNodes.map(node => node.vms.map(vm => (
                                     <g key={`vm-${vm.vmid}-${vm.node}`} transform={`translate(${vm.x}, ${vm.y})`}
-                                        style={{cursor: onVmClick ? 'pointer' : 'default'}}
+                                        style={{
+                                            cursor: onVmClick ? 'pointer' : 'default',
+                                            opacity: matchOpacity(vm.name, String(vm.vmid), node.name),
+                                            transition: 'opacity 0.2s',
+                                        }}
                                         onClick={onVmClick ? () => onVmClick(vm) : undefined}
                                         onMouseEnter={(e) => showTooltip(e,
                                             vm.name || `${vm.type === 'qemu' ? 'VM' : 'CT'} ${vm.vmid}`,
@@ -1421,11 +1912,11 @@
                                         )}
                                         <circle cx={16} cy={-10} r={3}
                                             fill={vm.status === 'running' ? '#60b515' : '#728b9a'} />
-                                        <text y={22} textAnchor="middle" fill="#e9ecef" fontSize="10">
+                                        <text y={22} textAnchor="middle" fill={topoColor.text} fontSize="10">
                                             <title>{vm.name || `${vm.type === 'qemu' ? 'VM' : 'CT'} ${vm.vmid}`}</title>
-                                            {(vm.name || `${vm.type === 'qemu' ? 'VM' : 'CT'} ${vm.vmid}`).substring(0, 24)}{(vm.name || '').length > 24 ? '…' : ''}
+                                            {(vm.name || `${vm.type === 'qemu' ? 'VM' : 'CT'} ${vm.vmid}`).substring(0, 16)}{(vm.name || '').length > 16 ? '…' : ''}
                                         </text>
-                                        <text y={33} textAnchor="middle" fill="#728b9a" fontSize="9">{vm.vmid}</text>
+                                        <text y={33} textAnchor="middle" fill={topoColor.muted} fontSize="9">{vm.vmid}</text>
                                     </g>
                                 )))}
 
@@ -1445,8 +1936,8 @@
                                         <line x1={-14} y1={-6} x2={-14} y2={6} stroke="#60b515" strokeWidth={1.3} />
                                         <line x1={14} y1={-6} x2={14} y2={6} stroke="#60b515" strokeWidth={1.3} />
                                         <circle cx={18} cy={-10} r={3} fill={pbs.status === 'connected' ? '#60b515' : '#efc006'} />
-                                        <text y={ICON / 2 + 6} textAnchor="middle" fill="#e9ecef" fontSize="11">{pbs.name || pbs.host}</text>
-                                        <text y={ICON / 2 + 18} textAnchor="middle" fill="#728b9a" fontSize="9">Backup Server</text>
+                                        <text y={ICON / 2 + 6} textAnchor="middle" fill={topoColor.text} fontSize="11">{pbs.name || pbs.host}</text>
+                                        <text y={ICON / 2 + 18} textAnchor="middle" fill={topoColor.muted} fontSize="9">Backup Server</text>
                                     </g>
                                 ))}
                                     </React.Fragment>
@@ -1465,6 +1956,50 @@
                                     {tooltip.lines.map((line, i) => (
                                         <div key={i} style={{color: '#728b9a', fontSize: '11px', lineHeight: '16px'}}>{line}</div>
                                     ))}
+                                </div>
+                            )}
+
+                            {/* LW: legend overlay — opt-in, positioned bottom-right so it doesn't cover the brand label */}
+                            {showLegend && (
+                                <div style={{
+                                    position: 'absolute', right: 8, bottom: 8, pointerEvents: 'auto',
+                                    background: 'var(--corp-surface-3, rgba(18,24,32,0.92))',
+                                    border: '1px solid var(--corp-border-medium, rgba(255,255,255,0.12))',
+                                    borderRadius: 6, padding: '8px 10px', zIndex: 40, fontSize: 11,
+                                    color: '#cbd5e1', minWidth: 180, backdropFilter: 'blur(6px)',
+                                }}>
+                                    <div style={{display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 6, fontWeight: 600, color: '#e9ecef'}}>
+                                        <span>{t('legend') || 'Legend'}</span>
+                                        <button onClick={toggleLegend} aria-label="Close legend"
+                                            style={{background: 'transparent', border: 'none', color: '#728b9a', cursor: 'pointer', fontSize: 14, lineHeight: 1, padding: 0}}>×</button>
+                                    </div>
+                                    <div style={{display: 'grid', gridTemplateColumns: 'auto 1fr', gap: '4px 8px', alignItems: 'center'}}>
+                                        <span style={{width: 10, height: 10, borderRadius: '50%', background: '#60b515', display: 'inline-block'}} />
+                                        <span>{t('legendOnline') || 'Node online'}</span>
+                                        <span style={{width: 10, height: 10, borderRadius: '50%', background: '#f54f47', display: 'inline-block'}} />
+                                        <span>{t('legendOffline') || 'Node offline'}</span>
+                                        <span style={{width: 10, height: 4, background: barColor(30), display: 'inline-block'}} />
+                                        <span>{t('legendLowLoad') || 'CPU/RAM < 60 %'}</span>
+                                        <span style={{width: 10, height: 4, background: barColor(70), display: 'inline-block'}} />
+                                        <span>{t('legendMidLoad') || 'CPU/RAM 60–80 %'}</span>
+                                        <span style={{width: 10, height: 4, background: barColor(90), display: 'inline-block'}} />
+                                        <span>{t('legendHighLoad') || 'CPU/RAM > 80 %'}</span>
+                                        <span style={{width: 10, height: 10, background: '#3b82f6', display: 'inline-block', borderRadius: 2}} />
+                                        <span>{t('legendVm') || 'VM / LXC running'}</span>
+                                        <span style={{width: 10, height: 10, background: '#475569', display: 'inline-block', borderRadius: 2}} />
+                                        <span>{t('legendVmStopped') || 'VM / LXC stopped'}</span>
+                                        {showAffinity && (
+                                            <>
+                                                <span style={{display: 'inline-block', width: 16, borderTop: '2px dashed #f54f47'}} />
+                                                <span>{t('legendAntiAff') || 'Anti-affinity edge'}</span>
+                                                <span style={{display: 'inline-block', width: 16, borderTop: '2px solid #60b515'}} />
+                                                <span>{t('legendAff') || 'Affinity edge'}</span>
+                                            </>
+                                        )}
+                                    </div>
+                                    <div style={{marginTop: 6, paddingTop: 6, borderTop: '1px dashed rgba(255,255,255,0.08)', color: '#728b9a', fontSize: 10}}>
+                                        {t('legendHint') || 'Drag to pan · Scroll to zoom · Hover for details'}
+                                    </div>
                                 </div>
                             )}
                         </div>
@@ -1535,7 +2070,7 @@
                                     const hidden = sorted.length - 5;
 
                                     return (
-                                        <div key={node.name} className="flex flex-col items-center" style={{minWidth: '200px', maxWidth: '300px', flex: '1 1 0'}}>
+                                        <div key={node.name} className="flex flex-col items-center" style={{minWidth: '220px', flex: '1 1 280px'}}>
                                             <div
                                                 className={`w-full cursor-pointer ${isCorporate ? '' : 'rounded-lg'}`}
                                                 style={{
@@ -1779,9 +2314,34 @@
                         const online = (nodes.data || nodes || []).find(n => n.status === 'online');
                         if (!online) return;
                         const nodeName = online.node || online.name;
-                        // bridges
+                        // bridges — MK Apr 2026 (#329): include Linux bridges, OVS bridges, and SDN vnets.
+                        // the old filter only caught "type=bridge" or vmbr* names, so OVSBridge + SDN
+                        // vnets were invisible even when actually configured on the node.
+                        const collected = [];
                         const br = await authFetch(`${API_URL}/clusters/${clusterId}/nodes/${nodeName}/networks`);
-                        if (br && br.ok) { const d = await br.json(); setBridges((d.data || d || []).filter(n => n.type === 'bridge' || n.iface?.startsWith('vmbr'))); }
+                        if (br && br.ok) {
+                            const d = await br.json();
+                            const items = (d.data || d || []).filter(n =>
+                                n.type === 'bridge' ||
+                                n.type === 'OVSBridge' ||
+                                n.iface?.startsWith('vmbr')
+                            );
+                            items.forEach(n => collected.push({ iface: n.iface, type: n.type || 'bridge' }));
+                        }
+                        // SDN vnets live on a separate endpoint and don't show up under /nodes/.../network
+                        try {
+                            const sd = await authFetch(`${API_URL}/clusters/${clusterId}/datacenter/sdn`);
+                            if (sd && sd.ok) {
+                                const sdnData = await sd.json();
+                                (sdnData.vnets || []).forEach(v => {
+                                    const name = v.vnet || v.name;
+                                    if (name && !collected.some(c => c.iface === name)) {
+                                        collected.push({ iface: name, type: 'sdn-vnet', zone: v.zone });
+                                    }
+                                });
+                            }
+                        } catch(_) { /* sdn endpoint optional */ }
+                        setBridges(collected);
                         // storages
                         const st = await authFetch(`${API_URL}/clusters/${clusterId}/nodes/${nodeName}/storage`);
                         if (st && st.ok) { const d = await st.json(); setStorages(d.data || d || []); }
@@ -1984,12 +2544,12 @@
                                         <div key={i} className="flex items-center gap-2 mb-2">
                                             <select value={row.src} onChange={e => setNetMapRows(prev => prev.map((r,j) => j === i ? {...r, src: e.target.value} : r))} className="flex-1 bg-proxmox-dark border border-proxmox-border rounded p-1.5 text-xs">
                                                 <option value="">{t('sourceBridge') || 'Source Bridge'}</option>
-                                                {sourceBridges.map(b => <option key={b.iface} value={b.iface}>{b.iface}</option>)}
+                                                {sourceBridges.map(b => <option key={b.iface} value={b.iface}>{b.iface}{b.type === 'OVSBridge' ? ' (OVS)' : b.type === 'sdn-vnet' ? ` (SDN${b.zone ? '/' + b.zone : ''})` : ''}</option>)}
                                             </select>
                                             <Icons.ArrowRight className="w-4 h-4 text-gray-500 shrink-0" />
                                             <select value={row.tgt} onChange={e => setNetMapRows(prev => prev.map((r,j) => j === i ? {...r, tgt: e.target.value} : r))} className="flex-1 bg-proxmox-dark border border-proxmox-border rounded p-1.5 text-xs">
                                                 <option value="">{t('targetBridge') || 'Target Bridge'}</option>
-                                                {targetBridges.map(b => <option key={b.iface} value={b.iface}>{b.iface}</option>)}
+                                                {targetBridges.map(b => <option key={b.iface} value={b.iface}>{b.iface}{b.type === 'OVSBridge' ? ' (OVS)' : b.type === 'sdn-vnet' ? ` (SDN${b.zone ? '/' + b.zone : ''})` : ''}</option>)}
                                             </select>
                                             <button onClick={() => setNetMapRows(prev => prev.filter((_,j) => j !== i))} className="text-red-400 hover:text-red-300"><Icons.Trash2 className="w-3.5 h-3.5" /></button>
                                         </div>
@@ -2207,6 +2767,8 @@
             const [showUserMenu, setShowUserMenu] = useState(false);
             const [showSettings, setShowSettings] = useState(false);
             const [showProfile, setShowProfile] = useState(false);
+            // LW Apr 2026 — global fuzzy-search palette (Ctrl/Cmd+K)
+            const [showCommandPalette, setShowCommandPalette] = useState(false);
             const [wsConnected, setWsConnected] = useState(false);
             const wsConnectedRef = useRef(false);  // NS: Ref for health check access
             const [tasks, setTasks] = useState([]);
@@ -2238,6 +2800,15 @@
             const [pbsTasks, setPbsTasks] = useState([]);
             const [pbsJobs, setPbsJobs] = useState({});
             const [pbsActiveTab, setPbsActiveTab] = useState('dashboard');
+            // MK Apr 2026: #273 — PBS Reports state
+            const [pbsReportDays, setPbsReportDays] = useState(30);
+            const [pbsReportSummary, setPbsReportSummary] = useState(null);
+            const [pbsReportInventory, setPbsReportInventory] = useState(null);
+            const [pbsReportGap, setPbsReportGap] = useState(null);
+            const [pbsReportGapCluster, setPbsReportGapCluster] = useState('');
+            const [pbsReportSubTab, setPbsReportSubTab] = useState('summary');  // summary | inventory | gap
+            const [pbsReportSearch, setPbsReportSearch] = useState('');
+            const [pbsReportLoading, setPbsReportLoading] = useState(false);
             const [pbsSelectedStore, setPbsSelectedStore] = useState(null);
             const [showAddPBS, setShowAddPBS] = useState(false);
             const [pbsLoading, setPbsLoading] = useState(false);
@@ -2599,6 +3170,9 @@
             const [automationSubTab, setAutomationSubTab] = useState('schedules');
             const [clusterAlerts, setClusterAlerts] = useState([]);
             const [showAlertModal, setShowAlertModal] = useState(false);
+            // NS Apr 2026 #213 — channels loaded lazily when modal opens
+            const [alertChannels, setAlertChannels] = useState([]);
+            const [pickedChannels, setPickedChannels] = useState(['email']);
             const [clusterAffinityRules, setClusterAffinityRules] = useState([]);
             const [showAffinityModal, setShowAffinityModal] = useState(false);
             
@@ -3440,10 +4014,15 @@
                 globalSearchTimerRef.current = setTimeout(() => performGlobalSearch(query), 300);
             };
             
-            // NS: ctrl+k shortcut like every other app these days
+            // NS: Ctrl/Cmd+K opens the command palette (LW Apr 2026 — promoted from
+            // plain header-search-focus to a proper fullscreen palette with actions).
+            // The header input still focuses with "/"  for the old flow.
             React.useEffect(() => {
                 const handleKeyDown = (e) => {
                     if ((e.ctrlKey || e.metaKey) && e.key === 'k') {
+                        e.preventDefault();
+                        setShowCommandPalette(true);
+                    } else if (e.key === '/' && !['INPUT', 'TEXTAREA'].includes(e.target.tagName)) {
                         e.preventDefault();
                         if (globalSearchRef.current) {
                             globalSearchRef.current.focus();
@@ -4963,6 +5542,38 @@
                     if (resp && resp.ok) setPbsJobs(await resp.json());
                 } catch (e) { console.warn('PBS jobs error:', e); }
             };
+
+            // MK Apr 2026: #273 — PBS Reports fetchers
+            const fetchPBSReportSummary = async (pbsId, days) => {
+                setPbsReportLoading(true);
+                try {
+                    const resp = await authFetch(`${API_URL}/pbs/${pbsId}/reports/summary?days=${days}`);
+                    if (resp && resp.ok) setPbsReportSummary(await resp.json());
+                    else setPbsReportSummary(null);
+                } catch (e) { console.warn('PBS report summary error:', e); setPbsReportSummary(null); }
+                finally { setPbsReportLoading(false); }
+            };
+
+            const fetchPBSReportInventory = async (pbsId, days) => {
+                setPbsReportLoading(true);
+                try {
+                    const resp = await authFetch(`${API_URL}/pbs/${pbsId}/reports/inventory?days=${days || 0}`);
+                    if (resp && resp.ok) setPbsReportInventory(await resp.json());
+                    else setPbsReportInventory(null);
+                } catch (e) { console.warn('PBS inventory error:', e); setPbsReportInventory(null); }
+                finally { setPbsReportLoading(false); }
+            };
+
+            const fetchPBSReportGap = async (pbsId, clusterId, days) => {
+                if (!clusterId) { setPbsReportGap(null); return; }
+                setPbsReportLoading(true);
+                try {
+                    const resp = await authFetch(`${API_URL}/pbs/${pbsId}/reports/protected-vms?cluster_id=${clusterId}&days=${days}`);
+                    if (resp && resp.ok) setPbsReportGap(await resp.json());
+                    else setPbsReportGap(null);
+                } catch (e) { console.warn('PBS gap error:', e); setPbsReportGap(null); }
+                finally { setPbsReportLoading(false); }
+            };
             
             const fetchPBSNamespaces = async (pbsId, store) => {
                 try {
@@ -5116,6 +5727,19 @@
                     return () => clearInterval(interval);
                 }
             }, [selectedPBS?.id]);
+
+            // MK Apr 2026 (#273): lazy-load report data when Reports tab or sub-tab changes
+            useEffect(() => {
+                if (!selectedPBS || pbsActiveTab !== 'reports') return;
+                const id = selectedPBS.id;
+                if (pbsReportSubTab === 'summary') {
+                    fetchPBSReportSummary(id, pbsReportDays);
+                } else if (pbsReportSubTab === 'inventory') {
+                    fetchPBSReportInventory(id, 0);  // 0 = no day filter
+                } else if (pbsReportSubTab === 'gap' && pbsReportGapCluster) {
+                    fetchPBSReportGap(id, pbsReportGapCluster, pbsReportDays);
+                }
+            }, [selectedPBS?.id, pbsActiveTab, pbsReportSubTab, pbsReportDays, pbsReportGapCluster]);
             
             // Load PBS datastore detail when selected
             useEffect(() => {
@@ -8254,6 +8878,7 @@
                                             <CorporateNodeDetailView
                                                 node={selectedSidebarNode.name}
                                                 clusterId={selectedSidebarNode.clusterId}
+                                                clusterHost={selectedSidebarNode.clusterId === selectedCluster?.id ? selectedCluster?.host : (clusters.find(c => c.id === selectedSidebarNode.clusterId)?.host || '')}
                                                 clusterMetrics={selectedSidebarNode.clusterId === selectedCluster?.id ? clusterMetrics : (sidebarClusterData[selectedSidebarNode.clusterId]?.metrics || {})}
                                                 clusterResources={selectedSidebarNode.clusterId === selectedCluster?.id ? clusterResources : (sidebarClusterData[selectedSidebarNode.clusterId]?.resources || [])}
                                                 onBack={() => setSelectedSidebarNode(null)}
@@ -8363,6 +8988,7 @@
                                                                     <div className="corp-overview-sub">{runningVms} {t('runningOf')} {allVms.length}</div>
                                                                 </div>
                                                             </div>
+                                                            <CapacityOutlookCard clusterId={selectedCluster?.id} t={t} getAuthHeaders={getAuthHeaders} />
                                                         </div>
                                                     );
                                                 })()}
@@ -9392,7 +10018,17 @@
                                                         <div className="flex justify-between items-center">
                                                             <p className="text-sm text-gray-400">{t('alertsDesc') || 'Get notified when resources exceed thresholds'}</p>
                                                             <button
-                                                                onClick={() => setShowAlertModal(true)}
+                                                                onClick={async () => {
+                                                                    setShowAlertModal(true);
+                                                                    setPickedChannels(['email']);
+                                                                    try {
+                                                                        const r = await fetch('/api/alert-channels', { credentials: 'include' });
+                                                                        if (r.ok) {
+                                                                            const j = await r.json();
+                                                                            setAlertChannels(Array.isArray(j) ? j : []);
+                                                                        }
+                                                                    } catch (e) { /* keep dropdown usable even if load fails */ }
+                                                                }}
                                                                 className="flex items-center gap-2 px-4 py-2 bg-proxmox-orange hover:bg-orange-600 rounded-lg text-sm"
                                                             >
                                                                 <Icons.Plus /> {t('newAlert') || 'New Alert'}
@@ -9720,6 +10356,8 @@
                                                                 disable_services: { ref: 'SVC', title: t('pegaDisableSvc') || 'Disable Unnecessary Services', desc: t('pegaDisableSvcDesc') || 'Stops and disables bluetooth, CUPS (printing), and Avahi (mDNS). Fewer running services means less attack surface.', impact: t('pegaDisableSvcImpact') || 'No local printing or Bluetooth — irrelevant for servers' },
                                                                 sysctl_hardening: { ref: 'NET+Kernel', title: t('pegaSysctl') || 'Sysctl Network & Kernel Hardening', desc: t('pegaSysctlDesc') || 'Applies 20+ sysctl parameters: IP spoofing protection, ICMP redirect blocking, SYN flood defense, ASLR, dmesg restriction, ptrace scope, symlink protection.', impact: t('pegaSysctlImpact') || 'None — standard production server hardening' },
                                                                 auditd_service: { ref: 'Audit', title: t('pegaAuditd') || 'Enable Audit Daemon (auditd)', desc: t('pegaAuditdDesc') || 'Installs and enables auditd for system event logging. Pair with STIG "Privileged Command Logging" for comprehensive audit rules.', impact: t('pegaAuditdImpact') || 'Minimal overhead — prerequisite for audit rules' },
+                                                                // MK Apr 2026 — brute-force protection for SSH + PVE Web-UI
+                                                                pve_fail2ban: { ref: 'Brute-Force', title: t('pegaFail2ban') || 'fail2ban — SSH + PVE Web-UI', desc: t('pegaFail2banDesc') || 'Installs fail2ban with jails for sshd and Proxmox Web-UI/API authentication. Policy: 5 failed logins in 10 minutes trigger a 24h IP ban. File-marker /etc/fail2ban/jail.d/pegaprox-pve.conf makes re-apply safe.', impact: t('pegaFail2banImpact') || 'Negligible — reads /var/log/daemon.log + /var/log/auth.log. Review banned IPs with `fail2ban-client status proxmox`.' },
                                                             };
                                                             const controls = hardenStatus.controls || {};
                                                             // NS Apr 2026: verbose result is {status, evidence, command}, non-verbose is bool
@@ -11303,6 +11941,7 @@
                                                 { id: 'datastores', label: 'Datastores', icon: Icons.Database },
                                                 { id: 'tasks', label: 'Tasks', icon: Icons.ClipboardList },
                                                 { id: 'jobs', label: 'Jobs', icon: Icons.Clock },
+                                                { id: 'reports', label: t('reports') || 'Reports', icon: Icons.FileText },  // MK Apr 2026: #273
                                             ].map(tab => (
                                                 <button key={tab.id} onClick={() => setPbsActiveTab(tab.id)}
                                                     className={isCorporate
@@ -12094,6 +12733,446 @@
                                                 </div>
                                             </div>
                                         )}
+
+                                        {/* Reports Tab — MK Apr 2026 (#273) */}
+                                        {pbsActiveTab === 'reports' && (
+                                            <div id="pbs-report-content" className={isCorporate ? 'space-y-3' : 'space-y-5'}>
+                                                {/* Top toolbar: time-range, sub-tab selector, exports */}
+                                                <div className="flex items-center gap-3 flex-wrap">
+                                                    <div className="flex gap-1">
+                                                        {[
+                                                            { id: 'summary', label: t('reportSummary') || 'Summary' },
+                                                            { id: 'inventory', label: t('reportInventory') || 'Inventory' },
+                                                            { id: 'gap', label: t('reportGap') || 'Gap Analysis' },
+                                                        ].map(sub => (
+                                                            <button key={sub.id} onClick={() => setPbsReportSubTab(sub.id)}
+                                                                className={`px-3 py-1.5 rounded text-xs font-medium transition-colors ${
+                                                                    pbsReportSubTab === sub.id
+                                                                        ? 'bg-blue-500 text-white'
+                                                                        : 'bg-proxmox-dark text-gray-400 hover:text-white border border-proxmox-border'
+                                                                }`}>
+                                                                {sub.label}
+                                                            </button>
+                                                        ))}
+                                                    </div>
+                                                    {pbsReportSubTab !== 'inventory' && (
+                                                        <select
+                                                            value={pbsReportDays}
+                                                            onChange={e => setPbsReportDays(parseInt(e.target.value))}
+                                                            className="bg-proxmox-dark border border-proxmox-border rounded px-2 py-1.5 text-xs text-white"
+                                                            title={t('reportWindow') || 'Time window'}
+                                                        >
+                                                            <option value={1}>{t('last24h') || 'Last 24h'}</option>
+                                                            <option value={7}>{t('last7d') || 'Last 7 days'}</option>
+                                                            <option value={30}>{t('last30d') || 'Last 30 days'}</option>
+                                                            <option value={90}>{t('last90d') || 'Last 90 days'}</option>
+                                                            <option value={365}>{t('last365d') || 'Last 365 days'}</option>
+                                                        </select>
+                                                    )}
+                                                    {pbsReportSubTab === 'gap' && (
+                                                        <select
+                                                            value={pbsReportGapCluster}
+                                                            onChange={e => setPbsReportGapCluster(e.target.value)}
+                                                            className="bg-proxmox-dark border border-proxmox-border rounded px-2 py-1.5 text-xs text-white"
+                                                        >
+                                                            <option value="">{t('selectCluster') || 'Select cluster...'}</option>
+                                                            {(clusters || []).filter(c => (selectedPBS?.linked_clusters || []).includes(c.id)).map(c => (
+                                                                <option key={c.id} value={c.id}>{c.name}</option>
+                                                            ))}
+                                                            {(selectedPBS?.linked_clusters || []).length === 0 && (clusters || []).map(c => (
+                                                                <option key={c.id} value={c.id}>{c.name}</option>
+                                                            ))}
+                                                        </select>
+                                                    )}
+                                                    <div className="flex-1" />
+                                                    <button
+                                                        onClick={() => {
+                                                            if (pbsReportSubTab === 'summary') fetchPBSReportSummary(selectedPBS.id, pbsReportDays);
+                                                            else if (pbsReportSubTab === 'inventory') fetchPBSReportInventory(selectedPBS.id, 0);
+                                                            else if (pbsReportSubTab === 'gap') fetchPBSReportGap(selectedPBS.id, pbsReportGapCluster, pbsReportDays);
+                                                        }}
+                                                        className="px-2.5 py-1 text-xs rounded border border-proxmox-border text-gray-400 hover:text-white hover:border-gray-500"
+                                                        title={t('refresh') || 'Refresh'}>
+                                                        <Icons.RefreshCw className={`w-3.5 h-3.5 ${pbsReportLoading ? 'animate-spin' : ''}`} />
+                                                    </button>
+                                                    <button
+                                                        onClick={() => {
+                                                            const el = document.getElementById('pbs-report-content');
+                                                            if (!el) return;
+                                                            const run = () => window.html2canvas(el, {backgroundColor: '#111a21', scale: 2, useCORS: true}).then(c => {
+                                                                const a = document.createElement('a');
+                                                                a.download = `pegaprox-pbs-${selectedPBS.name}-${pbsReportSubTab}-${new Date().toISOString().slice(0,10)}.png`;
+                                                                a.href = c.toDataURL('image/png'); a.click();
+                                                            });
+                                                            if (window.html2canvas) { run(); return; }
+                                                            const s = document.createElement('script'); s.src = '/static/js/html2canvas.min.js'; s.onload = run;
+                                                            s.onerror = () => { const s2 = document.createElement('script'); s2.src = 'https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js'; s2.onload = run; document.head.appendChild(s2); };
+                                                            document.head.appendChild(s);
+                                                        }}
+                                                        className="px-2.5 py-1 text-xs rounded border border-proxmox-border text-gray-400 hover:text-white hover:border-gray-500"
+                                                        title={t('exportPng') || 'Export as PNG'}>PNG</button>
+                                                    <button
+                                                        onClick={() => {
+                                                            const blocks = [];
+                                                            const fmtB = n => !n ? '0 B' : formatBytes(n);
+                                                            const fmtD = ts => ts ? new Date(ts * 1000).toLocaleString() : '—';
+                                                            if (pbsReportSubTab === 'summary' && pbsReportSummary) {
+                                                                const r = pbsReportSummary;
+                                                                blocks.push({ type: 'stats', data: [
+                                                                    { label: 'Jobs', value: String(r.totals?.jobs || 0), color: '#3c82c8' },
+                                                                    { label: 'Success', value: String(r.totals?.success || 0), color: '#2a9f2a' },
+                                                                    { label: 'Warning', value: String(r.totals?.warning || 0), color: '#c89600' },
+                                                                    { label: 'Failed', value: String(r.totals?.failed || 0), color: '#dc3232' },
+                                                                    { label: 'Success %', value: `${r.totals?.success_rate || 0}%`, color: '#2a9f2a' },
+                                                                ]});
+                                                                blocks.push({ type: 'spacer', height: 4 });
+                                                                blocks.push({
+                                                                    type: 'table',
+                                                                    title: `Per-VM (window: ${r.window?.days} days)`,
+                                                                    columns: ['Type', 'VMID', 'Name', 'Last backup', 'Status', 'Size', 'Duration', 'Datastore/NS', 'Verified'],
+                                                                    rows: (r.per_vm || []).map(v => [
+                                                                        v.type || '-', String(v.vmid || '-'), v.vm_name || '-',
+                                                                        fmtD(v.last_backup_ts), v.status || '-', fmtB(v.size),
+                                                                        v.duration_s ? `${Math.floor(v.duration_s/60)}m ${v.duration_s%60}s` : '-',
+                                                                        `${v.datastore || '-'}${v.namespace ? '/' + v.namespace : ''}`,
+                                                                        v.verified ? 'yes' : 'no',
+                                                                    ])
+                                                                });
+                                                            } else if (pbsReportSubTab === 'inventory' && pbsReportInventory) {
+                                                                const r = pbsReportInventory;
+                                                                blocks.push({ type: 'stats', data: [
+                                                                    { label: 'Snapshots', value: String(r.count || 0), color: '#3c82c8' },
+                                                                ]});
+                                                                blocks.push({ type: 'spacer', height: 4 });
+                                                                blocks.push({
+                                                                    type: 'table',
+                                                                    title: 'Backup Inventory',
+                                                                    columns: ['Type', 'VMID', 'Name', 'Timestamp', 'Datastore', 'Namespace', 'Size', 'Verified', 'Protected'],
+                                                                    rows: (r.entries || []).map(e => [
+                                                                        e.type || '-', String(e.vmid || '-'), e.vm_name || '-',
+                                                                        fmtD(e.backup_time), e.datastore || '-', e.namespace || '-',
+                                                                        fmtB(e.size),
+                                                                        e.verified ? 'ok' : (e.verified_state || 'none'),
+                                                                        e.protected ? 'yes' : 'no',
+                                                                    ])
+                                                                });
+                                                            } else if (pbsReportSubTab === 'gap' && pbsReportGap) {
+                                                                const r = pbsReportGap;
+                                                                blocks.push({ type: 'stats', data: [
+                                                                    { label: 'Protected', value: String(r.counts?.protected || 0), color: '#2a9f2a' },
+                                                                    { label: 'Stale', value: String(r.counts?.stale || 0), color: '#c89600' },
+                                                                    { label: 'Unprotected', value: String(r.counts?.unprotected || 0), color: '#dc3232' },
+                                                                ]});
+                                                                blocks.push({ type: 'spacer', height: 4 });
+                                                                blocks.push({
+                                                                    type: 'table', title: 'Unprotected VMs',
+                                                                    columns: ['Type', 'VMID', 'Name', 'Node', 'Status'],
+                                                                    rows: (r.unprotected || []).map(v => [v.type, v.vmid, v.vm_name || '-', v.node, v.status])
+                                                                });
+                                                                blocks.push({
+                                                                    type: 'table', title: 'Stale (last backup older than window)',
+                                                                    columns: ['Type', 'VMID', 'Name', 'Last backup', 'Datastore/NS'],
+                                                                    rows: (r.stale || []).map(v => [v.type, v.vmid, v.vm_name || '-', fmtD(v.last_backup_ts), `${v.datastore}${v.namespace ? '/' + v.namespace : ''}`])
+                                                                });
+                                                                blocks.push({
+                                                                    type: 'table', title: 'Protected',
+                                                                    columns: ['Type', 'VMID', 'Name', 'Last backup', 'Datastore/NS'],
+                                                                    rows: (r.protected || []).map(v => [v.type, v.vmid, v.vm_name || '-', fmtD(v.last_backup_ts), `${v.datastore}${v.namespace ? '/' + v.namespace : ''}`])
+                                                                });
+                                                            }
+                                                            generatePegaProxPDF({
+                                                                title: `PBS Report — ${pbsReportSubTab}`,
+                                                                subtitle: selectedPBS?.name,
+                                                                clusterName: pbsReportSubTab === 'gap' && pbsReportGapCluster
+                                                                    ? (clusters.find(c => c.id === pbsReportGapCluster)?.name || '')
+                                                                    : '',
+                                                                filename: `pegaprox-pbs-${selectedPBS?.name}-${pbsReportSubTab}-${new Date().toISOString().slice(0,10)}.pdf`,
+                                                                content: blocks,
+                                                                orientation: pbsReportSubTab === 'inventory' ? 'landscape' : 'portrait',
+                                                            });
+                                                        }}
+                                                        className="px-2.5 py-1 text-xs rounded border border-proxmox-border text-gray-400 hover:text-white hover:border-gray-500"
+                                                        title={t('exportPdf') || 'Export as PDF'}>PDF</button>
+                                                </div>
+
+                                                {pbsReportLoading && (
+                                                    <div className="flex items-center justify-center py-12">
+                                                        <Icons.RotateCw className="animate-spin w-6 h-6 text-gray-500" />
+                                                    </div>
+                                                )}
+
+                                                {/* ── Summary sub-view ── */}
+                                                {!pbsReportLoading && pbsReportSubTab === 'summary' && pbsReportSummary && (() => {
+                                                    const r = pbsReportSummary;
+                                                    const t_total = r.totals?.jobs || 0;
+                                                    const succ = r.totals?.success || 0;
+                                                    const warn = r.totals?.warning || 0;
+                                                    const fail = r.totals?.failed || 0;
+                                                    const rate = r.totals?.success_rate || 0;
+                                                    const perDayMax = Math.max(1, ...((r.per_day || []).map(d => (d.success + d.warning + d.failed))));
+                                                    return (
+                                                    <>
+                                                        {/* Stat cards */}
+                                                        <div className="grid grid-cols-2 md:grid-cols-5 gap-3">
+                                                            <div className="bg-proxmox-card border border-proxmox-border rounded-xl p-4 text-center">
+                                                                <div className="text-3xl font-bold text-blue-400">{t_total}</div>
+                                                                <div className="text-xs text-gray-500 mt-1">{t('totalJobs') || 'Total jobs'}</div>
+                                                            </div>
+                                                            <div className="bg-proxmox-card border border-proxmox-border rounded-xl p-4 text-center">
+                                                                <div className="text-3xl font-bold text-green-400">{succ}</div>
+                                                                <div className="text-xs text-gray-500 mt-1">{t('success') || 'Success'}</div>
+                                                            </div>
+                                                            <div className="bg-proxmox-card border border-proxmox-border rounded-xl p-4 text-center">
+                                                                <div className="text-3xl font-bold text-yellow-400">{warn}</div>
+                                                                <div className="text-xs text-gray-500 mt-1">{t('warning') || 'Warning'}</div>
+                                                            </div>
+                                                            <div className="bg-proxmox-card border border-proxmox-border rounded-xl p-4 text-center">
+                                                                <div className="text-3xl font-bold text-red-400">{fail}</div>
+                                                                <div className="text-xs text-gray-500 mt-1">{t('failed') || 'Failed'}</div>
+                                                            </div>
+                                                            <div className="bg-proxmox-card border border-proxmox-border rounded-xl p-4 text-center">
+                                                                <div className={`text-3xl font-bold ${rate >= 95 ? 'text-green-400' : rate >= 80 ? 'text-yellow-400' : 'text-red-400'}`}>{rate}%</div>
+                                                                <div className="text-xs text-gray-500 mt-1">{t('successRate') || 'Success rate'}</div>
+                                                            </div>
+                                                        </div>
+
+                                                        {/* Per-day mini bar chart (inline SVG) */}
+                                                        <div className="bg-proxmox-card border border-proxmox-border rounded-xl p-4">
+                                                            <div className="text-sm font-medium text-gray-300 mb-3">{t('perDayActivity') || 'Per-day activity'}</div>
+                                                            <div className="flex items-end gap-0.5 h-24">
+                                                                {(r.per_day || []).map((d, i) => {
+                                                                    const totalDay = d.success + d.warning + d.failed;
+                                                                    const h = (totalDay / perDayMax) * 100;
+                                                                    return (
+                                                                        <div key={i} className="flex-1 flex flex-col-reverse gap-0.5" title={`${d.date}: ${d.success} ok / ${d.warning} warn / ${d.failed} fail`}>
+                                                                            {d.success > 0 && <div style={{height: `${(d.success/perDayMax)*100}%`, minHeight: 2}} className="bg-green-500/80" />}
+                                                                            {d.warning > 0 && <div style={{height: `${(d.warning/perDayMax)*100}%`, minHeight: 2}} className="bg-yellow-500/80" />}
+                                                                            {d.failed > 0 && <div style={{height: `${(d.failed/perDayMax)*100}%`, minHeight: 2}} className="bg-red-500/80" />}
+                                                                            {totalDay === 0 && <div className="bg-gray-700/30" style={{height: '2px'}} />}
+                                                                        </div>
+                                                                    );
+                                                                })}
+                                                            </div>
+                                                            <div className="flex justify-between text-[10px] text-gray-600 mt-1">
+                                                                <span>{r.window?.days} {t('daysAgo') || 'days ago'}</span>
+                                                                <span>{t('now') || 'now'}</span>
+                                                            </div>
+                                                        </div>
+
+                                                        {/* Compliance hints */}
+                                                        {r.unverified_older_than_30d > 0 && (
+                                                            <div className="bg-yellow-500/10 border border-yellow-500/30 rounded-lg p-3 text-sm text-yellow-300 flex items-start gap-2">
+                                                                <Icons.AlertTriangle className="w-4 h-4 flex-shrink-0 mt-0.5" />
+                                                                <div>
+                                                                    <span className="font-medium">{r.unverified_older_than_30d}</span> {t('unverifiedOld') || 'snapshot(s) older than 30 days without successful verification.'}
+                                                                </div>
+                                                            </div>
+                                                        )}
+
+                                                        {/* Per-VM rollup table */}
+                                                        <div className="bg-proxmox-card border border-proxmox-border rounded-xl overflow-hidden">
+                                                            <div className="px-4 py-3 border-b border-proxmox-border flex items-center justify-between">
+                                                                <div className="text-sm font-medium text-gray-300">{t('perVmRollup') || 'Per-VM last backup'}</div>
+                                                                <div className="text-xs text-gray-500">{(r.per_vm || []).length} {t('entries') || 'entries'}</div>
+                                                            </div>
+                                                            <div className="max-h-96 overflow-auto">
+                                                                <table className="w-full text-xs">
+                                                                    <thead className="bg-proxmox-dark text-gray-500 sticky top-0">
+                                                                        <tr>
+                                                                            <th className="text-left p-2 pl-4">Type</th>
+                                                                            <th className="text-left p-2">VMID</th>
+                                                                            <th className="text-left p-2">{t('name') || 'Name'}</th>
+                                                                            <th className="text-left p-2">{t('lastBackup') || 'Last backup'}</th>
+                                                                            <th className="text-left p-2">{t('status') || 'Status'}</th>
+                                                                            <th className="text-left p-2">{t('size') || 'Size'}</th>
+                                                                            <th className="text-left p-2">{t('duration') || 'Duration'}</th>
+                                                                            <th className="text-left p-2">{t('location') || 'Location'}</th>
+                                                                            <th className="text-left p-2">{t('verified') || 'Verified'}</th>
+                                                                        </tr>
+                                                                    </thead>
+                                                                    <tbody>
+                                                                        {(r.per_vm || []).map((v, i) => (
+                                                                            <tr key={i} className="border-t border-proxmox-border/30 hover:bg-proxmox-hover/30">
+                                                                                <td className="p-2 pl-4 text-gray-400 font-mono">{v.type}</td>
+                                                                                <td className="p-2 text-gray-300 font-mono">{v.vmid}</td>
+                                                                                <td className="p-2 text-white">{v.vm_name || <span className="text-gray-600">—</span>}</td>
+                                                                                <td className="p-2 text-gray-400">{v.last_backup_ts ? fmtDate(v.last_backup_ts * 1000) : '—'}</td>
+                                                                                <td className="p-2">
+                                                                                    <span className={`px-1.5 py-0.5 rounded text-[10px] ${
+                                                                                        v.status === 'success' ? 'bg-green-500/20 text-green-400' :
+                                                                                        v.status === 'warning' ? 'bg-yellow-500/20 text-yellow-400' :
+                                                                                        'bg-red-500/20 text-red-400'
+                                                                                    }`}>{v.status}</span>
+                                                                                </td>
+                                                                                <td className="p-2 text-gray-400">{formatBytes(v.size)}</td>
+                                                                                <td className="p-2 text-gray-500">{v.duration_s ? `${Math.floor(v.duration_s/60)}m ${v.duration_s%60}s` : '—'}</td>
+                                                                                <td className="p-2 text-gray-500">{v.datastore || '—'}{v.namespace ? `/${v.namespace}` : ''}</td>
+                                                                                <td className="p-2">{v.verified ? <Icons.Check className="w-3.5 h-3.5 text-green-400" /> : <span className="text-gray-600">—</span>}</td>
+                                                                            </tr>
+                                                                        ))}
+                                                                        {(r.per_vm || []).length === 0 && (
+                                                                            <tr><td colSpan="9" className="p-8 text-center text-gray-500">{t('noBackupsInWindow') || 'No backups in selected window'}</td></tr>
+                                                                        )}
+                                                                    </tbody>
+                                                                </table>
+                                                            </div>
+                                                        </div>
+                                                    </>
+                                                    );
+                                                })()}
+
+                                                {/* ── Inventory sub-view ── */}
+                                                {!pbsReportLoading && pbsReportSubTab === 'inventory' && pbsReportInventory && (() => {
+                                                    const inv = pbsReportInventory;
+                                                    const q = (pbsReportSearch || '').toLowerCase();
+                                                    const filtered = (inv.entries || []).filter(e => !q ||
+                                                        (e.vm_name || '').toLowerCase().includes(q) ||
+                                                        String(e.vmid || '').includes(q) ||
+                                                        (e.datastore || '').toLowerCase().includes(q) ||
+                                                        (e.namespace || '').toLowerCase().includes(q)
+                                                    );
+                                                    return (
+                                                    <>
+                                                        <div className="flex items-center gap-3">
+                                                            <input
+                                                                value={pbsReportSearch}
+                                                                onChange={e => setPbsReportSearch(e.target.value)}
+                                                                placeholder={t('searchBackups') || 'Search by VM name, ID, datastore…'}
+                                                                className="flex-1 max-w-md bg-proxmox-dark border border-proxmox-border rounded px-3 py-1.5 text-sm text-white"
+                                                            />
+                                                            <div className="text-xs text-gray-500">{filtered.length} / {inv.count || 0}</div>
+                                                        </div>
+                                                        <div className="bg-proxmox-card border border-proxmox-border rounded-xl overflow-hidden">
+                                                            <div className="max-h-[600px] overflow-auto">
+                                                                <table className="w-full text-xs">
+                                                                    <thead className="bg-proxmox-dark text-gray-500 sticky top-0">
+                                                                        <tr>
+                                                                            <th className="text-left p-2 pl-4">Type</th>
+                                                                            <th className="text-left p-2">VMID</th>
+                                                                            <th className="text-left p-2">{t('name') || 'Name'}</th>
+                                                                            <th className="text-left p-2">{t('timestamp') || 'Timestamp'}</th>
+                                                                            <th className="text-left p-2">{t('datastore') || 'Datastore'}</th>
+                                                                            <th className="text-left p-2">NS</th>
+                                                                            <th className="text-left p-2">{t('size') || 'Size'}</th>
+                                                                            <th className="text-left p-2">{t('verified') || 'Verified'}</th>
+                                                                            <th className="text-left p-2">{t('protected') || 'Prot.'}</th>
+                                                                        </tr>
+                                                                    </thead>
+                                                                    <tbody>
+                                                                        {filtered.map((e, i) => (
+                                                                            <tr key={i} className="border-t border-proxmox-border/30 hover:bg-proxmox-hover/30">
+                                                                                <td className="p-2 pl-4 text-gray-400 font-mono">{e.type}</td>
+                                                                                <td className="p-2 text-gray-300 font-mono">{e.vmid}</td>
+                                                                                <td className="p-2 text-white">{e.vm_name || <span className="text-gray-600">—</span>}</td>
+                                                                                <td className="p-2 text-gray-400">{fmtDate(e.backup_time * 1000)}</td>
+                                                                                <td className="p-2 text-gray-300">{e.datastore}</td>
+                                                                                <td className="p-2 text-gray-500">{e.namespace || <span className="text-gray-700">root</span>}</td>
+                                                                                <td className="p-2 text-gray-400">{formatBytes(e.size)}</td>
+                                                                                <td className="p-2">
+                                                                                    {e.verified
+                                                                                        ? <span className="text-green-400 text-[10px]">ok</span>
+                                                                                        : e.verified_state
+                                                                                            ? <span className="text-yellow-400 text-[10px]">{e.verified_state}</span>
+                                                                                            : <span className="text-gray-600 text-[10px]">—</span>}
+                                                                                </td>
+                                                                                <td className="p-2">{e.protected ? <Icons.Lock className="w-3 h-3 text-blue-400" /> : <span className="text-gray-700">—</span>}</td>
+                                                                            </tr>
+                                                                        ))}
+                                                                        {filtered.length === 0 && (
+                                                                            <tr><td colSpan="9" className="p-8 text-center text-gray-500">{t('noMatchingBackups') || 'No matching backups'}</td></tr>
+                                                                        )}
+                                                                    </tbody>
+                                                                </table>
+                                                            </div>
+                                                        </div>
+                                                    </>
+                                                    );
+                                                })()}
+
+                                                {/* ── Gap Analysis sub-view ── */}
+                                                {!pbsReportLoading && pbsReportSubTab === 'gap' && !pbsReportGapCluster && (
+                                                    <div className="text-center py-16">
+                                                        <Icons.AlertCircle className="w-10 h-10 text-gray-700 mx-auto mb-3" />
+                                                        <p className="text-gray-400">{t('pickClusterForGap') || 'Pick a cluster above to run gap analysis'}</p>
+                                                        <p className="text-xs text-gray-600 mt-1">{t('pickClusterForGapDesc') || 'Shows which VMs in the chosen cluster are protected, stale, or completely unprotected on this PBS.'}</p>
+                                                    </div>
+                                                )}
+                                                {!pbsReportLoading && pbsReportSubTab === 'gap' && pbsReportGap && (() => {
+                                                    const g = pbsReportGap;
+                                                    return (
+                                                    <>
+                                                        <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
+                                                            <div className="bg-proxmox-card border border-green-500/30 rounded-xl p-4">
+                                                                <div className="text-2xl font-bold text-green-400">{g.counts.protected}</div>
+                                                                <div className="text-xs text-gray-500 mt-1">{t('protected') || 'Protected'} <span className="text-gray-600">(&lt; {g.window.days}d)</span></div>
+                                                            </div>
+                                                            <div className="bg-proxmox-card border border-yellow-500/30 rounded-xl p-4">
+                                                                <div className="text-2xl font-bold text-yellow-400">{g.counts.stale}</div>
+                                                                <div className="text-xs text-gray-500 mt-1">{t('stale') || 'Stale'} <span className="text-gray-600">(&gt; {g.window.days}d)</span></div>
+                                                            </div>
+                                                            <div className="bg-proxmox-card border border-red-500/30 rounded-xl p-4">
+                                                                <div className="text-2xl font-bold text-red-400">{g.counts.unprotected}</div>
+                                                                <div className="text-xs text-gray-500 mt-1">{t('unprotected') || 'No backups at all'}</div>
+                                                            </div>
+                                                        </div>
+
+                                                        {g.unprotected.length > 0 && (
+                                                            <div className="bg-proxmox-card border border-red-500/30 rounded-xl overflow-hidden">
+                                                                <div className="px-4 py-2 bg-red-500/10 text-red-300 text-sm font-medium">🔴 {t('unprotected') || 'Unprotected VMs'} ({g.unprotected.length})</div>
+                                                                <table className="w-full text-xs">
+                                                                    <thead className="text-gray-500"><tr><th className="text-left p-2 pl-4">Type</th><th className="text-left p-2">VMID</th><th className="text-left p-2">{t('name') || 'Name'}</th><th className="text-left p-2">{t('node') || 'Node'}</th><th className="text-left p-2">{t('status') || 'Status'}</th></tr></thead>
+                                                                    <tbody>
+                                                                        {g.unprotected.map((v, i) => (
+                                                                            <tr key={i} className="border-t border-proxmox-border/30"><td className="p-2 pl-4 text-gray-400 font-mono">{v.type}</td><td className="p-2 text-gray-300 font-mono">{v.vmid}</td><td className="p-2 text-white">{v.vm_name || '—'}</td><td className="p-2 text-gray-400">{v.node}</td><td className="p-2 text-gray-500">{v.status}</td></tr>
+                                                                        ))}
+                                                                    </tbody>
+                                                                </table>
+                                                            </div>
+                                                        )}
+
+                                                        {g.stale.length > 0 && (
+                                                            <div className="bg-proxmox-card border border-yellow-500/30 rounded-xl overflow-hidden">
+                                                                <div className="px-4 py-2 bg-yellow-500/10 text-yellow-300 text-sm font-medium">🟡 {t('stale') || 'Stale (last backup older than window)'} ({g.stale.length})</div>
+                                                                <table className="w-full text-xs">
+                                                                    <thead className="text-gray-500"><tr><th className="text-left p-2 pl-4">Type</th><th className="text-left p-2">VMID</th><th className="text-left p-2">{t('name') || 'Name'}</th><th className="text-left p-2">{t('lastBackup') || 'Last backup'}</th><th className="text-left p-2">{t('location') || 'Location'}</th></tr></thead>
+                                                                    <tbody>
+                                                                        {g.stale.map((v, i) => (
+                                                                            <tr key={i} className="border-t border-proxmox-border/30"><td className="p-2 pl-4 text-gray-400 font-mono">{v.type}</td><td className="p-2 text-gray-300 font-mono">{v.vmid}</td><td className="p-2 text-white">{v.vm_name || '—'}</td><td className="p-2 text-gray-400">{fmtDate(v.last_backup_ts * 1000)}</td><td className="p-2 text-gray-500">{v.datastore}{v.namespace ? `/${v.namespace}` : ''}</td></tr>
+                                                                        ))}
+                                                                    </tbody>
+                                                                </table>
+                                                            </div>
+                                                        )}
+
+                                                        {g.protected.length > 0 && (
+                                                            <div className="bg-proxmox-card border border-green-500/30 rounded-xl overflow-hidden">
+                                                                <div className="px-4 py-2 bg-green-500/10 text-green-300 text-sm font-medium">🟢 {t('protected') || 'Protected'} ({g.protected.length})</div>
+                                                                <div className="max-h-72 overflow-auto">
+                                                                    <table className="w-full text-xs">
+                                                                        <thead className="bg-proxmox-dark text-gray-500 sticky top-0"><tr><th className="text-left p-2 pl-4">Type</th><th className="text-left p-2">VMID</th><th className="text-left p-2">{t('name') || 'Name'}</th><th className="text-left p-2">{t('lastBackup') || 'Last backup'}</th><th className="text-left p-2">{t('location') || 'Location'}</th></tr></thead>
+                                                                        <tbody>
+                                                                            {g.protected.map((v, i) => (
+                                                                                <tr key={i} className="border-t border-proxmox-border/30"><td className="p-2 pl-4 text-gray-400 font-mono">{v.type}</td><td className="p-2 text-gray-300 font-mono">{v.vmid}</td><td className="p-2 text-white">{v.vm_name || '—'}</td><td className="p-2 text-gray-400">{fmtDate(v.last_backup_ts * 1000)}</td><td className="p-2 text-gray-500">{v.datastore}{v.namespace ? `/${v.namespace}` : ''}</td></tr>
+                                                                            ))}
+                                                                        </tbody>
+                                                                    </table>
+                                                                </div>
+                                                            </div>
+                                                        )}
+                                                    </>
+                                                    );
+                                                })()}
+
+                                                {!pbsReportLoading && (
+                                                    (pbsReportSubTab === 'summary' && !pbsReportSummary) ||
+                                                    (pbsReportSubTab === 'inventory' && !pbsReportInventory)
+                                                ) && (
+                                                    <div className="text-center py-8 text-sm text-gray-500">
+                                                        {t('noReportData') || 'No report data. Try Refresh or a different window.'}
+                                                    </div>
+                                                )}
+                                            </div>
+                                        )}
                                     </div>
                                 ) : selectedVMware ? (
                                     /* VMware Server Management View */
@@ -12809,23 +13888,23 @@
                                                                                 </div>
                                                                             )}
                                                                             <div className="bg-proxmox-card border border-proxmox-border rounded-xl p-4">
-                                                                                <h3 className="text-sm font-semibold text-gray-400 uppercase mb-4">Quick Actions</h3>
+                                                                                <h3 className="text-sm font-semibold text-gray-400 uppercase mb-4">{t('quickActions') || 'Quick Actions'}</h3>
                                                                                 <div className="space-y-2">
                                                                                     <button onClick={() => { setVmwareRenameName(vm.name || ''); setShowVmwareRename(true); }} className="w-full flex items-center gap-3 p-3 bg-proxmox-dark rounded-lg hover:bg-proxmox-hover transition-colors text-left">
                                                                                         <Icons.Edit className="w-5 h-5 text-blue-400" />
-                                                                                        <div><div className="text-sm text-white">Rename VM</div><div className="text-xs text-gray-500">Change the display name</div></div>
+                                                                                        <div><div className="text-sm text-white">{t('renameVm') || 'Rename VM'}</div><div className="text-xs text-gray-500">{t('renameVmDesc') || 'Change the display name'}</div></div>
                                                                                     </button>
                                                                                     <button onClick={() => { setVmwareCloneName(`${vm.name}-clone`); setShowVmwareClone(true); }} className="w-full flex items-center gap-3 p-3 bg-proxmox-dark rounded-lg hover:bg-proxmox-hover transition-colors text-left">
                                                                                         <Icons.Copy className="w-5 h-5 text-green-400" />
-                                                                                        <div><div className="text-sm text-white">Clone VM</div><div className="text-xs text-gray-500">Create an identical copy</div></div>
+                                                                                        <div><div className="text-sm text-white">{t('cloneVm') || 'Clone VM'}</div><div className="text-xs text-gray-500">{t('cloneVmDesc') || 'Create an identical copy'}</div></div>
                                                                                     </button>
                                                                                     <button onClick={() => fetchMigrationPlan(vmwareSelectedVm)} disabled={vmwareMigrateLoading} className="w-full flex items-center gap-3 p-3 bg-proxmox-dark rounded-lg hover:bg-proxmox-hover transition-colors text-left">
                                                                                         <Icons.FolderInput className="w-5 h-5 text-emerald-400" />
-                                                                                        <div><div className="text-sm text-white">Migrate to Proxmox</div><div className="text-xs text-gray-500">Near-zero downtime V2P migration</div></div>
+                                                                                        <div><div className="text-sm text-white">{t('migrateToProxmox') || 'Migrate to Proxmox'}</div><div className="text-xs text-gray-500">{t('v2pMigrationDesc') || 'Near-zero downtime V2P migration'}</div></div>
                                                                                     </button>
                                                                                     <button onClick={() => setShowVmwareDelete(true)} disabled={isOn} className="w-full flex items-center gap-3 p-3 bg-proxmox-dark rounded-lg hover:bg-red-500/5 transition-colors text-left disabled:opacity-40">
                                                                                         <Icons.Trash className="w-5 h-5 text-red-400" />
-                                                                                        <div><div className="text-sm text-red-400">Delete VM</div><div className="text-xs text-gray-500">{isOn ? 'Power off first to delete' : 'Permanently remove this VM'}</div></div>
+                                                                                        <div><div className="text-sm text-red-400">{t('deleteVm') || 'Delete VM'}</div><div className="text-xs text-gray-500">{isOn ? (t('powerOffFirst') || 'Power off first to delete') : (t('permanentlyRemoveVm') || 'Permanently remove this VM')}</div></div>
                                                                                     </button>
                                                                                 </div>
                                                                             </div>
@@ -12907,16 +13986,12 @@
                                                                             </div>
                                                                         </div>
                                                                         
-                                                                        <div className="bg-amber-500/5 border border-amber-500/20 rounded-lg p-3 mb-4">
-                                                                            <div className="text-xs text-amber-400 font-semibold mb-1">⚠ Prerequisite</div>
-                                                                            <div className="text-xs text-amber-400/70">The VM must be powered off on the ESXi host before starting the migration. Running VMs cannot be migrated — disk files are locked while the VM is active.</div>
-                                                                        </div>
-                                                                        <div className="space-y-2 mb-4 text-xs text-gray-500">
-                                                                            <div className="font-semibold text-gray-400 mb-1">How it works:</div>
-                                                                            <div>1. Full disk copy via HTTPS from ESXi datastore</div>
-                                                                            <div>2. Convert VMDK to Proxmox format (qcow2/raw)</div>
-                                                                            <div>3. Import VM config (CPU, RAM, network)</div>
-                                                                            <div>4. Start VM on Proxmox</div>
+                                                                        <div className="space-y-2 mb-4 text-xs text-gray-400">
+                                                                            <div className="font-semibold text-gray-300 mb-1">{t('howItWorks') || 'How it works:'}</div>
+                                                                            <div>1. {t('migStep1') || 'Snapshot or live-mirror the source VMDKs depending on transfer mode'}</div>
+                                                                            <div>2. {t('migStep2') || 'Stream disks to Proxmox storage (SSH dd / drive-mirror / SSHFS)'}</div>
+                                                                            <div>3. {t('migStep3') || 'Import VM config (CPU, RAM, network) — ESXi power-state handled automatically'}</div>
+                                                                            <div>4. {t('migStep4') || 'Atomic cutover and start VM on Proxmox'}</div>
                                                                         </div>
                                                                         
                                                                         <button onClick={() => fetchMigrationPlan(vmwareSelectedVm)} disabled={vmwareMigrateLoading} className="w-full py-2.5 rounded-lg bg-emerald-500 text-white font-medium hover:bg-emerald-600 disabled:opacity-50 text-sm">
@@ -13108,18 +14183,22 @@
                                                                     </div>
                                                                 )}
 
-                                                                {/* Transfer Mode */}
+                                                                {/* Transfer Mode — NS Apr 2026: added 'sshfs_boot' as recommended default
+                                                                    (live drive-mirror, ~30s downtime), 'snapshot_zero' for ESXi setups that
+                                                                    allow concurrent base-VMDK reads during snapshot. */}
                                                                 <div>
-                                                                    <label className="text-xs text-gray-500 mb-1 block">Transfer Mode</label>
+                                                                    <label className="text-xs text-gray-500 mb-1 block">{t('transferMode') || 'Transfer Mode'}</label>
                                                                     <select value={vmwareMigrateForm.transfer_mode} onChange={e => setVmwareMigrateForm({...vmwareMigrateForm, transfer_mode: e.target.value})} className="w-full px-3 py-2 bg-proxmox-dark border border-proxmox-border rounded-lg text-white text-sm">
-                                                                        <option value="auto">Auto (Pre-Sync + Delta)</option>
-                                                                        <option value="sshfs_boot">QEMU SSH Boot + Live Copy (Near-Zero Downtime)</option>
-                                                                        <option value="offline">Offline Copy (Full Downtime)</option>
+                                                                        <option value="auto">{t('transferModeAuto') || 'Auto (Pre-Sync + Delta)'}</option>
+                                                                        <option value="sshfs_boot">{t('transferModeSshfsBoot') || 'Live Mirror — Near-Zero Downtime (recommended)'}</option>
+                                                                        <option value="snapshot_zero">{t('transferModeSnapshotZero') || 'Snapshot-Iterative — Zero Downtime (experimental)'}</option>
+                                                                        <option value="offline">{t('transferModeOffline') || 'Offline Copy (Full Downtime)'}</option>
                                                                     </select>
-                                                                    <p className="text-xs text-gray-600 mt-1">
-                                                                        {vmwareMigrateForm.transfer_mode === 'auto' && 'Tries pre-sync while VM runs, falls back to QEMU SSH boot if locked'}
-                                                                        {vmwareMigrateForm.transfer_mode === 'sshfs_boot' && 'Boots Proxmox VM via QEMU SSH driver (~15s downtime), copies disks in background while VM runs. Recommended: max. 1 VM at a time.'}
-                                                                        {vmwareMigrateForm.transfer_mode === 'offline' && 'Stops VM, copies disks via SSH, then starts on Proxmox (full downtime)'}
+                                                                    <p className="text-xs text-gray-300 mt-1 leading-relaxed">
+                                                                        {vmwareMigrateForm.transfer_mode === 'auto' && (t('transferModeAutoDesc') || 'Tries pre-sync while VM runs, falls back to live-mirror if VMDK is locked')}
+                                                                        {vmwareMigrateForm.transfer_mode === 'sshfs_boot' && (t('transferModeSshfsBootDesc') || 'QEMU drive-mirror live-pivots disks from SSHFS-mounted source to local LVM. ~30s real downtime. Multi-disk capable. Recommended for most workloads — limit to 1-2 concurrent VMs to keep mirror throughput high.')}
+                                                                        {vmwareMigrateForm.transfer_mode === 'snapshot_zero' && (t('transferModeSnapshotZeroDesc') || 'ESXi snapshot rotation — VM stays running through pre-sync + iterative delta sync, only ~10s downtime at cutover. ⚠️ May not work on your system (e.g. ESXi 6.x or VMFS6 with strict locking) — requires ESXi setup that releases base-VMDK lock after snapshot.')}
+                                                                        {vmwareMigrateForm.transfer_mode === 'offline' && (t('transferModeOfflineDesc') || 'Stops ESXi VM, copies disks via SSH dd, then starts on Proxmox (full downtime ~ disk-size / network-speed)')}
                                                                     </p>
                                                                 </div>
                                                                 
@@ -14747,14 +15826,10 @@
                                     </div>
 
                                     <div className="bg-blue-500/5 border border-blue-500/20 rounded-lg p-3">
-                                        <div className="text-xs text-blue-400 font-semibold mb-1">Requirements</div>
-                                        <div className="text-xs text-blue-400/70">- SSH must be enabled on the ESXi host</div>
-                                        <div className="text-xs text-blue-400/70">- ESXi root credentials are required for VM migration</div>
-                                        <div className="text-xs text-blue-400/70">- VMs must be powered off on ESXi before migration</div>
-                                    </div>
-                                    <div className="bg-amber-500/5 border border-amber-500/20 rounded-lg p-3">
-                                        <div className="text-xs text-amber-400 font-semibold mb-1">⚠ Important</div>
-                                        <div className="text-xs text-amber-400/70">VMs must be shut down on the ESXi host before migration. Running VMs cannot be migrated and Near-Zero Downtime Migration requires exclusive disk access.</div>
+                                        <div className="text-xs text-blue-300 font-semibold mb-1">{t('requirements') || 'Requirements'}</div>
+                                        <div className="text-xs text-blue-300/80">- {t('reqSshEnabled') || 'SSH must be enabled on the ESXi host'}</div>
+                                        <div className="text-xs text-blue-300/80">- {t('reqEsxiRoot') || 'ESXi root credentials are required for VM migration'}</div>
+                                        <div className="text-xs text-blue-300/80">- {t('reqVmwareTools') || 'VMware Tools recommended for clean shutdown during cutover (not strictly required)'}</div>
                                     </div>
 
                                     {vmwareTestResult && (
@@ -15356,6 +16431,12 @@
                                 <form onSubmit={async (e) => {
                                     e.preventDefault();
                                     const form = e.target;
+                                    // NS Apr 2026 #213 — channels is the new field; keep `action`
+                                    // populated as a legacy fallback so older versions still read it.
+                                    const channels = pickedChannels.length ? pickedChannels : [];
+                                    const legacyAction = channels.length === 0 ? 'log'
+                                        : (channels.length === 1 && channels[0] === 'email') ? 'email'
+                                        : 'all';
                                     await createClusterAlert({
                                         name: form.name.value,
                                         target_type: form.target_type.value,
@@ -15363,7 +16444,8 @@
                                         metric: form.metric.value,
                                         operator: form.operator.value,
                                         threshold: parseInt(form.threshold.value),
-                                        action: form.action.value,
+                                        channels,
+                                        action: legacyAction,
                                         enabled: true
                                     });
                                 }} className="p-4 space-y-4">
@@ -15410,11 +16492,45 @@
                                         </div>
                                     </div>
                                     <div>
-                                        <label className="block text-sm text-gray-400 mb-1">{t('action') || 'Action'}</label>
-                                        <select name="action" className="w-full px-3 py-2 bg-proxmox-dark border border-proxmox-border rounded-lg">
-                                            <option value="log">Log Only</option>
-                                            <option value="email">Email</option>
-                                        </select>
+                                        <label className="block text-sm text-gray-400 mb-1">{t('notifyVia') || 'Notify via'}</label>
+                                        <div className="space-y-1.5 bg-proxmox-dark border border-proxmox-border rounded-lg p-2 max-h-40 overflow-y-auto">
+                                            <label className="flex items-center gap-2 text-sm cursor-pointer hover:bg-proxmox-hover px-2 py-1 rounded">
+                                                <input
+                                                    type="checkbox"
+                                                    checked={pickedChannels.includes('email')}
+                                                    onChange={(e) => {
+                                                        setPickedChannels(prev => e.target.checked
+                                                            ? [...prev.filter(c => c !== 'email'), 'email']
+                                                            : prev.filter(c => c !== 'email'));
+                                                    }}
+                                                />
+                                                <Icons.Mail className="w-4 h-4 text-gray-400" />
+                                                <span>Email</span>
+                                            </label>
+                                            {alertChannels.filter(c => c.enabled !== false).map(c => (
+                                                <label key={c.id} className="flex items-center gap-2 text-sm cursor-pointer hover:bg-proxmox-hover px-2 py-1 rounded">
+                                                    <input
+                                                        type="checkbox"
+                                                        checked={pickedChannels.includes(c.id)}
+                                                        onChange={(e) => {
+                                                            setPickedChannels(prev => e.target.checked
+                                                                ? [...prev.filter(x => x !== c.id), c.id]
+                                                                : prev.filter(x => x !== c.id));
+                                                        }}
+                                                    />
+                                                    <span className="text-xs uppercase text-proxmox-orange font-mono w-14 shrink-0">{c.type || 'generic'}</span>
+                                                    <span className="truncate">{c.name || c.id}</span>
+                                                </label>
+                                            ))}
+                                            {alertChannels.length === 0 && (
+                                                <div className="text-xs text-gray-500 px-2 py-1">
+                                                    {t('noWebhooksConfigured') || 'No webhook channels configured. Add some in Settings → Alerts.'}
+                                                </div>
+                                            )}
+                                        </div>
+                                        {pickedChannels.length === 0 && (
+                                            <div className="text-xs text-gray-500 mt-1">{t('logOnlyHint') || 'No channels selected — the alert will only be logged.'}</div>
+                                        )}
                                     </div>
                                     <div className="flex gap-2 justify-end pt-2">
                                         <button type="button" onClick={() => setShowAlertModal(false)} className="px-4 py-2 bg-proxmox-dark hover:bg-proxmox-hover rounded-lg">
@@ -15763,7 +16879,7 @@
                         onClose={() => setShowProfile(false)}
                         addToast={addToast}
                     />
-                    
+
                     {/* PegaProx Settings Modal */}
                     <PegaProxSettingsModal
                         isOpen={showSettings}
@@ -15771,6 +16887,40 @@
                         addToast={addToast}
                         onGroupsChanged={fetchClusterGroups}
                     />
+
+                    {/* LW Apr 2026 — global command palette (Ctrl/Cmd+K) */}
+                    {showCommandPalette && (
+                        <CommandPalette
+                            t={t}
+                            clusters={clusters}
+                            clusterResources={clusterResources}
+                            clusterMetrics={clusterMetrics}
+                            selectedCluster={selectedCluster}
+                            onClose={() => setShowCommandPalette(false)}
+                            onPickCluster={(c) => { setSelectedCluster(c); setActiveTab('overview'); setShowCommandPalette(false); }}
+                            onPickVm={(vm) => {
+                                const c = clusters.find(cl => cl.id === vm._clusterId);
+                                if (c) setSelectedCluster(c);
+                                setActiveTab('resources');
+                                setResourcesSubTab('management');
+                                setShowCommandPalette(false);
+                            }}
+                            onAction={(id) => {
+                                setShowCommandPalette(false);
+                                if (id === 'settings') setShowSettings(true);
+                                else if (id === 'profile') setShowProfile(true);
+                                else if (id === 'logout') logout();
+                                else if (id === 'audit') { setShowSettings(true); /* tab switches inside */ }
+                                else if (id === 'goto-overview') setActiveTab('overview');
+                                else if (id === 'goto-resources') setActiveTab('resources');
+                                else if (id === 'goto-datacenter') setActiveTab('datacenter');
+                                else if (id === 'goto-automation') setActiveTab('automation');
+                                else if (id === 'goto-reports') setActiveTab('reports');
+                                else if (id === 'goto-plugins') setActiveTab('plugins');
+                                else if (id === 'goto-settings') setActiveTab('settings');
+                            }}
+                        />
+                    )}
                     
                     {/* Group Manager Modal */}
                     {showGroupManager && (

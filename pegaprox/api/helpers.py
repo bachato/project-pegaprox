@@ -69,6 +69,20 @@ def load_server_settings():
         # Alert notification settings
         'alert_email_recipients': [],  # list of email addresses
         'alert_cooldown': 300,  # Don't send same alert within 5 min
+        # NS Apr 2026 (#331) — email notification when a new PegaProx release appears.
+        # Opt-in; re-uses alert_email_recipients. Dedupes via last-notified-version.
+        'alert_update_available': False,
+        'alert_last_notified_version': '',
+        # NS 2026-04-24 — when true, validate_session() invalidates a session if the
+        # source IP changes. Default off because mobile roaming / carrier NAT
+        # legitimately shifts IPs mid-session.
+        'strict_session_ip': False,
+        # MK Apr 2026 — when true, /api/metrics needs no auth. Useful for setups
+        # where a reverse proxy/mutual-TLS already gates scrapes. Default off.
+        'metrics_public': False,
+        # Webhook alert channels (Slack, Discord, Teams, ntfy, generic)
+        # Each: {id, name, type, url, enabled, ...type-specific fields}
+        'alert_webhooks': [],
         # IP Whitelisting - Jan 2026
         'ip_whitelist_enabled': False,
         'ip_whitelist': '',  # Comma-separated IPs/CIDRs
@@ -117,6 +131,7 @@ def load_server_settings():
         'oidc_button_text': 'Sign in with Microsoft',
         'oidc_group_mappings': [],
         'oidc_skip_jwt_verification': False,  # NS: disable JWT sig check for broken JWKS envs
+        'oidc_skip_ssl_verify': False,        # NS Apr 2026 (#188): self-signed-cert escape hatch
     }
     
     try:

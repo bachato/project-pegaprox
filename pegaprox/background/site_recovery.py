@@ -44,6 +44,67 @@ def _fire_webhook(url):
         logger.warning(f"[SR] Webhook failed: {url} - {e}")
 
 
+# NS 2026-04-24 — pre-flight validation. Real-world cause of most "Site Recovery failed
+# at 50%" reports: storage/bridge mappings reference names that don't exist on the
+# target. Proxmox returns HTTP 500 mid-migration with a useless error. We now check
+# before we start.
+def validate_mappings(tgt_mgr, storage_map, net_map):
+    """Validate that the mapping targets actually exist on the target cluster.
+    Returns a list of {severity, msg} entries. Empty list = all good."""
+    issues = []
+    if not tgt_mgr:
+        issues.append({'severity': 'error', 'msg': 'Target cluster manager unavailable'})
+        return issues
+    if not getattr(tgt_mgr, 'is_connected', False):
+        issues.append({'severity': 'error', 'msg': 'Target cluster not connected — cannot validate mappings'})
+        return issues
+
+    # pick any online target node to query storage + network from
+    node_name = None
+    try:
+        ns = tgt_mgr.get_node_status() or {}
+        for n, info in ns.items():
+            if info.get('status') == 'online':
+                node_name = n; break
+    except Exception as e:
+        issues.append({'severity': 'warning', 'msg': f'Could not enumerate target nodes: {e}'})
+    if not node_name:
+        issues.append({'severity': 'error', 'msg': 'No online node on target cluster to validate mappings against'})
+        return issues
+
+    # storage existence check
+    try:
+        storages = tgt_mgr.get_storage_list(node_name) or []
+        stor_names = {s.get('storage') for s in storages if s.get('storage')}
+        for src, tgt in (storage_map or {}).items():
+            if not tgt:
+                issues.append({'severity': 'error', 'msg': f"Storage mapping '{src}' → (empty) — fill in the target storage"})
+            elif tgt not in stor_names:
+                issues.append({'severity': 'error',
+                               'msg': f"Target storage '{tgt}' (mapped from '{src}') does not exist on target cluster"})
+    except Exception as e:
+        issues.append({'severity': 'warning', 'msg': f'Storage validation failed: {e}'})
+
+    # network existence check
+    try:
+        nets = tgt_mgr.get_network_list(node_name) or []
+        net_names = set()
+        for n in nets:
+            name = n.get('iface') or n.get('name')
+            if name:
+                net_names.add(name)
+        for src, tgt in (net_map or {}).items():
+            if not tgt:
+                issues.append({'severity': 'error', 'msg': f"Network mapping '{src}' → (empty) — fill in the target bridge/vnet"})
+            elif tgt not in net_names:
+                issues.append({'severity': 'error',
+                               'msg': f"Target bridge '{tgt}' (mapped from '{src}') does not exist on target cluster"})
+    except Exception as e:
+        issues.append({'severity': 'warning', 'msg': f'Network validation failed: {e}'})
+
+    return issues
+
+
 def _broadcast_progress(plan_id, message, progress=None):
     """Push realtime update to frontend"""
     broadcast_sse({'type': 'site_recovery', 'plan_id': plan_id, 'message': message, 'progress': progress})
@@ -101,23 +162,45 @@ def _migrate_vm_cross_cluster(src_mgr, tgt_mgr, vmid, vm_type, storage_map, net_
 
         # determine target storage — build PVE mapping format "source:target"
         # MK: check if VM's current storage has a mapping, else use first available
+        # NS 2026-04-24: the old `except: pass` silently hid get_vm_config failures
+        # and dumped VMs onto whichever storage happened to be first in the map.
+        # Now we surface the reason + record it in the result so admins can see *why*
+        # the fallback kicked in.
         target_storage = ''
+        fallback_reason = None
         if storage_map:
             try:
                 config = src_mgr.get_vm_config(vm_node, vmid, vm_type)
-                # build PVE mapping format: "src_stor:tgt_stor,src_stor2:tgt_stor2"
-                mappings = []
-                for k, v in (config or {}).items():
-                    if k.startswith(('scsi', 'virtio', 'ide', 'sata', 'rootfs', 'mp')) and isinstance(v, str) and ':' in v:
-                        src_stor = v.split(':')[0]
-                        if src_stor and src_stor != 'none' and src_stor in storage_map:
-                            mappings.append(f"{src_stor}:{storage_map[src_stor]}")
-                if mappings:
-                    target_storage = ','.join(dict.fromkeys(mappings))  # dedupe
-            except Exception:
-                pass
+                if not config:
+                    fallback_reason = 'source config empty (API call returned no data)'
+                else:
+                    # build PVE mapping format: "src_stor:tgt_stor,src_stor2:tgt_stor2"
+                    mappings = []
+                    for k, v in (config or {}).items():
+                        if k.startswith(('scsi', 'virtio', 'ide', 'sata', 'rootfs', 'mp')) and isinstance(v, str) and ':' in v:
+                            src_stor = v.split(':')[0]
+                            if src_stor and src_stor != 'none' and src_stor in storage_map:
+                                mappings.append(f"{src_stor}:{storage_map[src_stor]}")
+                    if mappings:
+                        target_storage = ','.join(dict.fromkeys(mappings))  # dedupe
+                    else:
+                        unmapped = sorted({v.split(':')[0] for k, v in (config or {}).items()
+                                           if k.startswith(('scsi', 'virtio', 'ide', 'sata', 'rootfs', 'mp'))
+                                           and isinstance(v, str) and ':' in v}
+                                          - set(storage_map.keys()) - {'none'})
+                        fallback_reason = (f"VM uses storage(s) {unmapped} but no mapping exists"
+                                           if unmapped else 'no disk entries in VM config')
+            except Exception as _e:
+                fallback_reason = f'get_vm_config failed: {_e}'
+                logger.warning(f"[SR] _migrate_vm_cross_cluster({vmid}): storage-map lookup failed: {_e}")
         if not target_storage:
-            fallback = list(storage_map.values())[0] if storage_map else 'local-lvm'
+            if storage_map:
+                # deterministic fallback: sort mapping by source-storage name so repeat runs pick same target
+                fallback = sorted(storage_map.items())[0][1]
+            else:
+                fallback = 'local-lvm'
+            logger.warning(f"[SR] VM {vmid} falling back to storage '{fallback}'"
+                           + (f" ({fallback_reason})" if fallback_reason else ''))
             target_storage = fallback
 
         target_bridge = 'vmbr0'
@@ -250,6 +333,21 @@ def execute_failover(plan_id, failover_type='planned'):
     net_map = plan.get('network_mappings', {})
     stor_map = plan.get('storage_mappings', {})
 
+    # NS 2026-04-24 — pre-flight: catch bad mappings BEFORE we start moving VMs.
+    # A typo like `local-lvm` → `local-lvmm` used to fail silently mid-migration
+    # with a Proxmox 500; now we fail fast with a clear message.
+    preflight_issues = validate_mappings(tgt_mgr, stor_map, net_map) if failover_type != 'emergency' else []
+    preflight_errors = [i for i in preflight_issues if i.get('severity') == 'error']
+    if preflight_errors:
+        msg = '; '.join(i['msg'] for i in preflight_errors[:3])
+        logger.error(f"[SR] Pre-flight failed for plan '{plan['name']}': {msg}")
+        _broadcast_progress(plan_id, f"Pre-flight failed: {msg}", 100)
+        _complete_event(event_id, 'failed', {'preflight_issues': preflight_issues, 'aborted': 'before any VM moved'})
+        db = get_db()
+        db.execute("UPDATE site_recovery_plans SET status = 'failed', updated_at = ? WHERE id = ?",
+                   (datetime.utcnow().isoformat(), plan_id))
+        return
+
     total_vms = len(vms)
     completed = 0
 
@@ -366,6 +464,7 @@ def execute_test_failover(plan_id):
                             found = True
                             break
                 except Exception as e:
+                    logger.warning(f"[SR] Test failover: exception probing node {node_name} for VM {vmid}: {e}")
                     continue
                 if found:
                     break
@@ -374,20 +473,39 @@ def execute_test_failover(plan_id):
         except Exception as e:
             results[str(vmid)] = {'success': False, 'error': str(e)}
 
-    all_failed = all(not r.get('success') for r in results.values()) if results else True
-    event_status = 'failed' if all_failed else 'completed'
-    _complete_event(event_id, event_status, {'results': results, 'test_vmids': test_vmids})
+    # NS 2026-04-24 — track ok/failed/total so "6 out of 10 VMs cloned" is visible
+    # to admins. Old code marked the whole test as "completed" if even one VM worked.
+    ok_count = sum(1 for r in results.values() if r.get('success'))
+    failed_count = sum(1 for r in results.values() if not r.get('success'))
+    total = len(results)
+    if total == 0:
+        event_status = 'failed'
+    elif failed_count == 0:
+        event_status = 'completed'
+    elif ok_count == 0:
+        event_status = 'failed'
+    else:
+        event_status = 'partial'
+
+    summary = {
+        'results': results,
+        'test_vmids': test_vmids,
+        'counts': {'ok': ok_count, 'failed': failed_count, 'total': total},
+    }
+    _complete_event(event_id, event_status, summary)
 
     db = get_db()
     now = datetime.utcnow().isoformat()
-    if all_failed:
-        # no clones created, nothing to cleanup — mark as failed
+    if event_status == 'failed':
         db.execute("UPDATE site_recovery_plans SET status = 'failed', last_test = ?, updated_at = ? WHERE id = ?", (now, now, plan_id))
-        _broadcast_progress(plan_id, "Test failover failed — no VMs cloned.", 100)
+        _broadcast_progress(plan_id, f"Test failover failed — 0/{total} VMs cloned.", 100)
     else:
         db.execute("UPDATE site_recovery_plans SET last_test = ?, updated_at = ? WHERE id = ?", (now, now, plan_id))
         # keep status as 'testing' until cleanup
-        _broadcast_progress(plan_id, "Test failover complete. Cleanup when ready.", 100)
+        if event_status == 'partial':
+            _broadcast_progress(plan_id, f"Test partial: {ok_count}/{total} cloned, {failed_count} failed. Review events + cleanup.", 100)
+        else:
+            _broadcast_progress(plan_id, f"Test failover complete: {ok_count}/{total} cloned. Cleanup when ready.", 100)
 
     ok = sum(1 for r in results.values() if r.get('success'))
     log_audit('system', 'site_recovery.test_complete',

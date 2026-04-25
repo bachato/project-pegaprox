@@ -519,11 +519,42 @@ def update_node_subscription_api(cluster_id, node):
 # MK: this was surprisingly tricky to get right, proxmox smbios format is picky
 # =============================================================================
 
+# NS 2026-04-24 — sudo detection is shared across SMBIOS helpers. We query once per
+# SSH connection and cache on the client object so every helper sees the same answer.
+def _ssh_sudo_prefix(ssh):
+    """Returns '' when the SSH login user is already root, 'sudo -n ' otherwise.
+    Cached on the ssh object so we don't re-query for every command."""
+    cached = getattr(ssh, '_pegaprox_sudo_prefix', None)
+    if cached is not None:
+        return cached
+    try:
+        stdin, stdout, _ = ssh.exec_command('id -u', timeout=10)
+        uid = stdout.read().decode().strip()
+        prefix = '' if uid == '0' else 'sudo -n '
+    except Exception:
+        prefix = ''
+    try:
+        ssh._pegaprox_sudo_prefix = prefix
+    except Exception:
+        pass
+    return prefix
+
+
 def _ssh_run_checked(ssh, cmd, timeout=30):
     """Run a command via SSH, raise on non-zero exit. NS Apr 2026 — used to be
     scattered all over with `stdout.read()` and no check, which silently swallowed
-    systemctl failures during smbios deploy (#317 aftermath)."""
-    stdin, stdout, stderr = ssh.exec_command(cmd, timeout=timeout)
+    systemctl failures during smbios deploy (#317 aftermath).
+    NS 2026-04-24 — auto-prefix with sudo when login isn't root (pegaprox@pam)."""
+    prefix = _ssh_sudo_prefix(ssh)
+    # Wrap multi-line / redirect commands through `sudo bash -c` via base64 so
+    # `>` and heredocs work. Single-token commands just get a plain prefix.
+    if prefix and (cmd.lstrip().startswith(('cat ', 'sh -c', 'bash -c')) or ' > ' in cmd or '\n' in cmd):
+        import base64 as _b64
+        enc = _b64.b64encode(cmd.encode('utf-8')).decode('ascii')
+        full = f"echo {enc} | base64 -d | sudo -n bash"
+    else:
+        full = f"{prefix}{cmd}"
+    stdin, stdout, stderr = ssh.exec_command(full, timeout=timeout)
     out = stdout.read().decode('utf-8', errors='replace')
     rc = stdout.channel.recv_exit_status()
     err = stderr.read().decode('utf-8', errors='replace').strip()
@@ -533,44 +564,80 @@ def _ssh_run_checked(ssh, cmd, timeout=30):
 
 
 def _ssh_write_file(ssh, path, content, mode=None):
-    """Write file via SSH - SFTP with exec_command fallback.
-    MK Feb 2026 - some Proxmox nodes don't have openssh-sftp-server or /opt/
-    NS Apr 2026 - added exit code checks, was failing silently on perm errors
+    """Write file via SSH. Works for both root and non-root (pegaprox@pam + sudo) logins.
+
+    Strategy:
+      - root login: SFTP direct (fastest), fall back to `cat >`
+      - non-root login: upload to /tmp first (no sudo needed), then `sudo mv` into place.
+        SFTP-writing to /etc via sudo is a mess because paramiko's SFTP runs as the
+        login user — we bypass by staging in /tmp.
+    NS 2026-04-24 — pegaprox@pam + NOPASSWD sudo deployments
     """
     import os
+    prefix = _ssh_sudo_prefix(ssh)
     parent = os.path.dirname(path)
-
-    # Ensure parent directory exists (check exit code!)
     q_parent = shlex.quote(parent)
-    stdin, stdout, stderr = ssh.exec_command(f"mkdir -p {q_parent}")
+    q_path = shlex.quote(path)
+
+    # mkdir first — mkdir -p is a no-op if the dir exists already
+    stdin, stdout, stderr = ssh.exec_command(f"{prefix}mkdir -p {q_parent}")
     rc = stdout.channel.recv_exit_status()
     if rc != 0:
         err = stderr.read().decode('utf-8', errors='replace').strip()
         raise RuntimeError(f"mkdir -p {parent} failed (rc={rc}): {err or 'permission denied?'}")
 
-    q_path = shlex.quote(path)
-    try:
-        sftp = ssh.open_sftp()
-        with sftp.file(path, 'w') as f:
-            f.write(content)
+    if not prefix:
+        # root login — original simple SFTP path
+        try:
+            sftp = ssh.open_sftp()
+            with sftp.file(path, 'w') as f:
+                f.write(content)
+            if mode is not None:
+                sftp.chmod(path, mode)
+            sftp.close()
+        except (IOError, OSError) as e:
+            logging.warning(f"SFTP write to {path} failed ({e}), falling back to exec_command")
+            stdin, stdout, stderr = ssh.exec_command(f"cat > {q_path}")
+            stdin.write(content)
+            stdin.channel.shutdown_write()
+            rc = stdout.channel.recv_exit_status()
+            if rc != 0:
+                err = stderr.read().decode('utf-8', errors='replace').strip()
+                raise RuntimeError(f"write {path} failed (rc={rc}): {err or 'unknown'}")
+            if mode is not None:
+                _ssh_run_checked(ssh, f"chmod {oct(mode)[2:]} {q_path}")
+    else:
+        # non-root — stage in /tmp, then sudo-mv into place
+        import uuid as _uuid
+        tmp_path = f"/tmp/pegaprox-stage-{_uuid.uuid4().hex[:12]}"
+        q_tmp = shlex.quote(tmp_path)
+        try:
+            sftp = ssh.open_sftp()
+            with sftp.file(tmp_path, 'w') as f:
+                f.write(content)
+            sftp.close()
+        except (IOError, OSError) as e:
+            logging.warning(f"SFTP stage to {tmp_path} failed ({e}), using stdin pipe")
+            stdin, stdout, stderr = ssh.exec_command(f"cat > {q_tmp}")
+            stdin.write(content); stdin.channel.shutdown_write()
+            rc = stdout.channel.recv_exit_status()
+            if rc != 0:
+                raise RuntimeError(f"staging {tmp_path} failed (rc={rc})")
+        # Move to final location as root, set mode if requested
+        mv_cmd = f"sudo -n mv {q_tmp} {q_path}"
         if mode is not None:
-            sftp.chmod(path, mode)
-        sftp.close()
-    except (IOError, OSError) as e:
-        logging.warning(f"SFTP write to {path} failed ({e}), falling back to exec_command")
-        # Pipe content via stdin - avoids heredoc escaping issues
-        stdin, stdout, stderr = ssh.exec_command(f"cat > {q_path}")
-        stdin.write(content)
-        stdin.channel.shutdown_write()
+            mv_cmd += f" && sudo -n chmod {oct(mode)[2:]} {q_path}"
+        stdin, stdout, stderr = ssh.exec_command(mv_cmd)
         rc = stdout.channel.recv_exit_status()
-        err = stderr.read().decode('utf-8', errors='replace').strip()
         if rc != 0:
-            raise RuntimeError(f"write {path} failed (rc={rc}): {err or 'unknown'}")
-        if mode is not None:
-            _ssh_run_checked(ssh, f"chmod {oct(mode)[2:]} {q_path}")
+            err = stderr.read().decode('utf-8', errors='replace').strip()
+            # best-effort cleanup so /tmp doesn't stay littered on failure
+            try: ssh.exec_command(f"rm -f {q_tmp}")
+            except Exception: pass
+            raise RuntimeError(f"sudo mv → {path} failed (rc={rc}): {err or 'permission denied?'}")
 
     # Verify — file actually on disk with non-zero size
-    stdin, stdout, stderr = ssh.exec_command(f"test -s {q_path}")
+    stdin, stdout, stderr = ssh.exec_command(f"{prefix}test -s {q_path}")
     if stdout.channel.recv_exit_status() != 0:
         raise RuntimeError(f"Write verification failed: {path} missing or empty")
 
@@ -1002,7 +1069,8 @@ def remove_smbios_autoconfig(cluster_id, node):
         if not ssh:
             return jsonify({'error': 'SSH connection failed - check SSH key in cluster settings'}), 500
 
-        # Stop and disable service, remove files
+        # Stop and disable service, remove files. _ssh_run_checked handles sudo
+        # for pegaprox@pam deployments (NS 2026-04-24).
         commands = [
             'systemctl stop pegaprox-smbios-autoconfig 2>/dev/null || true',
             'systemctl disable pegaprox-smbios-autoconfig 2>/dev/null || true',
@@ -1011,10 +1079,14 @@ def remove_smbios_autoconfig(cluster_id, node):
             'rm -f /var/lib/pegaprox-smbios-processed.txt',
             'systemctl daemon-reload'
         ]
-        
         for cmd in commands:
-            stdin, stdout, stderr = ssh.exec_command(cmd)
-            stdout.read()
+            try:
+                _ssh_run_checked(ssh, cmd)
+            except RuntimeError as rerr:
+                # `|| true` lines stay silent; only bubble hard failures on the unconditional ones
+                if cmd.endswith('|| true'):
+                    continue
+                logging.warning(f"SMBIOS remove: `{cmd}` → {rerr}")
         
         ssh.close()
         
@@ -1060,15 +1132,19 @@ def control_smbios_autoconfig(cluster_id, node):
             cmd = 'rm -f /var/lib/pegaprox-smbios-processed.txt && systemctl restart pegaprox-smbios-autoconfig'
         else:
             cmd = f'systemctl {action} pegaprox-smbios-autoconfig'
-        
-        stdin, stdout, stderr = ssh.exec_command(cmd)
-        stdout.read()
-        err_output = stderr.read().decode()
-        
+
+        err_output = ''
+        try:
+            _ssh_run_checked(ssh, cmd)
+        except RuntimeError as rerr:
+            err_output = str(rerr)
+
         ssh.close()
-        
+
         if err_output and 'not found' in err_output.lower():
             return jsonify({'error': 'Service not installed on this node'}), 404
+        if err_output:
+            return jsonify({'error': err_output}), 500
         
         usr = getattr(request, 'session', {}).get('user', 'system')
         log_audit(usr, f'smbios_autoconfig.{action}', f"SMBIOS auto-config {action} on {node}", cluster=mgr.config.name)

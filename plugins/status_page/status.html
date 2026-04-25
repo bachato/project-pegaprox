@@ -453,6 +453,9 @@ function render(data) {
         html += '</div></div>'; // cluster-body + cluster
     }
 
+    // MK #309 — PBS backup health section (public-facing)
+    html += renderPbsBackups(data.pbs_backups || [], cfg);
+
     // incidents section
     html += renderIncidents(incidents);
 
@@ -499,6 +502,84 @@ function buildUptimeBar(cluster, uptimeData) {
     }
 
     html += '</div><div class="uptime-bar-label"><span>90 days ago</span><span>Today</span></div></div>';
+    return html;
+}
+
+// MK #309 — public-facing backup health block
+function renderPbsBackups(pbsList, cfg) {
+    if (!cfg.show_pbs_backups) return '';
+    if (!pbsList || pbsList.length === 0) return '';
+
+    var html = '<div class="cluster"><div class="cluster-header">' +
+               '<div class="cluster-title"><div class="status-dot status-operational"></div>' +
+               '<span>Backup Health</span></div>' +
+               '<span class="status-text" style="color:var(--muted);font-weight:500">' +
+               pbsList.length + ' PBS server' + (pbsList.length === 1 ? '' : 's') +
+               '</span></div><div class="cluster-body">';
+
+    for (var pi = 0; pi < pbsList.length; pi++) {
+        var p = pbsList[pi];
+        var hasStale = p.stale_count && p.stale_count > 0;
+        var hasFailed = p.failed_verifications && p.failed_verifications > 0;
+        var allGood = p.connected && !hasStale && !hasFailed;
+        var headerColor = !p.connected ? 'var(--red)' : (hasStale || hasFailed ? 'var(--yellow)' : 'var(--green)');
+
+        html += '<div class="section"><div class="section-title" style="display:flex;align-items:center;gap:8px">' +
+                '<span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:' + headerColor + '"></span>' +
+                escapeHtml(p.name);
+        if (p.host) html += '<span style="color:var(--muted);font-weight:400;font-size:11px">&middot; ' + escapeHtml(p.host) + '</span>';
+        html += '</div>';
+
+        if (!p.connected) {
+            html += '<div style="padding:8px 0;color:var(--red);font-size:13px">&#9888; Backup server offline</div></div>';
+            continue;
+        }
+
+        // summary counts
+        html += '<div class="summary-row">' +
+                '<div class="summary-item"><div class="summary-value" style="color:var(--text)">' + (p.total_groups || 0) + '</div><div class="summary-label">Backup groups</div></div>';
+        html += '<div class="summary-item"><div class="summary-value" style="color:' + (hasStale ? 'var(--yellow)' : 'var(--green)') + '">' +
+                (p.stale_count || 0) + '</div><div class="summary-label">Stale (&gt; ' + (cfg.pbs_stale_hours || 48) + 'h)</div></div>';
+        html += '<div class="summary-item"><div class="summary-value" style="color:' + (hasFailed ? 'var(--red)' : 'var(--green)') + '">' +
+                (p.failed_verifications || 0) + '</div><div class="summary-label">Failed verifies</div></div>';
+        html += '<div class="summary-item"><div class="summary-value" style="color:var(--blue)">' + (p.datastores ? p.datastores.length : 0) + '</div><div class="summary-label">Datastores</div></div>';
+        html += '</div>';
+
+        // datastore usage
+        if (p.datastores && p.datastores.length) {
+            html += '<div class="storage-list" style="margin-top:10px">';
+            for (var di = 0; di < p.datastores.length; di++) {
+                var d = p.datastores[di];
+                var pct = d.percent == null ? 0 : d.percent;
+                html += '<div class="storage-item"><div class="storage-info">' +
+                        '<div class="storage-name">' + escapeHtml(d.name) + '</div>' +
+                        '<div class="storage-type">' + (d.groups || 0) + ' groups &middot; ' +
+                        (d.used != null ? fmtBytes(d.used) : '?') + ' / ' + (d.total != null ? fmtBytes(d.total) : '?') +
+                        '</div></div><div style="width:80px">' +
+                        '<div style="text-align:right;font-size:12px;font-weight:600;color:' + barColor(pct, 'storage') + ';margin-bottom:2px">' + pct + '%</div>' +
+                        '<div class="bar"><div class="bar-fill" style="width:' + pct + '%;background:' + barColor(pct, 'storage') + '"></div></div>' +
+                        '</div></div>';
+            }
+            html += '</div>';
+        }
+
+        // stale groups — up to ~20 already trimmed server-side
+        if (hasStale) {
+            html += '<div style="margin-top:10px;padding:10px 12px;background:rgba(210,153,34,0.08);border-left:3px solid var(--yellow);border-radius:4px">';
+            html += '<div style="font-size:12px;color:var(--yellow);font-weight:600;margin-bottom:4px">Oldest stale backups</div>';
+            html += '<ul style="list-style:none;padding:0;margin:0;font-size:12px;line-height:1.6">';
+            for (var si = 0; si < Math.min(p.stale_groups.length, 10); si++) {
+                var sg = p.stale_groups[si];
+                html += '<li>&bull; <code style="font-family:inherit">' + escapeHtml(sg.group) + '</code> on ' +
+                        escapeHtml(sg.store) + ' — ' + Math.round(sg.age_hours) + 'h old</li>';
+            }
+            html += '</ul></div>';
+        }
+
+        html += '</div>';
+    }
+
+    html += '</div></div>';
     return html;
 }
 

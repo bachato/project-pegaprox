@@ -1255,6 +1255,374 @@ def get_pbs_time(pbs_id):
 # Backup Verification — NS Apr 2026
 # ============================================================================
 
+# ============================================================================
+# PBS Reports — issue #273 (Bradley-Radomski, cberr2024)
+# Exportable backup reports for audit use cases (ISO 27001, SOC2, CMMC).
+# Main question the reporter wanted answered: "prove that <VM X> was backed up
+# on <day Y>, and where". Covered by summary + inventory endpoints below.
+# ----------------------------------------------------------------------------
+# Helpers shared by the three endpoints below.
+
+def _pbs_collect_snapshots(mgr, protected_only=False, min_backup_time=0):
+    """Walk all datastores and namespaces and return a flat list of snapshots.
+
+    Each entry carries the originating datastore + namespace. We purposely do
+    not cache — the report is refreshed on demand and the numbers must be
+    current for audit use.
+    """
+    entries = []
+    ds_resp = mgr.get_datastores() or {}
+    for ds in (ds_resp.get('data', []) or []):
+        store = ds.get('name', '')
+        if not store:
+            continue
+        # Figure out which namespaces live under this store. Empty '' is the
+        # root namespace and always exists even if there are no sub-namespaces.
+        namespaces = ['']
+        try:
+            ns_resp = mgr.get_namespaces(store) or {}
+            ns_list = [n.get('ns', '') for n in (ns_resp.get('data', []) or [])]
+            namespaces = list({'', *ns_list})
+        except Exception:
+            pass
+        for ns in namespaces:
+            try:
+                snap_resp = mgr.get_snapshots(store, ns=ns or None) or {}
+            except Exception:
+                continue
+            for s in (snap_resp.get('data', []) or []):
+                if min_backup_time and s.get('backup-time', 0) < min_backup_time:
+                    continue
+                if protected_only and not s.get('protected'):
+                    continue
+                s['_datastore'] = store
+                s['_namespace'] = ns or ''
+                entries.append(s)
+    return entries
+
+
+def _pbs_resolve_vm_names(mgr):
+    """Walk each linked PVE cluster and build (type, vmid_str) -> name.
+    type is normalized to 'vm' / 'ct' to match PBS worker-id conventions.
+    """
+    names = {}
+    for cid in (mgr.linked_clusters or []):
+        pve_mgr = cluster_managers.get(cid)
+        if not pve_mgr or not getattr(pve_mgr, 'is_connected', False):
+            continue
+        try:
+            resources = pve_mgr.get_vm_resources() or []
+        except Exception:
+            continue
+        for r in resources:
+            t = r.get('type')
+            if t == 'qemu':
+                vt = 'vm'
+            elif t == 'lxc':
+                vt = 'ct'
+            else:
+                continue
+            names[(vt, str(r.get('vmid', '')))] = r.get('name', '')
+    return names
+
+
+@bp.route('/api/pbs/<pbs_id>/reports/summary', methods=['GET'])
+@require_auth(perms=['pbs.view'])
+def get_pbs_reports_summary(pbs_id):
+    """Aggregated backup report over a time window.
+
+    Covers the executive-summary + per-VM rollup reports from #273.
+
+    Query params:
+      days      time window (default 30, max 365)
+    """
+    if pbs_id not in pbs_managers:
+        return jsonify({'error': 'PBS server not found'}), 404
+    mgr = pbs_managers[pbs_id]
+    if not mgr.connected:
+        return jsonify({'error': 'Not connected'}), 503
+
+    import time
+    import datetime as _dt
+
+    try:
+        days = max(1, min(365, int(request.args.get('days', 30))))
+    except Exception:
+        days = 30
+    now_ts = int(time.time())
+    since_ts = now_ts - days * 86400
+
+    # ── Backup tasks in window ─────────────────────────────────────────────
+    tasks_resp = mgr.get_tasks(limit=500, typefilter='backup', since=since_ts) or {}
+    tasks = tasks_resp.get('data', []) or []
+
+    totals = {'jobs': 0, 'success': 0, 'warning': 0, 'failed': 0}
+    per_day = {}          # YYYY-MM-DD -> {date, success, warning, failed}
+    per_vm_latest = {}    # (type, vmid) -> latest task dict
+
+    for t in tasks:
+        # PBS task shape: {upid, starttime, endtime, status, worker_type, worker_id}
+        if t.get('worker_type') != 'backup':
+            continue
+        totals['jobs'] += 1
+
+        status_raw = (t.get('status') or '').strip()
+        status_upper = status_raw.upper()
+        if status_upper == 'OK':
+            bucket = 'success'
+        elif 'WARN' in status_upper:
+            bucket = 'warning'
+        else:
+            bucket = 'failed'
+        totals[bucket] += 1
+
+        end_ts = t.get('endtime') or t.get('starttime') or 0
+        if end_ts:
+            day = _dt.datetime.fromtimestamp(end_ts).strftime('%Y-%m-%d')
+            if day not in per_day:
+                per_day[day] = {'date': day, 'success': 0, 'warning': 0, 'failed': 0}
+            per_day[day][bucket] += 1
+
+        worker_id = t.get('worker_id') or t.get('id') or ''
+        if '/' in worker_id:
+            vm_type, vmid = worker_id.split('/', 1)
+            key = (vm_type, vmid)
+            prev = per_vm_latest.get(key)
+            if (prev is None
+                    or (t.get('endtime') or 0) > (prev.get('endtime') or 0)):
+                per_vm_latest[key] = t
+
+    # ── Snapshot inventory for size/verify info ────────────────────────────
+    snapshots = _pbs_collect_snapshots(mgr)
+    snapshots_by_key = {}   # (type, vmid_str) -> [snap, ...]
+    for s in snapshots:
+        key = (s.get('backup-type', ''), str(s.get('backup-id', '')))
+        snapshots_by_key.setdefault(key, []).append(s)
+
+    # unverified older than 30 days — used as a compliance-warning gauge
+    cutoff_verify = now_ts - 30 * 86400
+    unverified_old = 0
+    for s in snapshots:
+        v = s.get('verification') or {}
+        state = v.get('state') if isinstance(v, dict) else None
+        if state != 'ok' and s.get('backup-time', 0) < cutoff_verify:
+            unverified_old += 1
+
+    # ── Resolve VM names from linked clusters ──────────────────────────────
+    vm_names = _pbs_resolve_vm_names(mgr)
+
+    # ── Build per-VM rollup (Veeam-style last N per job) ───────────────────
+    per_vm = []
+    for (vm_type, vmid), task in per_vm_latest.items():
+        snaps = snapshots_by_key.get((vm_type, vmid), [])
+        latest_snap = max(snaps, key=lambda x: x.get('backup-time', 0)) if snaps else None
+
+        end_ts = task.get('endtime') or 0
+        start_ts = task.get('starttime') or 0
+        duration = (end_ts - start_ts) if end_ts and start_ts else 0
+        status_upper = (task.get('status') or '').upper()
+        if status_upper == 'OK':
+            status_label = 'success'
+        elif 'WARN' in status_upper:
+            status_label = 'warning'
+        else:
+            status_label = 'failed'
+
+        latest_verify = {}
+        if latest_snap:
+            latest_verify = latest_snap.get('verification') or {}
+            if not isinstance(latest_verify, dict):
+                latest_verify = {}
+        per_vm.append({
+            'type': vm_type,
+            'vmid': vmid,
+            'vm_name': vm_names.get((vm_type, str(vmid)), ''),
+            'datastore': latest_snap.get('_datastore') if latest_snap else '',
+            'namespace': latest_snap.get('_namespace') if latest_snap else '',
+            'last_backup_ts': end_ts,
+            'status': status_label,
+            'size': latest_snap.get('size', 0) if latest_snap else 0,
+            'duration_s': duration,
+            'verified': latest_verify.get('state') == 'ok',
+            'snapshot_count': len(snaps),
+            'upid': task.get('upid', ''),
+        })
+    per_vm.sort(key=lambda x: x.get('last_backup_ts', 0), reverse=True)
+
+    # ── Fill missing days so frontend chart renders gaps as zeros ──────────
+    per_day_filled = []
+    for i in range(days - 1, -1, -1):
+        day = (_dt.datetime.fromtimestamp(now_ts) - _dt.timedelta(days=i)).strftime('%Y-%m-%d')
+        per_day_filled.append(per_day.get(day, {'date': day, 'success': 0, 'warning': 0, 'failed': 0}))
+
+    success_rate = (totals['success'] / totals['jobs'] * 100.0) if totals['jobs'] else 0.0
+
+    return jsonify({
+        'window': {'days': days, 'since_ts': since_ts, 'until_ts': now_ts},
+        'totals': {**totals, 'success_rate': round(success_rate, 1)},
+        'per_day': per_day_filled,
+        'per_vm': per_vm,
+        'inventory_snapshot_count': len(snapshots),
+        'unverified_older_than_30d': unverified_old,
+    })
+
+
+@bp.route('/api/pbs/<pbs_id>/reports/inventory', methods=['GET'])
+@require_auth(perms=['pbs.view'])
+def get_pbs_reports_inventory(pbs_id):
+    """Flat list of every snapshot across all datastores/namespaces.
+
+    Primary use-case from #273: audit question "prove X was backed up on day Y
+    and where". This endpoint is the answer.
+
+    Query params:
+      days=0         filter to snapshots newer than N days (0 = no filter)
+      protected=1    only protected snapshots
+    """
+    if pbs_id not in pbs_managers:
+        return jsonify({'error': 'PBS server not found'}), 404
+    mgr = pbs_managers[pbs_id]
+    if not mgr.connected:
+        return jsonify({'error': 'Not connected'}), 503
+
+    import time
+    try:
+        days = int(request.args.get('days', 0))
+    except Exception:
+        days = 0
+    protected_only = str(request.args.get('protected', '')).lower() in ('1', 'true', 'yes')
+    now_ts = int(time.time())
+    min_bt = (now_ts - days * 86400) if days > 0 else 0
+
+    raw = _pbs_collect_snapshots(mgr, protected_only=protected_only, min_backup_time=min_bt)
+
+    vm_names = _pbs_resolve_vm_names(mgr)
+
+    entries = []
+    for s in raw:
+        verify = s.get('verification') or {}
+        if not isinstance(verify, dict):
+            verify = {}
+        vtype = s.get('backup-type', '')
+        vmid = str(s.get('backup-id', ''))
+        entries.append({
+            'type': vtype,
+            'vmid': vmid,
+            'vm_name': vm_names.get((vtype, vmid), ''),
+            'datastore': s.get('_datastore', ''),
+            'namespace': s.get('_namespace', ''),
+            'backup_time': s.get('backup-time', 0),
+            'size': s.get('size', 0),
+            'owner': s.get('owner', ''),
+            'protected': bool(s.get('protected', False)),
+            'comment': s.get('comment', '') or '',
+            'verified': verify.get('state') == 'ok',
+            'verified_state': verify.get('state') or None,
+            'verified_time': verify.get('upid_time') if isinstance(verify, dict) else None,
+            'files_count': len(s.get('files', []) or []),
+        })
+    entries.sort(key=lambda x: x['backup_time'], reverse=True)
+    return jsonify({'entries': entries, 'count': len(entries)})
+
+
+@bp.route('/api/pbs/<pbs_id>/reports/protected-vms', methods=['GET'])
+@require_auth(perms=['pbs.view'])
+def get_pbs_reports_protected_vms(pbs_id):
+    """Gap analysis — which cluster VMs/CTs are actually backed up.
+
+    Essential for SOC2 "protected workloads" audit evidence (#273).
+
+    Query params:
+      cluster_id   (required) PVE cluster to check
+      days=7       a VM counts as protected if its most recent snapshot is
+                   within this window. Older ones land in 'stale'.
+    """
+    if pbs_id not in pbs_managers:
+        return jsonify({'error': 'PBS server not found'}), 404
+    mgr = pbs_managers[pbs_id]
+    if not mgr.connected:
+        return jsonify({'error': 'Not connected'}), 503
+
+    cluster_id = request.args.get('cluster_id', '')
+    if not cluster_id:
+        return jsonify({'error': 'cluster_id query param required'}), 400
+    pve_mgr = cluster_managers.get(cluster_id)
+    if not pve_mgr:
+        return jsonify({'error': 'Cluster not found'}), 404
+
+    import time
+    try:
+        days = max(1, min(365, int(request.args.get('days', 7))))
+    except Exception:
+        days = 7
+    cutoff = int(time.time()) - days * 86400
+
+    try:
+        resources = pve_mgr.get_vm_resources() or []
+    except Exception as e:
+        return jsonify({'error': f'Could not load cluster resources: {e}'}), 502
+
+    # Most recent backup timestamp + datastore per (type, vmid)
+    most_recent = {}
+    snaps = _pbs_collect_snapshots(mgr)
+    for s in snaps:
+        key = (s.get('backup-type', ''), str(s.get('backup-id', '')))
+        bt = s.get('backup-time', 0)
+        cur = most_recent.get(key)
+        if cur is None or bt > cur['ts']:
+            most_recent[key] = {
+                'ts': bt,
+                'datastore': s.get('_datastore', ''),
+                'namespace': s.get('_namespace', ''),
+            }
+
+    protected, unprotected, stale = [], [], []
+    for r in resources:
+        rtype = r.get('type')
+        if rtype not in ('qemu', 'lxc'):
+            continue
+        vt = 'vm' if rtype == 'qemu' else 'ct'
+        vmid = str(r.get('vmid', ''))
+        info = most_recent.get((vt, vmid))
+        entry = {
+            'type': vt,
+            'vmid': vmid,
+            'vm_name': r.get('name', ''),
+            'node': r.get('node', ''),
+            'status': r.get('status', ''),
+            'last_backup_ts': info['ts'] if info else 0,
+            'datastore': info['datastore'] if info else '',
+            'namespace': info['namespace'] if info else '',
+        }
+        if not info:
+            unprotected.append(entry)
+        elif info['ts'] < cutoff:
+            stale.append(entry)
+        else:
+            protected.append(entry)
+
+    protected.sort(key=lambda x: (x['vm_name'] or x['vmid']).lower())
+    unprotected.sort(key=lambda x: (x['vm_name'] or x['vmid']).lower())
+    stale.sort(key=lambda x: x['last_backup_ts'])
+
+    return jsonify({
+        'window': {'days': days, 'cutoff_ts': cutoff},
+        'counts': {
+            'protected': len(protected),
+            'unprotected': len(unprotected),
+            'stale': len(stale),
+            'total': len(protected) + len(unprotected) + len(stale),
+        },
+        'protected': protected,
+        'unprotected': unprotected,
+        'stale': stale,
+    })
+
+
+# End of PBS Reports (#273)
+# ============================================================================
+
+
 @bp.route('/api/clusters/<cluster_id>/backup-verify', methods=['POST'])
 @require_auth(perms=['vm.backup'])
 def start_backup_verification(cluster_id):

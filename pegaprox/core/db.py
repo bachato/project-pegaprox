@@ -502,6 +502,7 @@ class PegaProxDB:
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 cluster_id TEXT,
                 vmid INTEGER,
+                vm_type TEXT DEFAULT 'qemu',
                 action TEXT NOT NULL,
                 schedule_type TEXT NOT NULL,
                 schedule_time TEXT,
@@ -509,10 +510,23 @@ class PegaProxDB:
                 schedule_date TEXT,
                 enabled INTEGER DEFAULT 1,
                 last_run TEXT,
+                name TEXT,
                 created_by TEXT,
                 created_at TEXT
             )
         ''')
+        # MK Apr 2026 (#337): existing deployments are missing name + vm_type columns.
+        # Both were in the Python in-memory model but never persisted, so edits
+        # dropped both back to defaults on reload. Migrate in-place.
+        try:
+            cursor.execute("PRAGMA table_info(scheduled_actions)")
+            cols = {row['name'] for row in cursor.fetchall()}
+            if 'name' not in cols:
+                cursor.execute("ALTER TABLE scheduled_actions ADD COLUMN name TEXT")
+            if 'vm_type' not in cols:
+                cursor.execute("ALTER TABLE scheduled_actions ADD COLUMN vm_type TEXT DEFAULT 'qemu'")
+        except Exception as _migr_e:
+            logging.warning(f"scheduled_actions migration skipped: {_migr_e}")
         
         # Update schedules table - MK Jan 2026
         # For automatic rolling updates
@@ -695,6 +709,26 @@ class PegaProxDB:
         cursor.execute('''
             CREATE INDEX IF NOT EXISTS idx_api_tokens_user ON api_tokens(username)
         ''')
+
+        # NS Apr 2026 — WebAuthn / FIDO2 hardware token credentials
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS webauthn_credentials (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                username TEXT NOT NULL,
+                credential_id BLOB NOT NULL UNIQUE,
+                public_key BLOB NOT NULL,
+                sign_count INTEGER DEFAULT 0,
+                transports TEXT DEFAULT '',
+                aaguid TEXT DEFAULT '',
+                name TEXT NOT NULL,
+                user_handle BLOB NOT NULL,
+                created_at TEXT NOT NULL,
+                last_used_at TEXT,
+                last_used_ip TEXT
+            )
+        ''')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_webauthn_user ON webauthn_credentials(username)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_webauthn_cred ON webauthn_credentials(credential_id)')
         
         # Schema migrations for existing databases
         # Add password_salt column if it doesn't exist (for databases created before this fix)

@@ -252,7 +252,7 @@
             --color-card-rgb: 22, 27, 34;
             --color-border-rgb: 48, 54, 61;
             --color-hover-rgb: 28, 33, 40;
-            --color-secondary-rgb: 35, 134, 54;
+            --color-secondary-rgb: 22, 27, 34;  /* NS 2026-04-24: was green (35,134,54); caused bg-proxmox-secondary inputs (tokens, LDAP, OIDC) to render on a grass-coloured background. Now matches --color-card-rgb for a consistent sunken input look. */
             --color-success-rgb: 63, 185, 80;
             --color-warning-rgb: 210, 153, 34;
             --color-error-rgb: 248, 81, 73;
@@ -1119,6 +1119,7 @@
         body[data-corp-theme="light"] .bg-proxmox-dark { background: #eef1f4 !important; }
         body[data-corp-theme="light"] .bg-proxmox-darker { background: #e4e8ec !important; }
         body[data-corp-theme="light"] .bg-proxmox-card { background: #fff !important; }
+        body[data-corp-theme="light"] .bg-proxmox-secondary { background: #fff !important; color: #222 !important; border-color: #cfd8dc !important; }
         body[data-corp-theme="light"] .bg-proxmox-hover { background: #e8f0f4 !important; }
         body[data-corp-theme="light"] .border-proxmox-border { border-color: #cfd8dc !important; }
         body[data-corp-theme="light"] .border-gray-700\/50,
@@ -1443,6 +1444,48 @@
         /* toggle switch */
         body[data-corp-theme="light"] .toggle-switch { background: #cfd8dc !important; }
         body[data-corp-theme="light"] .toggle-switch.active { background: var(--corp-accent) !important; }
+
+        /* LW Apr 2026 (#296) — light-mode polish for the spots proxforge flagged.
+           The aggressive light-mode overrides above caught 90% of elements, but three
+           concrete patterns were still dark-on-light or bleached grey on white:
+           search inputs rendered inline, secondary-text grays too weak for WCAG AA,
+           and "card-style" buttons with text-gray-400 on white card bg.                */
+
+        /* (1) search bars — inline styles on the filter/search inputs didn't get
+           caught by the generic input override because they set explicit rgba()
+           backgrounds via inline style. Force white + dark text + visible border. */
+        body[data-corp-theme="light"] input[type="text"][placeholder],
+        body[data-corp-theme="light"] input[type="search"],
+        body[data-corp-theme="light"] input[placeholder*="Filter"],
+        body[data-corp-theme="light"] input[placeholder*="filter"],
+        body[data-corp-theme="light"] input[placeholder*="Suchen"],
+        body[data-corp-theme="light"] input[placeholder*="Search"],
+        body[data-corp-theme="light"] input[placeholder*="search"] {
+            background: #fff !important;
+            color: #222 !important;
+            border-color: #b0bec5 !important;
+        }
+        body[data-corp-theme="light"] input::placeholder { color: #8a99a5 !important; }
+
+        /* (2) darker text for low-importance labels — #777 / #888 bleached against
+           white cards. Push toward AA. Keep .text-gray-500 slightly lighter than
+           .text-gray-400 so hierarchy survives. */
+        body[data-corp-theme="light"] .text-gray-400 { color: #4a5561 !important; }
+        body[data-corp-theme="light"] .text-gray-500 { color: #5e6a75 !important; }
+        /* and the inline-style twins that React sometimes emits as hex/rgb */
+        body[data-corp-theme="light"] [style*="color: #728b9a"],
+        body[data-corp-theme="light"] [style*="color: rgb(114, 139, 154)"],
+        body[data-corp-theme="light"] [style*="color: #adbbc4"],
+        body[data-corp-theme="light"] [style*="color: rgb(173, 187, 196)"] { color: #5e6a75 !important; }
+
+        /* (3) buttons that use bg-proxmox-card + text-gray-400 (e.g. the Storage tab
+           buttons incl. ISO-Sync tab). In dark mode they read fine; in light mode
+           the card bg is white and the text-gray-400 barely shows. Treat them like
+           inactive tabs: light-grey surface, mid-tone text, accent on hover/active. */
+        body[data-corp-theme="light"] button.bg-proxmox-card { background: #f0f2f5 !important; border: 1px solid #cfd8dc !important; }
+        body[data-corp-theme="light"] button.bg-proxmox-card.text-gray-400 { color: #455560 !important; }
+        body[data-corp-theme="light"] button.bg-proxmox-card:hover { color: #0072a3 !important; background: #e8f0f4 !important; }
+        /* active tab styling already lands via bg-proxmox-orange → leave it */
 
         /* NS: xterm.js terminal must not inherit corporate spacing/font overrides */
         body[data-layout="corporate"] .xterm,

@@ -740,6 +740,8 @@
             
             // NS: Issue #50 - Guest Agent info
             const [guestInfo, setGuestInfo] = useState(null);
+            // MK #334 — fsinfo for the modern/compact panel (mirrors the Corporate one)
+            const [fsInfo, setFsInfo] = useState(null);
 
             // LW: inline arrow fn, less boilerplate
             const authFetch = async (url, opts = {}) => {
@@ -843,6 +845,16 @@
                     .then(data => { if (data && data.agent_running) setGuestInfo(data); else setGuestInfo(null); })
                     .catch(() => setGuestInfo(null));
             }, [vm.vmid, vm.status, clusterId]);
+
+            // MK #334 — fsinfo; same chain as the corporate panel, only polled when the
+            // agent responded to the prior guest-info call (avoids 500-spam for agent-less VMs).
+            useEffect(() => {
+                if (!isQemu || vm.status !== 'running' || !guestInfo) { setFsInfo(null); return; }
+                authFetch(`${API_URL}/clusters/${clusterId}/vms/${vm.node}/${vm.type}/${vm.vmid}/guest-fsinfo`)
+                    .then(r => r && r.ok ? r.json() : null)
+                    .then(d => setFsInfo(d || null))
+                    .catch(() => setFsInfo(null));
+            }, [vm.vmid, vm.status, clusterId, !!guestInfo]);
 
             // NS: Fetch VM config for hardware info (machine type, BIOS, SCSI, CPU model)
             const [vmHwInfo, setVmHwInfo] = useState(null);
@@ -1162,6 +1174,41 @@
                             </div>
                         </div>
                     )}
+
+                    {/* MK #334 — guest filesystem usage (modern/compact variant).
+                        Kept tight because the Resources panel can be narrow; full size/pct info
+                        on a second line so the bar always has breathing room. */}
+                    {isQemu && vm.status === 'running' && fsInfo?.filesystems?.length > 0 && (
+                        <div className="px-6 pb-2">
+                            <div className="bg-proxmox-dark rounded-lg px-3 py-2">
+                                <div className="flex items-center justify-between mb-1.5">
+                                    <div className="flex items-center gap-1.5">
+                                        <Icons.HardDrive className="w-3.5 h-3.5 text-proxmox-orange" />
+                                        <span className="text-[12px] font-medium text-white">{t('guestFilesystems') || 'Filesystem Usage'}</span>
+                                    </div>
+                                    <span className="text-[10px] text-gray-500">{fsInfo.filesystems.length}</span>
+                                </div>
+                                <div className="space-y-1">
+                                    {fsInfo.filesystems.map((fs, i) => {
+                                        const pct = fs.used_pct == null ? 0 : fs.used_pct;
+                                        const barColor = pct > 90 ? '#f54f47' : pct > 75 ? '#efc006' : '#60b515';
+                                        const sizes = fs.used_bytes != null && fs.total_bytes != null
+                                            ? `${formatBytes(fs.used_bytes)} / ${formatBytes(fs.total_bytes)}` : '';
+                                        return (
+                                            <div key={i} className="flex items-center gap-1.5 text-[11px]" title={`${fs.name || ''} (${fs.type || '?'}) ${sizes}`}>
+                                                <span className="font-mono text-gray-300 truncate flex-shrink-0" style={{maxWidth: '80px'}}>{fs.mountpoint}</span>
+                                                <div className="flex-1 h-1 bg-proxmox-darker rounded overflow-hidden min-w-0">
+                                                    <div className="h-full" style={{width: `${Math.min(pct, 100)}%`, background: barColor}} />
+                                                </div>
+                                                <span className="text-gray-200 font-mono flex-shrink-0" style={{minWidth: '30px', textAlign: 'right'}}>{fs.used_pct != null ? `${fs.used_pct}%` : '—'}</span>
+                                            </div>
+                                        );
+                                    })}
+                                </div>
+                            </div>
+                        </div>
+                    )}
+
                     {isQemu && vm.status === 'running' && !guestInfo && (
                         <div className="px-6 pb-2">
                             <div className="bg-proxmox-dark rounded-lg p-3 flex items-center gap-3">
@@ -1380,6 +1427,36 @@
             const displayName = vm.name || `${isQemu ? 'VM' : 'CT'} ${vm.vmid}`;
             const isRunning = vm.status === 'running';
 
+            // LW Apr 2026 (#250) — per-VM web link (browser-local; keyed by cluster:vmid)
+            const webLinkKey = `${clusterId}:${vm.vmid}`;
+            const loadVmLinks = () => {
+                try { return JSON.parse(localStorage.getItem('pegaprox-vm-weblinks') || '{}'); }
+                catch(_) { return {}; }
+            };
+            const [vmWebUrl, setVmWebUrl] = useState(() => (loadVmLinks()[webLinkKey] || ''));
+            // re-read when switching between VMs
+            useEffect(() => { setVmWebUrl(loadVmLinks()[webLinkKey] || ''); }, [webLinkKey]);
+            const saveVmWebUrl = (url) => {
+                const clean = (url || '').trim();
+                const all = loadVmLinks();
+                if (clean) all[webLinkKey] = clean; else delete all[webLinkKey];
+                try { localStorage.setItem('pegaprox-vm-weblinks', JSON.stringify(all)); } catch(_) {}
+                setVmWebUrl(clean);
+            };
+            const promptForVmWebUrl = () => {
+                const cur = vmWebUrl || '';
+                const next = window.prompt(t('setVmWebLinkPrompt') || `Web URL for ${displayName} (leave empty to remove):`, cur);
+                if (next === null) return;  // cancelled
+                let n = next.trim();
+                if (n && !/^https?:\/\//i.test(n)) n = 'http://' + n;  // allow bare host:port
+                saveVmWebUrl(n);
+                addToast?.(n ? (t('vmWebLinkSaved') || 'Web link saved') : (t('vmWebLinkCleared') || 'Web link removed'), 'success');
+            };
+            const openVmWebUrl = () => {
+                if (!vmWebUrl) { promptForVmWebUrl(); return; }
+                window.open(vmWebUrl, '_blank', 'noopener,noreferrer');
+            };
+
             // Reuse same fetch pattern as VmDetailPanel
             const authFetch = async (url, opts = {}) => {
                 try { return await fetch(url, { ...opts, credentials: 'include', headers: { ...opts.headers, ...getAuthHeaders() } }); }
@@ -1473,6 +1550,8 @@
             const [metricsTimeframe, setMetricsTimeframe] = useState('hour');
             const [metricsData, setMetricsData] = useState(null);
             const [metricsLoading, setMetricsLoading] = useState(false);
+            // MK #334 — filesystem usage from qemu-agent get-fsinfo
+            const [fsInfo, setFsInfo] = useState(null);
 
             // Close actions menu on outside click
             useEffect(() => {
@@ -1521,6 +1600,16 @@
                     .then(data => { if (data && data.agent_running) setGuestInfo(data); else setGuestInfo(null); })
                     .catch(() => setGuestInfo(null));
             }, [vm.vmid, vm.status, clusterId]);
+
+            // MK #334 — fsinfo. Only polls when guest agent is alive to avoid hammering the
+            // proxmox API with 500s for VMs without an agent.
+            useEffect(() => {
+                if (!isQemu || vm.status !== 'running' || !guestInfo) { setFsInfo(null); return; }
+                authFetch(`${API_URL}/clusters/${clusterId}/vms/${vm.node}/${vm.type}/${vm.vmid}/guest-fsinfo`)
+                    .then(r => r && r.ok ? r.json() : null)
+                    .then(d => setFsInfo(d || null))
+                    .catch(() => setFsInfo(null));
+            }, [vm.vmid, vm.status, clusterId, !!guestInfo]);
 
             // Fetch VM hardware config
             useEffect(() => {
@@ -1693,6 +1782,19 @@
                                             </button>
                                         )}
                                         <div className="my-1" style={{borderTop: '1px solid var(--corp-border-medium)'}}></div>
+                                        {/* LW Apr 2026 (#250) — user-configurable web URL for this VM */}
+                                        <button onClick={() => { openVmWebUrl(); setShowActionsMenu(false); }}
+                                            className="w-full text-left px-3 py-1.5 text-[13px] flex items-center gap-2" style={{color: 'var(--corp-text-secondary)'}}>
+                                            <Icons.ExternalLink className="w-3.5 h-3.5" />
+                                            {vmWebUrl ? (t('openVmWebUI') || 'Open Web UI') : (t('setVmWebLink') || 'Set Web URL…')}
+                                        </button>
+                                        {vmWebUrl && (
+                                            <button onClick={() => { promptForVmWebUrl(); setShowActionsMenu(false); }}
+                                                className="w-full text-left px-3 py-1.5 text-[11px] flex items-center gap-2" style={{color: 'var(--corp-text-secondary)', opacity: 0.7}}>
+                                                <span className="w-3.5 h-3.5" /> {t('editVmWebLink') || 'Edit Web URL…'}
+                                            </button>
+                                        )}
+                                        <div className="my-1" style={{borderTop: '1px solid var(--corp-border-medium)'}}></div>
                                         <button onClick={() => { onDelete(vm); setShowActionsMenu(false); }} className="w-full text-left px-3 py-1.5 text-[13px] flex items-center gap-2" style={{color: '#f54f47'}}>
                                             <Icons.Trash className="w-3.5 h-3.5" /> {t('delete')}
                                         </button>
@@ -1803,6 +1905,41 @@
                                     <Icons.AlertTriangle className="w-4 h-4 flex-shrink-0" style={{color: '#efc006'}} />
                                     <span className="text-[13px]" style={{color: '#efc006'}}>{t('guestAgentNotInstalled')}</span>
                                     <a href="https://pve.proxmox.com/wiki/Qemu-guest-agent" target="_blank" rel="noopener noreferrer" className="text-[12px] ml-1" style={{color: '#49afd9'}}>{t('installGuestAgent') || 'Install QEMU Guest Agent...'}</a>
+                                </div>
+                            )}
+
+                            {/* MK #334 — Guest filesystem usage (qemu-agent). Rendered only when
+                                we actually got a list back, so VMs without agent stay uncluttered. */}
+                            {isQemu && isRunning && fsInfo?.filesystems?.length > 0 && (
+                                <div style={{border: '1px solid var(--corp-border-medium)'}}>
+                                    <div className="px-3 py-2 flex items-center gap-2" style={{background: 'var(--corp-header-bg)', borderBottom: '1px solid var(--corp-border-medium)'}}>
+                                        <Icons.HardDrive className="w-3.5 h-3.5" style={{color: 'var(--corp-accent)'}} />
+                                        <span className="text-[13px] font-medium" style={{color: '#e9ecef'}}>{t('guestFilesystems') || 'Filesystem Usage'}</span>
+                                        <span className="text-[11px] ml-auto" style={{color: '#728b9a'}}>{fsInfo.filesystems.length} {fsInfo.filesystems.length === 1 ? 'mount' : 'mounts'}</span>
+                                    </div>
+                                    <div className="p-3 space-y-2">
+                                        {fsInfo.filesystems.map((fs, i) => {
+                                            const pct = fs.used_pct == null ? 0 : fs.used_pct;
+                                            const barColor = pct > 90 ? '#f54f47' : pct > 75 ? '#efc006' : '#60b515';
+                                            return (
+                                                <div key={i} className="flex items-center gap-2 text-[12px]">
+                                                    <span style={{color: '#adbbc4', minWidth: '140px', fontFamily: 'monospace'}} title={fs.name || ''}>{fs.mountpoint}</span>
+                                                    {fs.type && (
+                                                        <span className="text-[10px] px-1 py-0 rounded" style={{background: 'rgba(255,255,255,0.05)', color: '#728b9a'}}>{fs.type}</span>
+                                                    )}
+                                                    <div className="flex-1 flex items-center gap-2">
+                                                        <div className="flex-1 h-1.5 overflow-hidden" style={{background: 'var(--corp-bar-track)'}}>
+                                                            <div className="h-full" style={{width: `${Math.min(pct, 100)}%`, background: barColor}}></div>
+                                                        </div>
+                                                        <span style={{color: '#e9ecef', minWidth: '45px', textAlign: 'right'}}>{fs.used_pct != null ? `${fs.used_pct}%` : '—'}</span>
+                                                    </div>
+                                                    <span className="text-[11px]" style={{color: '#728b9a', minWidth: '140px', textAlign: 'right', fontFamily: 'monospace'}}>
+                                                        {fs.used_bytes != null ? formatBytes(fs.used_bytes) : '—'} / {fs.total_bytes != null ? formatBytes(fs.total_bytes) : '—'}
+                                                    </span>
+                                                </div>
+                                            );
+                                        })}
+                                    </div>
                                 </div>
                             )}
 

@@ -26,7 +26,9 @@
                 password_expiry_include_admins: false,  // NS: opt-in for admins
                 // NS: Feb 2026 - Force 2FA
                 force_2fa: false,
-                force_2fa_exclude_admins: false
+                force_2fa_exclude_admins: false,
+                // NS 2026-04-24 — strict session IP binding (audit #6)
+                strict_session_ip: false,
             });
             const [lockedIps, setLockedIps] = useState([]);
             const [lockedUsers, setLockedUsers] = useState([]);  // NS: Username lockout support
@@ -66,7 +68,8 @@
                             password_expiry_email_enabled: data.password_expiry_email_enabled !== false,
                             password_expiry_include_admins: data.password_expiry_include_admins || false,
                             force_2fa: data.force_2fa || false,
-                            force_2fa_exclude_admins: data.force_2fa_exclude_admins || false
+                            force_2fa_exclude_admins: data.force_2fa_exclude_admins || false,
+                            strict_session_ip: data.strict_session_ip || false,
                         }));
                     }
                 } catch(e) {
@@ -613,6 +616,30 @@
                                 </div>
                             </div>
                         )}
+                    </div>
+
+                    {/* NS Apr 2026 — session IP-binding (audit #6) */}
+                    <div className="bg-proxmox-dark border border-proxmox-border rounded-xl p-4">
+                        <h4 className="font-medium text-white mb-3 flex items-center gap-2">
+                            <Icons.Shield className="w-4 h-4" />
+                            {t('strictSessionIp') || 'Strict Session IP Binding'}
+                        </h4>
+                        <label className="flex items-start gap-3 cursor-pointer p-3 rounded-lg hover:bg-proxmox-hover/50">
+                            <input type="checkbox"
+                                checked={settings.strict_session_ip || false}
+                                onChange={e => {
+                                    const ns = {...settings, strict_session_ip: e.target.checked};
+                                    saveSettings(ns);
+                                }}
+                                className="mt-0.5 w-4 h-4 rounded accent-proxmox-orange"
+                            />
+                            <div>
+                                <span className="text-sm text-white font-medium">{t('strictSessionIpLabel') || 'Invalidate sessions when source IP changes'}</span>
+                                <p className="text-xs text-gray-500 mt-0.5">
+                                    {t('strictSessionIpDesc') || 'Stops session cookies from being used from a different network (hijacking via stolen cookie). Warning: mobile users on carrier NAT or VPN-toggling users may be logged out when their IP shifts.'}
+                                </p>
+                            </div>
+                        </label>
                     </div>
 
                     {/* Locked IPs */}
@@ -1817,10 +1844,13 @@
                     )}
                     
                     {/* Add VM dropdown */}
-                    <div className="flex gap-2">
+                    {/* MK Apr 2026 (#335): min-w-0 on the select lets flex shrink it below its intrinsic
+                        content width (long VM names would otherwise push the Exclude button out of
+                        view). flex-shrink-0 + whitespace-nowrap on the button keeps it pinned. */}
+                    <div className="flex gap-2 w-full">
                         <select
                             id={`excludeVMSelect-${clusterId}`}
-                            className="flex-1 bg-proxmox-dark border border-proxmox-border rounded-lg px-3 py-2 text-sm"
+                            className="flex-1 min-w-0 bg-proxmox-dark border border-proxmox-border rounded-lg px-3 py-2 text-sm"
                             defaultValue=""
                         >
                             <option value="" disabled>{t('selectVMToExclude') || 'Select VM to exclude...'}</option>
@@ -1839,7 +1869,7 @@
                                 excludeVM(vmid, vm?.name);
                                 select.value = '';
                             }}
-                            className="px-3 py-2 bg-red-500/20 text-red-400 rounded-lg hover:bg-red-500/30 text-sm flex items-center gap-1"
+                            className="flex-shrink-0 whitespace-nowrap px-3 py-2 bg-red-500/20 text-red-400 rounded-lg hover:bg-red-500/30 text-sm flex items-center gap-1"
                         >
                             <Icons.Ban className="w-4 h-4" />
                             {t('exclude') || 'Exclude'}
@@ -1905,10 +1935,11 @@
                             ))}
                         </div>
                     )}
-                    <div className="flex gap-2">
+                    {/* #335: same flex fix as ExcludedVMsList — long pool names pushed the button out */}
+                    <div className="flex gap-2 w-full">
                         <select
                             id={`excludePoolSelect-${clusterId}`}
-                            className="flex-1 bg-proxmox-dark border border-proxmox-border rounded-lg px-3 py-2 text-sm"
+                            className="flex-1 min-w-0 bg-proxmox-dark border border-proxmox-border rounded-lg px-3 py-2 text-sm"
                             defaultValue=""
                         >
                             <option value="" disabled>{t('selectPool') || 'Select pool to exclude...'}</option>
@@ -1925,7 +1956,7 @@
                                 excludePool(select.value);
                                 select.value = '';
                             }}
-                            className="px-3 py-2 bg-red-500/20 text-red-400 rounded-lg hover:bg-red-500/30 text-sm flex items-center gap-1"
+                            className="flex-shrink-0 whitespace-nowrap px-3 py-2 bg-red-500/20 text-red-400 rounded-lg hover:bg-red-500/30 text-sm flex items-center gap-1"
                         >
                             <Icons.Ban className="w-4 h-4" />
                             {t('exclude') || 'Exclude'}
@@ -1949,6 +1980,7 @@
             const [skipEvacuation, setSkipEvacuation] = useState(false);  // NS: Issue #22 - skip VM evacuation (NOT RECOMMENDED)
             const [evacuationTimeout, setEvacuationTimeout] = useState(1800);  // NS: 30 min default
             const [rebootTimeout, setRebootTimeout] = useState(600);  // NS Apr 2026 (#328): 10 min default, extend for Ceph/slow-boot nodes
+            const [allowLocalDisks, setAllowLocalDisks] = useState(false);  // #330
             const [waitForReboot, setWaitForReboot] = useState(true);  // NS: GitHub #40 - wait for node online before next
             const [pauseOnEvacError, setPauseOnEvacError] = useState(true);  // NS: GitHub #40 - pause if VMs fail to migrate
             const [showAdvancedOptions, setShowAdvancedOptions] = useState(false);  // NS: Toggle for timeouts
@@ -2076,15 +2108,19 @@
             // Check for updates with progress
             const [checkProgress, setCheckProgress] = useState(null);
             
-            const checkUpdates = async () => {
+            // NS 2026-04-24: pass `force` to bypass the 24h server cache.
+            // Auto-fired checks (stale cache, post-rolling-update) run non-forced and
+            // reuse the cached payload when fresh; only the Refresh button forces a poll.
+            const checkUpdates = async (force = false) => {
                 setChecking(true);
                 setCheckProgress({ status: 'checking', message: t('checkingNodes') || 'Checking nodes for updates...' });
-                
+
                 try {
                     const res = await fetch(`${API_URL}/clusters/${clusterId}/updates/check`, {
                         method: 'POST',
                         credentials: 'include',
-                        headers: getAuthHeaders()
+                        headers: {...getAuthHeaders(), 'Content-Type': 'application/json'},
+                        body: JSON.stringify({ force: !!force }),
                     });
                     
                     const json = await res.json();
@@ -2240,7 +2276,8 @@
                             wait_for_reboot: waitForReboot,  // NS: GitHub #40
                             pause_on_evacuation_error: pauseOnEvacError,  // NS: GitHub #40
                             evacuation_timeout: evacuationTimeout,
-                            reboot_timeout: rebootTimeout  // NS Apr 2026 (#328): per-cluster override for slow-boot nodes
+                            reboot_timeout: rebootTimeout,  // NS Apr 2026 (#328): per-cluster override for slow-boot nodes
+                            allow_local_disks: allowLocalDisks,  // #330
                         })
                     });
                     const data = await response.json();
@@ -2417,7 +2454,7 @@
                             {/* Actions */}
                             <div className="flex items-center gap-3">
                                 <button
-                                    onClick={(e) => { e.stopPropagation(); checkUpdates(); }}
+                                    onClick={(e) => { e.stopPropagation(); checkUpdates(true); }}
                                     disabled={checking}
                                     className="px-4 py-2 bg-proxmox-dark border border-proxmox-border rounded-lg text-sm hover:border-proxmox-orange transition-colors flex items-center gap-2 disabled:opacity-50"
                                 >
@@ -3253,6 +3290,33 @@
                                                     {t('rebootTimeoutHint') || 'How long to wait for a node to come back online after reboot. Extend this if you run Ceph OSDs or have many disks.'}
                                                 </p>
                                             </div>
+
+                                            {/* LW Apr 2026 (#330): opt-in for local-disk evacuation. intentionally
+                                                styled as a checkbox with a warning block so users don't flip it
+                                                without reading — copying disks over the cluster network is painful
+                                                on bigger VMs. */}
+                                            <label className="flex items-start gap-2 mt-3 cursor-pointer" title={t('allowLocalDisksHint') || ''}>
+                                                <input
+                                                    type="checkbox"
+                                                    checked={allowLocalDisks}
+                                                    onChange={(e) => setAllowLocalDisks(e.target.checked)}
+                                                    disabled={skipEvacuation}
+                                                    className="mt-0.5 w-4 h-4 rounded border-proxmox-border bg-proxmox-darker accent-proxmox-orange"
+                                                />
+                                                <div>
+                                                    <div className="text-sm text-white">
+                                                        {t('allowLocalDisks') || 'Allow --with-local-disks migration'}
+                                                    </div>
+                                                    <p className="text-xs text-gray-500">
+                                                        {t('allowLocalDisksHint') || 'Evacuate VMs with local storage by copying disks to the target node over the cluster network. Can take a long time on large VMs.'}
+                                                    </p>
+                                                    {allowLocalDisks && (
+                                                        <p className="text-xs text-yellow-400 mt-1">
+                                                            ⚠ {t('allowLocalDisksWarn') || 'Expect significantly longer evacuation time. Consider increasing Evacuation Timeout.'}
+                                                        </p>
+                                                    )}
+                                                </div>
+                                            </label>
                                         </div>
                                     )}
                                 </div>

@@ -71,7 +71,9 @@ class V2PMigrationTask:
         # MK: Apr 2026 — extended migration config (#222)
         self.ostype = self.config.get('ostype', 'auto')
         self.cpu_type = self.config.get('cpu_type', 'host')
-        self.vga = self.config.get('vga', 'vmware')
+        # NS Apr 2026 — default to 'std' (universal). VMware-svga driver from ESXi
+        # guest doesn't survive cross-hypervisor jump and renders garbled.
+        self.vga = self.config.get('vga', 'std')
         self.sockets = self.config.get('sockets', 0)
         self.cores_per_socket = self.config.get('cores_per_socket', 0)
         self.memory = self.config.get('memory', 0)
@@ -92,6 +94,11 @@ class V2PMigrationTask:
         self.protection = self.config.get('protection', False)
         self.tags = self.config.get('tags', '')
         self.description = self.config.get('description', '')
+        # NS Apr 2026 — recovery state for outer except handler. If we suspend
+        # the source VM and then crash before resuming, the source stays in
+        # suspended-forever limbo on ESXi. Track so cleanup can revive it.
+        self._source_suspended = False
+        self._extra_snapshots = []  # named snapshots beyond the migration snap
     
     def log(self, msg):
         ts = datetime.now().strftime('%H:%M:%S')
@@ -351,17 +358,39 @@ def _run_v2p_migration(task):
         if not descriptor_files:
             task.set_phase('failed', f'No VMDK descriptor files found in {vm_path}'); return
         
-        # Verify sshfs on Proxmox node
+        # Verify sshfs on Proxmox node (auto-install + re-verify).
+        # NS Apr 2026 — old check looked for the substring "sshfs" in apt-get output,
+        # which matched even when install silently failed (lock held, mirror down).
+        # New: check PRESENT/INSTALLED/FAILED sentinel from the post-install probe.
         task.log(f"Verifying sshfs on Proxmox node {task.target_node}...")
-        rc, out, err = _pve_node_exec(pve_mgr, task.target_node,
-            'which sshfs || apt-get install -y sshfs 2>&1', timeout=60)
-        if 'sshfs' not in (out + err) and rc != 0:
-            task.set_phase('failed', f'sshfs not available on node: {err}'); return
-        task.log("sshfs OK")
-        
-        # Also ensure sshpass is available (needed for SCP fallback)
+        rc, out, _ = _pve_node_exec(pve_mgr, task.target_node,
+            "if command -v sshfs >/dev/null 2>&1; then echo PRESENT; else "
+            "  DEBIAN_FRONTEND=noninteractive apt-get update -qq >/dev/null 2>&1 || true; "
+            "  DEBIAN_FRONTEND=noninteractive apt-get install -y sshfs >/tmp/v2p-sshfs-install.log 2>&1; "
+            "  if command -v sshfs >/dev/null 2>&1; then echo INSTALLED; "
+            "  else echo FAILED; tail -5 /tmp/v2p-sshfs-install.log 2>/dev/null; fi; "
+            "fi",
+            timeout=180)
+        verdict = ''
+        for line in reversed(str(out or '').splitlines()):
+            line = line.strip()
+            if line in ('PRESENT', 'INSTALLED', 'FAILED'):
+                verdict = line; break
+        if verdict == 'PRESENT':
+            task.log("sshfs OK (already installed)")
+        elif verdict == 'INSTALLED':
+            task.log("sshfs auto-installed on target node ✓")
+        else:
+            task.set_phase('failed',
+                f'sshfs not available on {task.target_node} and auto-install failed. '
+                f'Run manually: apt install sshfs\nInstaller tail: {out[-300:]}')
+            return
+
+        # Also ensure sshpass is available (needed for SCP fallback). Best-effort.
         _pve_node_exec(pve_mgr, task.target_node,
-            'which sshpass || apt-get install -y sshpass 2>&1', timeout=60)
+            "command -v sshpass >/dev/null 2>&1 || "
+            "DEBIAN_FRONTEND=noninteractive apt-get install -y sshpass >/dev/null 2>&1 || true",
+            timeout=120)
         
         # Get next VMID
         try:
@@ -432,7 +461,11 @@ def _run_v2p_migration(task):
 
         # MK: Apr 2026 — fully configurable VM creation (#222)
         cpu_type = getattr(task, 'cpu_type', 'host') or 'host'
-        vga_type = getattr(task, 'vga', 'vmware') or 'vmware'
+        # NS Apr 2026 — default to 'std' VGA after V2P. ESXi VMs report vmware-svga,
+        # but the Windows VMware Tools display driver doesn't survive the cross-hypervisor
+        # jump and renders the post-boot framebuffer garbled. Standard VGA is universally
+        # supported by every guest (Windows builds in vgaSave.sys / *VESA*).
+        vga_type = getattr(task, 'vga', '') or 'std'
         task_sockets = getattr(task, 'sockets', 0) or 0
         task_cores = getattr(task, 'cores_per_socket', 0) or 0
         # prefer user values, fallback to ESXi detection
@@ -498,9 +531,15 @@ def _run_v2p_migration(task):
             sb = getattr(task, 'secure_boot', None)
             if sb is None:
                 sb = hw.get('secure_boot', False)
+            # NS Apr 2026 — Windows guests need Microsoft KEK enrolled in NVRAM, otherwise
+            # OVMF can't validate bootmgfw.efi (signed by MS) and the VM PXE-loops post-V2P.
+            # Force pre-enrolled-keys=1 for any Windows ostype (covers win10/win11/win-server).
+            # The pre-enrolled template also ships sane default Boot####/BootOrder entries.
+            is_windows = str(ostype or '').lower().startswith('win')
+            pre_keys = '1' if (sb or is_windows) else '0'
             task._pending_efidisk = {
                 'efitype': '4m',
-                'pre_enrolled_keys': '1' if sb else '0',
+                'pre_enrolled_keys': pre_keys,
             }
         # TPM: auto-detect or user override
         tpm = getattr(task, 'tpm_enabled', None)
@@ -671,10 +710,179 @@ def _run_v2p_migration(task):
         # ================================================================
         # TRANSFER MODE ROUTING
         # ================================================================
-        # sshfs_boot: Stop VM → Boot Proxmox from SSHFS → Live-move disks (near-zero downtime)
-        # offline:    Stop VM → Full copy via SSH dd → Start Proxmox (more downtime, simpler)
-        # auto:       Try pre-sync while running → fallback to sshfs_boot if locked
-        
+        # sshfs_boot:    Stop VM → Boot Proxmox from SSHFS → Live-move disks (near-zero downtime)
+        # offline:       Stop VM → Full copy via SSH dd → Start Proxmox (more downtime, simpler)
+        # snapshot_zero: ESXi snapshot rotation iterative-delta, VM stays running until cutover (~10s downtime)
+        # auto:          Try pre-sync while running → fallback to sshfs_boot if locked
+
+        # NS Apr 2026 — snapshot_zero owns its own dispatch so it doesn't get sucked into the
+        # auto-mode's silent-fallback-to-sshfs_boot. We log clearly and fail explicitly if
+        # pre-sync can't access the base VMDK (typical: VM running but VMDK locked because of
+        # active snapshot disagreement).
+        if task.transfer_mode == 'snapshot_zero':
+            task.log("=== TRANSFER MODE: snapshot_zero (zero-downtime via snapshot rotation) ===")
+            task.log("Creating initial migration snapshot (S0)...")
+            # NS Apr 2026 — DO NOT use quiesce=True here. Quiesce requires VMware Tools running
+            # and responsive; if Tools are stuck (common after multiple power-cycles or guest BSOD)
+            # the call returns "success" but the snapshot is never actually created on disk.
+            # We accept slightly stale guest state in exchange for the snapshot reliably appearing.
+            snap_result = vmware_mgr.create_snapshot(
+                task.vm_id, '_pegaprox_migration_snap',
+                'PegaProx live migration - do not delete manually',
+                memory=False, quiesce=False)
+            if 'error' in snap_result:
+                task.set_phase('failed', f'snapshot_zero S0 creation failed: {snap_result.get("error")}')
+                _cleanup_sshfs(pve_mgr, task.target_node, mnt_path)
+                return
+            # Verify the snapshot ACTUALLY exists on ESXi (defensive — REST returns 200 even on issues)
+            time.sleep(3)
+            verify_snaps = vmware_mgr.get_snapshots(task.vm_id).get('data', []) or []
+            if not any(s.get('name') == '_pegaprox_migration_snap' for s in verify_snaps):
+                task.set_phase('failed',
+                    'snapshot_zero S0 was reported created but is not present on ESXi. '
+                    'Likely cause: VMware Tools unresponsive (try rebooting the source VM cleanly first), '
+                    'or vCenter/ESXi rejected the snapshot (check vCenter task log).')
+                _cleanup_sshfs(pve_mgr, task.target_node, mnt_path)
+                return
+            task.log("  S0 confirmed on ESXi — base VMDKs frozen, delta1 active")
+            task.log("  Waiting 10s for ESXi to settle snapshot state...")
+            time.sleep(10)
+
+            task.set_phase('pre_sync')
+            task.log("=== PRE-SYNC: copy base VMDKs while VM keeps running ===")
+            presync_volumes = []
+            for i, desc_file in enumerate(descriptor_files):
+                dk = f'disk{i}'
+                disk_size = task.disk_progress[dk]['total']
+                task.log(f"Pre-sync disk {i}: {desc_file} ({disk_size / (1024**3):.1f} GB)")
+                vol_id, vol_path = _ssh_pipe_transfer(
+                    pve_mgr, task, esxi_host, esxi_user, esxi_pass,
+                    datastore, vm_dir, desc_file, i)
+                if not vol_id:
+                    task.set_phase('failed',
+                        f'snapshot_zero pre-sync failed for disk {i} ({desc_file}). '
+                        f'No fallback — set transfer_mode to "auto" or "offline" if you accept higher downtime.')
+                    try: vmware_mgr.delete_migration_snapshot(task.vm_id)
+                    except: pass
+                    _cleanup_sshfs(pve_mgr, task.target_node, mnt_path)
+                    return
+                # Resolve flat path on ESXi for delta-extent reads later
+                flat_file = desc_file.replace('.vmdk', '-flat.vmdk')
+                esxi_flat = f"/vmfs/volumes/{datastore}/{vm_dir}/{flat_file}"
+                presync_volumes.append((vol_id, vol_path, esxi_flat, disk_size))
+                # attach to Proxmox VM shell
+                _pve_node_exec(pve_mgr, task.target_node,
+                    f"qm set {task.proxmox_vmid} --{disk_bus}{i} {vol_id} 2>&1", timeout=30)
+                task.log(f"  Disk {i} attached as {disk_bus}{i}")
+                task.update_progress(dk, disk_size, disk_size)
+            task.log("=== PRE-SYNC COMPLETE — entering snapshot-iterative delta loop ===")
+
+            # Iterative delta loop (VM still running on ESXi)
+            task.set_phase('delta_sync')
+            try:
+                ok, n_iters, snap_chain = _snapshot_zero_v2p_delta_loop(
+                    pve_mgr, task, vmware_mgr, esxi_host, esxi_user, esxi_pass,
+                    datastore, vm_dir, descriptor_files, presync_volumes, mnt_path)
+                if not ok:
+                    raise Exception("delta loop returned failure")
+                task.log(f"=== DELTA LOOP CONVERGED after {n_iters} iterations ===")
+
+                # Cutover — minimal downtime
+                task.set_phase('cutover')
+                cut_t0 = time.time()
+                task.log("=== CUTOVER: pausing ESXi VM (downtime starts) ===")
+                pwr = vmware_mgr.vm_power_action(task.vm_id, 'suspend')
+                if 'error' in pwr:
+                    task.log(f"  Suspend failed ({pwr.get('error')}), falling back to power-off")
+                    vmware_mgr.vm_power_action(task.vm_id, 'stop')
+                else:
+                    task._source_suspended = True
+                time.sleep(3)
+
+                vmware_mgr.create_snapshot(task.vm_id, '_pegaprox_v2p_final',
+                                            'V2P final cutover delta', memory=False, quiesce=False)
+                snap_chain.append('_pegaprox_v2p_final')
+                task._extra_snapshots.append('_pegaprox_v2p_final')
+                time.sleep(1)
+
+                all_deltas = _list_delta_files_on_esxi(esxi_host, esxi_user, esxi_pass,
+                                                        datastore, vm_dir, descriptor_files)
+                final_bytes = 0
+                for di, (vol_id, vol_path, _, _) in enumerate(presync_volumes):
+                    deltas = all_deltas[di] if di < len(all_deltas) else []
+                    if not deltas:
+                        continue
+                    final_delta = deltas[-2] if len(deltas) >= 2 else deltas[-1]
+                    desc_e = final_delta.replace('-delta.vmdk', '.vmdk')
+                    rel = desc_e.replace(f"/vmfs/volumes/{datastore}/", "")
+                    sshfs_d = f"{mnt_path}/{rel}"
+                    sshfs_data = sshfs_d.replace('.vmdk', '-delta.vmdk')
+                    extents = _qemu_map_extents_via_sshfs(pve_mgr, task, sshfs_d) or []
+                    deltas_top = [e for e in extents if e.get('data') and (e.get('depth', 0) == 0)]
+                    for e in deltas_top:
+                        if _apply_extent_dd(pve_mgr, task, sshfs_data, vol_path,
+                                            e.get('start', 0), e.get('length', 0)):
+                            final_bytes += e.get('length', 0)
+                task.log(f"  Final cutover delta: {final_bytes / (1024**2):.2f} MB applied")
+
+                # Apply Proxmox-side fixes (sector size, EFI, BOOTX64 fallback)
+                _pve_node_exec(pve_mgr, task.target_node,
+                    f"qm set {task.proxmox_vmid} --boot order={disk_bus}0 2>&1", timeout=15)
+                if bios == 'ovmf':
+                    pending = getattr(task, '_pending_efidisk', None) or {'efitype': '4m', 'pre_enrolled_keys': '1'}
+                    pre_keys = pending.get('pre_enrolled_keys', '1')
+                    _pve_node_exec(pve_mgr, task.target_node,
+                        f"qm set {task.proxmox_vmid} --efidisk0 {task.target_storage}:1,efitype=4m,pre-enrolled-keys={pre_keys} 2>&1",
+                        timeout=15)
+                _ensure_guest_sector_size_512(pve_mgr, task, disk_bus, len(descriptor_files))
+                _register_uefi_fallback_loader(pve_mgr, task)
+
+                # Start Proxmox VM
+                if task.start_after:
+                    pve_mgr._api_post(
+                        f"https://{pve_mgr.host}:8006/api2/json/nodes/{task.target_node}"
+                        f"/qemu/{task.proxmox_vmid}/status/start")
+                cut_t1 = time.time()
+                actual_downtime = cut_t1 - cut_t0
+                task.log(f"=== ACTUAL DOWNTIME: {actual_downtime:.1f}s ===")
+                task.total_downtime_seconds = actual_downtime
+
+                # Cleanup ESXi: power-off + delete migration snapshots
+                task.log("Cleaning up ESXi snapshot chain + powering off source...")
+                try:
+                    vmware_mgr.vm_power_action(task.vm_id, 'stop')
+                    time.sleep(3)
+                except Exception:
+                    pass
+                for sn in reversed(snap_chain):
+                    try:
+                        snap_list = vmware_mgr.get_snapshots(task.vm_id).get('data', []) or []
+                        target = next((s for s in snap_list if s.get('name') == sn), None)
+                        if target:
+                            vmware_mgr.delete_snapshot(task.vm_id, str(target.get('snapshot') or target.get('id') or ''))
+                    except Exception as _ce:
+                        task.log(f"  Snapshot cleanup of '{sn}' failed: {_ce}")
+                try: vmware_mgr.delete_migration_snapshot(task.vm_id)
+                except: pass
+                if task.remove_source:
+                    task.log("Deleting source VM on ESXi (remove_source=true)")
+                    try: vmware_mgr.delete_vm(task.vm_id)
+                    except Exception as _e: task.log(f"  delete_vm failed: {_e}")
+
+                task.set_phase('verify')
+                time.sleep(5)
+                task.set_phase('cleanup')
+                _cleanup_sshfs(pve_mgr, task.target_node, mnt_path)
+                task.set_phase('completed')
+                task.log(f"COMPLETED (snapshot_zero, downtime: {actual_downtime:.1f}s): {task.vm_name} -> VMID {task.proxmox_vmid}")
+                return
+            except Exception as _szerr:
+                task.set_phase('failed', f'snapshot_zero exception: {_szerr}')
+                _cleanup_sshfs(pve_mgr, task.target_node, mnt_path)
+                try: vmware_mgr.delete_migration_snapshot(task.vm_id)
+                except: pass
+                return
+
         if task.transfer_mode == 'sshfs_boot':
             task.log(f"=== TRANSFER MODE: QEMU SSH Boot + Live Copy ===")
             task.log("Near-zero downtime: boot from SSH, copy in background")
@@ -707,7 +915,8 @@ def _run_v2p_migration(task):
             # Go directly to SSHFS-boot flow (reuse the same code block)
             # Create temp storage, symlink disks, boot, move
             _do_sshfs_boot_migration(pve_mgr, task, vmware_mgr, esxi_host, esxi_user, esxi_pass,
-                                     datastore, vm_dir, descriptor_files, disk_bus, mnt_path)
+                                     datastore, vm_dir, descriptor_files, disk_bus, mnt_path,
+                                     v2p_tmpdir=v2p_tmpdir)
             return
         
         if task.transfer_mode == 'offline':
@@ -763,9 +972,26 @@ def _run_v2p_migration(task):
             # Set boot order and start
             _pve_node_exec(pve_mgr, task.target_node,
                 f"qm set {task.proxmox_vmid} --boot order={disk_bus}0 2>&1", timeout=10)
-            
+
+            # NS Apr 2026 — allocate persistent efidisk0 for OVMF guests. Without this,
+            # Proxmox uses /tmp/<vmid>-ovmf.fd as throwaway NVRAM and Boot entries don't
+            # survive reboots. (Bug previously caused OVMF→PXE-loop on V2P'd Windows VMs.)
+            if bios == 'ovmf':
+                pending = getattr(task, '_pending_efidisk', None) or {'efitype': '4m', 'pre_enrolled_keys': '1'}
+                pre_keys = pending.get('pre_enrolled_keys', '1')
+                _pve_node_exec(pve_mgr, task.target_node,
+                    f"qm set {task.proxmox_vmid} --efidisk0 {task.target_storage}:1,efitype=4m,pre-enrolled-keys={pre_keys} 2>&1",
+                    timeout=15)
+                task.log(f"  EFI disk allocated (OVMF, pre-enrolled-keys={pre_keys})")
+
+            # NS Apr 2026 — 4K iSCSI LUN sector-size emulation (see helper)
+            _ensure_guest_sector_size_512(pve_mgr, task, disk_bus, len(descriptor_files))
+
+            # NS Apr 2026 — UEFI fallback loader so OVMF auto-boots Windows post-V2P
+            _register_uefi_fallback_loader(pve_mgr, task)
+
             _cleanup_sshfs(pve_mgr, task.target_node, mnt_path)
-            
+
             if task.start_after:
                 task.log("Starting Proxmox VM...")
                 try:
@@ -832,7 +1058,8 @@ def _run_v2p_migration(task):
                 time.sleep(2)
                 
                 _do_sshfs_boot_migration(pve_mgr, task, vmware_mgr, esxi_host, esxi_user, esxi_pass,
-                                         datastore, vm_dir, descriptor_files, disk_bus, mnt_path)
+                                         datastore, vm_dir, descriptor_files, disk_bus, mnt_path,
+                                         v2p_tmpdir=v2p_tmpdir)
                 return
             
             if not vol_id:
@@ -859,7 +1086,115 @@ def _run_v2p_migration(task):
             task.update_progress(dk, disk_size, disk_size)
         
         task.log("=== PRE-SYNC COMPLETE ===")
-        
+
+        # NS Apr 2026 — snapshot_zero mode: iterative delta with VM running, then suspend + tiny final delta.
+        # Falls back to standard delta_sync on any error.
+        if task.transfer_mode == 'snapshot_zero' and not stopped_for_presync:
+            task.set_phase('delta_sync')
+            task.log("=== SNAPSHOT-ZERO MODE: iterative delta, VM keeps running ===")
+            try:
+                ok, n_iters, snap_chain = _snapshot_zero_v2p_delta_loop(
+                    pve_mgr, task, vmware_mgr, esxi_host, esxi_user, esxi_pass,
+                    datastore, vm_dir, descriptor_files, presync_volumes, mnt_path)
+                if not ok:
+                    task.log("snapshot-zero loop failed, falling back to standard delta")
+                    raise Exception("snapshot_zero failed")
+                task.log(f"=== SNAPSHOT-ZERO converged after {n_iters} iterations ===")
+
+                # ===== CUTOVER: ESXi-suspend → final delta → start Proxmox VM =====
+                task.set_phase('cutover')
+                cut_t0 = time.time()
+                task.log("=== CUTOVER: pausing ESXi VM ===")
+                pwr = vmware_mgr.vm_power_action(task.vm_id, 'suspend')
+                if 'error' in pwr:
+                    task.log(f"  Suspend failed ({pwr['error']}), falling back to power-off")
+                    vmware_mgr.vm_power_action(task.vm_id, 'stop')
+                else:
+                    task._source_suspended = True
+                # Give ESXi a moment to write final delta blocks
+                time.sleep(3)
+
+                # Take FINAL snapshot to freeze post-suspend state
+                vmware_mgr.create_snapshot(task.vm_id, '_pegaprox_v2p_final',
+                                            'V2P final cutover delta', memory=False, quiesce=False)
+                snap_chain.append('_pegaprox_v2p_final')
+                task._extra_snapshots.append('_pegaprox_v2p_final')
+                time.sleep(1)
+
+                # Apply final tiny delta — same logic as inside the loop
+                all_deltas = _list_delta_files_on_esxi(esxi_host, esxi_user, esxi_pass,
+                                                        datastore, vm_dir, descriptor_files)
+                final_bytes = 0
+                for di, (vol_id, vol_path, _, _) in enumerate(presync_volumes):
+                    deltas = all_deltas[di] if di < len(all_deltas) else []
+                    if not deltas:
+                        continue
+                    final_delta = deltas[-2] if len(deltas) >= 2 else deltas[-1]
+                    desc_e = final_delta.replace('-delta.vmdk', '.vmdk')
+                    rel = desc_e.replace(f"/vmfs/volumes/{datastore}/", "")
+                    sshfs_d = f"{mnt_path}/{rel}"
+                    sshfs_data = sshfs_d.replace('.vmdk', '-delta.vmdk')
+                    extents = _qemu_map_extents_via_sshfs(pve_mgr, task, sshfs_d) or []
+                    deltas_top = [e for e in extents if e.get('data') and (e.get('depth', 0) == 0)]
+                    for e in deltas_top:
+                        if _apply_extent_dd(pve_mgr, task, sshfs_data, vol_path,
+                                            e.get('start', 0), e.get('length', 0)):
+                            final_bytes += e.get('length', 0)
+                task.log(f"  Final cutover delta: {final_bytes / (1024**2):.2f} MB applied")
+
+                # Now do the same post-disk-attach steps as the normal path:
+                _pve_node_exec(pve_mgr, task.target_node,
+                    f"qm set {task.proxmox_vmid} --boot order={disk_bus}0 2>&1", timeout=15)
+                if bios == 'ovmf':
+                    pending = getattr(task, '_pending_efidisk', None) or {'efitype': '4m', 'pre_enrolled_keys': '1'}
+                    pre_keys = pending.get('pre_enrolled_keys', '1')
+                    _pve_node_exec(pve_mgr, task.target_node,
+                        f"qm set {task.proxmox_vmid} --efidisk0 {task.target_storage}:1,efitype=4m,pre-enrolled-keys={pre_keys} 2>&1",
+                        timeout=15)
+                _ensure_guest_sector_size_512(pve_mgr, task, disk_bus, len(descriptor_files))
+                _register_uefi_fallback_loader(pve_mgr, task)
+
+                # Start Proxmox VM
+                if task.start_after:
+                    pve_mgr._api_post(
+                        f"https://{pve_mgr.host}:8006/api2/json/nodes/{task.target_node}"
+                        f"/qemu/{task.proxmox_vmid}/status/start")
+                cut_t1 = time.time()
+                actual_downtime = cut_t1 - cut_t0
+                task.log(f"=== ACTUAL DOWNTIME: {actual_downtime:.1f}s ===")
+                task.total_downtime_seconds = actual_downtime
+
+                # Cleanup ESXi snapshots (collapse chain back to base, then remove)
+                task.log("Cleaning up ESXi snapshot chain...")
+                for sn in reversed(snap_chain):
+                    try:
+                        snap_list = vmware_mgr.get_snapshots(task.vm_id).get('data', []) or []
+                        target = next((s for s in snap_list if s.get('name') == sn), None)
+                        if target:
+                            vmware_mgr.delete_snapshot(task.vm_id, str(target.get('snapshot') or target.get('id') or ''))
+                    except Exception as _ce:
+                        task.log(f"  Snapshot cleanup of '{sn}' failed: {_ce}")
+
+                if task.remove_source:
+                    task.log("Powering off + deleting source VM on ESXi...")
+                    try:
+                        vmware_mgr.vm_power_action(task.vm_id, 'stop')
+                        time.sleep(3)
+                        vmware_mgr.delete_vm(task.vm_id)
+                    except Exception as _e:
+                        task.log(f"  Source-VM cleanup failed: {_e}")
+
+                task.set_phase('verify')
+                time.sleep(5)
+                task.set_phase('cleanup')
+                _cleanup_sshfs(pve_mgr, task.target_node, mnt_path)
+                task.set_phase('completed')
+                task.log(f"COMPLETED (snapshot_zero, downtime: {actual_downtime:.1f}s): {task.vm_name} -> VMID {task.proxmox_vmid}")
+                return
+            except Exception as _szerr:
+                task.log(f"snapshot_zero exception: {_szerr} — falling back to legacy delta_sync")
+                # fall through to legacy path below
+
         if stopped_for_presync:
             # VM was stopped during pre-sync -- we have a clean copy, skip delta-sync
             task.log("=== SKIPPING DELTA SYNC (VM was stopped, copy is clean) ===")
@@ -956,7 +1291,26 @@ def _run_v2p_migration(task):
         task.set_phase('cutover')
         _pve_node_exec(pve_mgr, task.target_node,
             f"qm set {task.proxmox_vmid} --boot order={disk_bus}0 2>&1", timeout=15)
-        
+
+        # NS Apr 2026 — allocate persistent efidisk0 for OVMF guests so NVRAM (Boot
+        # entries, MS keys) survives reboots. Without this Proxmox falls back to
+        # /tmp/<vmid>-ovmf.fd throwaway NVRAM and the VM PXE-loops post-V2P.
+        if bios == 'ovmf':
+            pending = getattr(task, '_pending_efidisk', None) or {'efitype': '4m', 'pre_enrolled_keys': '1'}
+            pre_keys = pending.get('pre_enrolled_keys', '1')
+            _pve_node_exec(pve_mgr, task.target_node,
+                f"qm set {task.proxmox_vmid} --efidisk0 {task.target_storage}:1,efitype=4m,pre-enrolled-keys={pre_keys} 2>&1",
+                timeout=15)
+            task.log(f"  EFI disk allocated (OVMF, pre-enrolled-keys={pre_keys})")
+
+        # NS Apr 2026 — check target LUN sector size, inject 512b emulation if 4Kn
+        _ensure_guest_sector_size_512(pve_mgr, task, disk_bus, len(descriptor_files))
+
+        # NS Apr 2026 — register UEFI fallback loader so OVMF boots Windows without NVRAM entry
+        if str(getattr(task, 'config', {}).get('bios', '')).lower() == 'ovmf' or True:
+            # always try; helper bails harmlessly if disk has no Microsoft loader
+            _register_uefi_fallback_loader(pve_mgr, task)
+
         if task.start_after:
             task.log("Starting VM on Proxmox...")
             try:
@@ -995,13 +1349,303 @@ def _run_v2p_migration(task):
         task.set_phase('failed', str(e))
         try: _cleanup_sshfs(pve_mgr, task.target_node, mnt_path)
         except: pass
-        # Clean up migration snapshot if it exists
+        # NS Apr 2026 — recovery: don't leave the source ESXi VM stuck in a
+        # bad state. If we suspended it for cutover, resume it. Then clean up
+        # any named v2p_* snapshots and the migration snapshot.
         try:
             vmware_mgr = vmware_managers.get(task.vmware_id)
             if vmware_mgr:
-                vmware_mgr.delete_migration_snapshot(task.vm_id)
-                task.log("Cleaned up migration snapshot after failure")
-        except: pass
+                if getattr(task, '_source_suspended', False):
+                    try:
+                        vmware_mgr.vm_power_action(task.vm_id, 'start')
+                        task.log("Source VM resumed after failure")
+                        task._source_suspended = False
+                    except Exception as _re:
+                        task.log(f"Source resume failed: {_re}")
+                # Best-effort named-snapshot cleanup
+                for sn in list(getattr(task, '_extra_snapshots', []) or []):
+                    try:
+                        snap_list = vmware_mgr.get_snapshots(task.vm_id).get('data', []) or []
+                        target = next((s for s in snap_list if s.get('name') == sn), None)
+                        if target:
+                            vmware_mgr.delete_snapshot(task.vm_id, str(target.get('snapshot') or target.get('id') or ''))
+                    except Exception:
+                        pass
+                try:
+                    vmware_mgr.delete_migration_snapshot(task.vm_id)
+                    task.log("Cleaned up migration snapshot after failure")
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+
+# NS Apr 2026 — 4K-sector iSCSI LUN fix. Lots of SAN targets (TrueNAS LIO, some
+# netapp, enterprise arrays) advertise LUNs with 4K logical sector size by default.
+# Source VMDKs on VMFS6 are 512b though, and Windows/Linux guests parse GPT assuming
+# the sector size the block device reports. If the guest suddenly sees 4K where the
+# on-disk GPT was written for 512b, partition offsets shift by 8x → GPT not found →
+# boot loop / INACCESSIBLE_BOOT_DEVICE. Fix: probe the target volume on the Proxmox
+# node right after disks are attached, and if we detect a >512b logical sector size,
+# inject `qm set --args "-set device.<scsiN>.logical_block_size=512 ..."` so QEMU
+# emulates 512b to the guest regardless of what the backing LUN reports.
+# NS Apr 2026 — V2P from VMware loses the .nvram blob (EFI boot variables) because
+# we only copy the .vmdk(s). Without NVRAM entries, OVMF only has the default boot
+# discovery — it scans for \EFI\BOOT\BOOTX64.EFI but Microsoft installs to
+# \EFI\Microsoft\Boot\bootmgfw.efi. Result: PXE/HTTP-boot loop and no usable disk
+# entry in the Boot Manager. Workaround: copy bootmgfw.efi to the removable-media
+# default path so OVMF auto-discovers it.
+def _register_uefi_fallback_loader(pve_mgr, task):
+    try:
+        vol_id = f"{task.target_storage}:vm-{task.proxmox_vmid}-disk-0"
+        _rc, vol_path, _ = _pve_node_exec(pve_mgr, task.target_node,
+            f"pvesm path {shlex.quote(vol_id)} 2>/dev/null", timeout=10)
+        vol_path = str(vol_path or '').strip()
+        if not vol_path:
+            task.log("EFI fallback: could not resolve volume path, skipping")
+            return
+        task.log(f"EFI fallback: registering BOOTX64.EFI on {vol_path}")
+        # Combined script — losetup with 512b sector override, partprobe, identify ESP,
+        # mount RW, copy loader, cleanup. Idempotent: if BOOTX64.EFI already exists with
+        # same content, no-op. Read-only check first; write only if needed.
+        # NS Apr 2026 — script: activate LV, loopback w/ 512b sector emulation, scan for ESP,
+        # mount RW, copy bootmgfw.efi to UEFI default fallback path. losetup -fP creates
+        # partitions automatically — no need for partprobe (which isn't on minimal Proxmox).
+        script = (
+            "#!/bin/bash\n"
+            f"VOL={shlex.quote(vol_path)}\n"
+            "lvchange -ay \"$VOL\" 2>/dev/null || true\n"
+            "[ -b \"$VOL\" ] || { echo 'volume not a block device'; exit 1; }\n"
+            "TMPDIR=$(mktemp -d /tmp/v2p-efi-XXXXXX)\n"
+            "MNT=\"$TMPDIR/esp\"; mkdir -p \"$MNT\"\n"
+            "LOOP=\"\"\n"
+            "cleanup() { umount \"$MNT\" 2>/dev/null||true; "
+            "[ -n \"$LOOP\" ] && losetup -d \"$LOOP\" 2>/dev/null||true; "
+            "rm -rf \"$TMPDIR\"; }\n"
+            "trap cleanup EXIT\n"
+            "LOOP=$(losetup -b 512 -fP --show \"$VOL\" 2>&1)\n"
+            "[ -b \"$LOOP\" ] || { echo \"losetup failed: $LOOP\"; exit 1; }\n"
+            "# Wait briefly for partition nodes to materialize\n"
+            "for i in 1 2 3 4 5; do ls -1 ${LOOP}p* 2>/dev/null | head -1 >/dev/null && break; sleep 1; done\n"
+            "ESP=\"\"\n"
+            "for p in ${LOOP}p*; do [ -e \"$p\" ] || continue; "
+            "T=$(blkid -s TYPE -o value \"$p\" 2>/dev/null); "
+            "[ \"$T\" = vfat ] || continue; "
+            "PT=$(blkid -s PART_ENTRY_TYPE -o value \"$p\" 2>/dev/null); "
+            "if [ \"$PT\" = c12a7328-f81f-11d2-ba4b-00a0c93ec93b ]; then ESP=$p; break; fi; "
+            "[ -z \"$ESP\" ] && ESP=$p; done\n"
+            "[ -n \"$ESP\" ] || { echo 'no ESP partition found'; exit 1; }\n"
+            "mount -t vfat -o rw \"$ESP\" \"$MNT\" || { echo 'mount failed'; exit 1; }\n"
+            "MGR=\"$MNT/EFI/Microsoft/Boot/bootmgfw.efi\"\n"
+            "[ -f \"$MGR\" ] || { echo 'bootmgfw.efi not present (not a Windows ESP?)'; exit 0; }\n"
+            "DST=\"$MNT/EFI/BOOT/BOOTX64.EFI\"\n"
+            "if [ -f \"$DST\" ] && cmp -s \"$MGR\" \"$DST\"; then "
+            "echo 'fallback loader already in place'; exit 0; fi\n"
+            "mkdir -p \"$MNT/EFI/BOOT\"\n"
+            "cp -f \"$MGR\" \"$DST\" && sync && echo 'fallback loader installed'\n"
+        )
+        sf = f"/tmp/v2p-efi-fallback-{task.proxmox_vmid}.sh"
+        _pve_node_exec(pve_mgr, task.target_node,
+            f"cat > {sf} << 'EOFSCRIPT'\n{script}EOFSCRIPT\nchmod +x {sf}",
+            timeout=15)
+        rc, out, err = _pve_node_exec(pve_mgr, task.target_node,
+            f"bash {sf} 2>&1; rm -f {sf}", timeout=120)
+        out_str = str(out or '').strip()
+        if rc == 0 and ('installed' in out_str or 'already in place' in out_str):
+            task.log(f"EFI fallback loader: {out_str.splitlines()[-1] if out_str else 'OK'}")
+        else:
+            task.log(f"EFI fallback loader skipped (non-fatal): rc={rc} {out_str[-300:]}")
+    except Exception as e:
+        task.log(f"EFI fallback registration failed (non-fatal): {e}")
+
+
+# NS Apr 2026 — Snapshot-iterative ZERO-DOWNTIME V2P (transfer_mode='snapshot_zero').
+# VM stays running on ESXi the entire time except for ~5-15s final cutover.
+# Multi-disk capable. Algorithm:
+#   pre-sync (existing) → S0 + base copied
+#   loop:
+#     take Sn → freezes previous delta-vmdk
+#     for each disk: read frozen delta extents via qemu-img map, apply via dd
+#     if total bytes < threshold OR last iteration was small → break
+#   suspend VM on ESXi
+#   take final snapshot, transfer last delta
+#   start VM on Proxmox, shut down ESXi VM, cleanup all snapshots
+def _ssh_esxi_exec(esxi_host, esxi_user, esxi_pass, cmd, timeout=30):
+    """Run a command on ESXi via sshpass+ssh from this PegaProx host. Returns (rc, stdout, stderr)."""
+    import subprocess, shlex as _sh
+    full = ['sshpass', '-p', esxi_pass, 'ssh',
+            '-o', 'StrictHostKeyChecking=no', '-o', 'UserKnownHostsFile=/dev/null',
+            '-o', 'BatchMode=no', '-o', 'ConnectTimeout=10',
+            f'{esxi_user}@{esxi_host}', cmd]
+    try:
+        r = subprocess.run(full, capture_output=True, timeout=timeout, text=True)
+        return r.returncode, r.stdout, r.stderr
+    except Exception as e:
+        return 1, '', str(e)
+
+
+def _list_delta_files_on_esxi(esxi_host, esxi_user, esxi_pass, datastore, vm_dir, descriptor_files):
+    """For each disk in descriptor_files, return list of -delta.vmdk paths
+    (on ESXi-side path /vmfs/volumes/<ds>/<vm_dir>/<basename>-NNNNNN-delta.vmdk),
+    sorted oldest→newest. Multi-disk: descriptor_files[i] like 'Test-VM.vmdk' or 'Test-VM_1.vmdk'."""
+    base_path = f"/vmfs/volumes/{datastore}/{vm_dir}"
+    per_disk = []
+    for desc in descriptor_files:
+        # base name without extension
+        bn = desc[:-5] if desc.endswith('.vmdk') else desc
+        # match <bn>-NNNNNN-delta.vmdk
+        cmd = f"ls -1 '{base_path}/{bn}-'*'-delta.vmdk' 2>/dev/null | sort"
+        rc, out, _ = _ssh_esxi_exec(esxi_host, esxi_user, esxi_pass, cmd, timeout=15)
+        items = [l.strip() for l in (out or '').splitlines() if l.strip()]
+        per_disk.append(items)
+    return per_disk
+
+
+def _qemu_map_extents_via_sshfs(pve_mgr, task, sshfs_descriptor_path):
+    """Run qemu-img map --output=json on Proxmox node against an SSHFS-mounted descriptor.
+    Returns list of {start, length, depth, data} dicts. Only data:true entries are real data."""
+    cmd = f"qemu-img map --output=json -f vmdk {shlex.quote(sshfs_descriptor_path)} 2>&1"
+    rc, out, _ = _pve_node_exec(pve_mgr, task.target_node, cmd, timeout=180)
+    if rc != 0:
+        return None
+    try:
+        return json.loads(str(out or '').strip())
+    except Exception:
+        return None
+
+
+def _apply_extent_dd(pve_mgr, task, sshfs_source_path, target_lvm_path, offset, length):
+    """Apply one extent (offset+length bytes) from sshfs-mounted source to LVM target.
+    Both are on the Proxmox node. Reads from SSHFS (= ESXi datastore), writes to LVM raw block device."""
+    BS = 1024 * 1024  # 1 MB
+    if length <= 0:
+        return True
+    # Compute aligned start + tail handling. For simplicity, fall back to bs=1 for non-MB-aligned.
+    if offset % BS == 0 and length % BS == 0:
+        skip_blocks = offset // BS
+        count_blocks = length // BS
+        cmd = (f"dd if={shlex.quote(sshfs_source_path)} bs={BS} "
+               f"skip={skip_blocks} count={count_blocks} "
+               f"of={shlex.quote(target_lvm_path)} seek={skip_blocks} "
+               f"conv=notrunc oflag=seek_bytes iflag=skip_bytes "
+               f"status=none 2>&1") if False else \
+              (f"dd if={shlex.quote(sshfs_source_path)} of={shlex.quote(target_lvm_path)} "
+               f"bs={BS} skip={skip_blocks} count={count_blocks} seek={skip_blocks} "
+               f"conv=notrunc status=none 2>&1")
+    else:
+        # Byte-precise (slower)
+        cmd = (f"dd if={shlex.quote(sshfs_source_path)} of={shlex.quote(target_lvm_path)} "
+               f"bs=1M iflag=skip_bytes,count_bytes oflag=seek_bytes "
+               f"skip={offset} count={length} seek={offset} "
+               f"conv=notrunc status=none 2>&1")
+    rc, out, _ = _pve_node_exec(pve_mgr, task.target_node, cmd, timeout=600)
+    return rc == 0
+
+
+def _snapshot_zero_v2p_delta_loop(pve_mgr, task, vmware_mgr, esxi_host, esxi_user, esxi_pass,
+                                    datastore, vm_dir, descriptor_files, presync_volumes,
+                                    mnt_path):
+    """Iterative snapshot-based delta sync. Returns (success, total_iterations, snapshots_to_cleanup)."""
+    MAX_ITERATIONS = 6
+    CONVERGENCE_BYTES = 64 * 1024 * 1024  # converge if last delta < 64 MB
+    snapshot_chain = []  # names we created, in order
+    last_iter_bytes = -1
+
+    for iteration in range(1, MAX_ITERATIONS + 1):
+        snap_name = f"_pegaprox_v2p_iter{iteration}"
+        task.log(f"--- Snapshot-zero iter {iteration}: take {snap_name} ---")
+        snap_result = vmware_mgr.create_snapshot(task.vm_id, snap_name,
+                                                  f"V2P delta iter {iteration}",
+                                                  memory=False, quiesce=False)
+        if 'error' in snap_result:
+            task.log(f"  Snapshot iter {iteration} failed: {snap_result['error']}")
+            break
+        snapshot_chain.append(snap_name)
+        time.sleep(2)
+
+        # Find the FROZEN delta files (the ones that were active before this snapshot)
+        all_deltas = _list_delta_files_on_esxi(esxi_host, esxi_user, esxi_pass,
+                                                 datastore, vm_dir, descriptor_files)
+        iter_total_bytes = 0
+        for di, (vol_id, vol_path, _esxi_flat, _flat_size) in enumerate(presync_volumes):
+            disk_deltas = all_deltas[di] if di < len(all_deltas) else []
+            if not disk_deltas:
+                task.log(f"  Disk {di}: no delta files yet")
+                continue
+            # The just-frozen delta is the next-to-last (last is the new active)
+            # Actually after taking snapshot, the OLD active becomes the LAST frozen one.
+            # Sort returns oldest first, so "frozen most recent" = disk_deltas[-2] if multiple,
+            # else disk_deltas[-1] is the freshest frozen.
+            # On first iteration there's only 1 delta file (= the just-frozen pre-sync delta).
+            target_delta = disk_deltas[-1] if iteration == 1 else (
+                disk_deltas[-2] if len(disk_deltas) >= 2 else disk_deltas[-1]
+            )
+            # The descriptor for this delta has same path minus '-delta'
+            desc_on_esxi = target_delta.replace('-delta.vmdk', '.vmdk')
+            # We have an existing SSHFS mount on the Proxmox node at mnt_path → maps the entire datastore
+            # Build the equivalent path on the SSHFS mount
+            # mnt_path is something like /tmp/v2p-<task.id>/  → datastore root
+            esxi_relative = desc_on_esxi.replace(f"/vmfs/volumes/{datastore}/", "")
+            sshfs_desc = f"{mnt_path}/{esxi_relative}"
+            sshfs_data = sshfs_desc.replace('.vmdk', '-delta.vmdk')
+
+            extents = _qemu_map_extents_via_sshfs(pve_mgr, task, sshfs_desc)
+            if extents is None:
+                task.log(f"  Disk {di}: qemu-img map failed for {sshfs_desc}")
+                continue
+            # Filter: only allocated regions at the top of the chain (depth=0 = this delta only)
+            # Some qemu-img versions don't include depth — fall back to data=true.
+            data_extents = [e for e in extents if e.get('data') and (e.get('depth', 0) == 0)]
+            disk_bytes = sum(e.get('length', 0) for e in data_extents)
+            task.log(f"  Disk {di}: {len(data_extents)} extents, {disk_bytes / (1024**2):.1f} MB to transfer")
+            iter_total_bytes += disk_bytes
+
+            applied = 0
+            for e in data_extents:
+                if _apply_extent_dd(pve_mgr, task, sshfs_data, vol_path,
+                                    e.get('start', 0), e.get('length', 0)):
+                    applied += e.get('length', 0)
+            task.log(f"  Disk {di}: applied {applied / (1024**2):.1f} MB")
+
+        task.log(f"  Iteration {iteration}: total delta = {iter_total_bytes / (1024**2):.1f} MB")
+        last_iter_bytes = iter_total_bytes
+        if iter_total_bytes < CONVERGENCE_BYTES and iteration >= 2:
+            task.log(f"  Converged at iteration {iteration}")
+            break
+
+    return True, len(snapshot_chain), snapshot_chain
+
+
+def _ensure_guest_sector_size_512(pve_mgr, task, disk_bus, disk_count):
+    try:
+        # pvesm path returns the host-side path for the first disk
+        vol_id = f"{task.target_storage}:vm-{task.proxmox_vmid}-disk-0"
+        _rc, vol_path, _ = _pve_node_exec(pve_mgr, task.target_node,
+            f"pvesm path {shlex.quote(vol_id)} 2>/dev/null", timeout=10)
+        vol_path = str(vol_path or '').strip()
+        if not vol_path:
+            return
+        _rc, bs_out, _ = _pve_node_exec(pve_mgr, task.target_node,
+            f"lsblk -nd -o LOG-SEC {shlex.quote(vol_path)} 2>/dev/null", timeout=10)
+        logical_sec = 0
+        try:
+            logical_sec = int(str(bs_out or '').strip().split()[0])
+        except Exception:
+            pass
+        if logical_sec <= 0 or logical_sec == 512:
+            return
+        task.log(f"⚠ Target LUN reports {logical_sec}b logical sectors — "
+                 f"injecting 512b emulation so guest GPT matches source VMDK layout")
+        parts = []
+        for i in range(max(1, disk_count)):
+            parts.append(f"-set device.{disk_bus}{i}.logical_block_size=512")
+            parts.append(f"-set device.{disk_bus}{i}.physical_block_size=512")
+        args_str = ' '.join(parts)
+        _pve_node_exec(pve_mgr, task.target_node,
+            f"qm set {task.proxmox_vmid} --args {shlex.quote(args_str)} 2>&1", timeout=10)
+        task.log(f"Applied 512b sector emulation ({disk_count} disk(s)): {args_str}")
+    except Exception as e:
+        task.log(f"Sector-size pre-check failed (non-fatal, VM may still boot): {e}")
 
 
 def _qemu_device_spec(drive_id, disk_index, disk_bus):
@@ -1017,16 +1661,32 @@ def _qemu_device_spec(drive_id, disk_index, disk_bus):
 
 
 def _qm_monitor_cmd(pve_mgr, node, vmid, command, timeout=15):
-    """Send HMP command to running QEMU VM via Proxmox API monitor endpoint.
-    Returns (success: bool, output: str)."""
+    """Send HMP command to running QEMU VM. Returns (success: bool, output: str).
+    NS Apr 2026 — switched from /monitor HTTPS API (returned HTTP 500 with no body)
+    to SSH `qm monitor` because the API path is unreliable on PVE 9.x for some
+    commands (drive_mirror, block_job_*). qm monitor over SSH always works."""
     try:
-        resp = pve_mgr._api_post(
-            f"https://{pve_mgr.host}:8006/api2/json/nodes/{node}/qemu/{vmid}/monitor",
-            data={"command": command}, timeout=timeout)
-        if resp.status_code == 200:
-            data = resp.json().get('data', '')
-            return True, str(data)
-        return False, f"HTTP {resp.status_code}"
+        # echo into qm monitor — interactive otherwise. -- prevents qm from interpreting
+        # cmd flags. shlex.quote escapes the command safely.
+        sh_cmd = f"echo {shlex.quote(command)} | qm monitor {vmid} 2>&1"
+        rc, out, _ = _pve_node_exec(pve_mgr, node, sh_cmd, timeout=timeout)
+        out_str = str(out or '')
+        # qm monitor wraps output with: "qm> <cmd>\nqm> Entering QEMU Monitor for VM N - type 'help' for help\n<actual output>"
+        # Strip those wrappers to give the caller the raw HMP response.
+        cleaned_lines = []
+        skip_next_qm = False
+        for line in out_str.splitlines():
+            stripped = line.strip()
+            if stripped.startswith('qm> '):
+                # could be the echoed command or the welcome banner
+                continue
+            if 'Entering QEMU Monitor for VM' in stripped:
+                continue
+            cleaned_lines.append(line)
+        cleaned = '\n'.join(cleaned_lines).strip()
+        if rc != 0 and not cleaned:
+            return False, f"qm monitor exit={rc}: {out_str[-200:]}"
+        return True, cleaned
     except Exception as e:
         return False, str(e)
 
@@ -2089,7 +2749,8 @@ fi
 
 
 def _do_sshfs_boot_migration(pve_mgr, task, vmware_mgr, esxi_host, esxi_user, esxi_pass,
-                              datastore, vm_dir, descriptor_files, disk_bus, mnt_path):
+                              datastore, vm_dir, descriptor_files, disk_bus, mnt_path,
+                              v2p_tmpdir='/var/tmp'):
     """Near-zero downtime migration using QEMU's native SSH block driver.
     
     QEMU has a built-in SSH block driver (libssh) that is MUCH faster than SSHFS/FUSE
@@ -2110,7 +2771,12 @@ def _do_sshfs_boot_migration(pve_mgr, task, vmware_mgr, esxi_host, esxi_user, es
     VMware VM must already be stopped before calling this.
     """
     import time
-    
+
+    # NS Apr 2026 — resolve bios at function entry. The live-pivot post-mirror block
+    # references `bios` (line ~4055) which previously was only defined later in the
+    # post-stop-and-restart fallback path. Live pivot returns before that.
+    bios = getattr(task, 'bios_override', None) or getattr(task, '_detected_bios', 'seabios')
+
     task.set_phase('cutover')
     
     # ================================================================
@@ -2941,27 +3607,43 @@ def _do_sshfs_boot_migration(pve_mgr, task, vmware_mgr, esxi_host, esxi_user, es
             
             task.log(f"  Disk {di}: {sshfs_src} → {dev_path} ({disk_gb:.1f} GB)")
             
-            # qemu-img convert with -U (force share) -- no lock conflict with running QEMU
-            # -p = progress, -n = no create (target already allocated), -f raw -O raw
+            # NS Apr 2026 — switched from qemu-img convert to dd for 4K-LUN-safe writes.
+            # qemu-img convert was failing with "Invalid argument" at random offsets on
+            # 4Kn-formatted iSCSI LUN targets (TrueNAS, enterprise SAN) — internal-buffering
+            # alignment issues. dd with bs=4M is rock-solid against any block-size target
+            # because the kernel handles alignment via buffered I/O. For VMDK-descriptor
+            # sources (snapshot chains), we still need qemu-img — there we add -W
+            # (out-of-order, buffered writes) which mostly avoids the same trap.
             progress_log = f"/tmp/v2p-import-{task.proxmox_vmid}-{di}.log"
             _pve_node_exec(pve_mgr, task.target_node, f"rm -f {progress_log}", timeout=5)
-            
+
             # Detect source format (flat = raw, descriptor = vmdk)
             src_format = "raw"
             if sshfs_src.endswith('.vmdk') and not sshfs_src.endswith('-flat.vmdk'):
                 src_format = "vmdk"
-            
-            # Write copy script (avoids quoting nightmares in nested shells)
+
             copy_script = f"/tmp/v2p-copy-{task.proxmox_vmid}-{di}.sh"
-            # Redirect all output to log; progress monitored via /proc IO stats
-            script_body = (
-                f"#!/bin/bash\n"
-                f"export TMPDIR='{v2p_tmpdir}'\n"
-                f"qemu-img convert -U -p -n -f {src_format} -O raw "
-                f"'{sshfs_src}' '{dev_path}' "
-                f"&> '{progress_log}'\n"
-                f"echo \"EXIT_CODE=$?\" >> '{progress_log}'\n"
-            )
+            if src_format == "raw":
+                # dd path — preferred for raw flat-vmdk sources, works on any sector size
+                script_body = (
+                    f"#!/bin/bash\n"
+                    f"export TMPDIR='{v2p_tmpdir}'\n"
+                    f"dd if='{sshfs_src}' of='{dev_path}' bs=4M conv=notrunc status=progress "
+                    f"&> '{progress_log}'\n"
+                    f"echo \"EXIT_CODE=$?\" >> '{progress_log}'\n"
+                )
+            else:
+                # qemu-img path — for VMDK-descriptor sources only (snapshot chains).
+                # -W = out-of-order writes (skips O_DIRECT alignment), -T writeback = buffered target IO
+                script_body = (
+                    f"#!/bin/bash\n"
+                    f"export TMPDIR='{v2p_tmpdir}'\n"
+                    f"qemu-img convert -W -U -p -n -t writeback -T writeback "
+                    f"-f {src_format} -O raw "
+                    f"'{sshfs_src}' '{dev_path}' "
+                    f"&> '{progress_log}'\n"
+                    f"echo \"EXIT_CODE=$?\" >> '{progress_log}'\n"
+                )
             _pve_node_exec(pve_mgr, task.target_node,
                 f"cat > {copy_script} << 'EOFSCRIPT'\n{script_body}EOFSCRIPT\n"
                 f"chmod +x {copy_script}", timeout=10)
@@ -2969,35 +3651,35 @@ def _do_sshfs_boot_migration(pve_mgr, task, vmware_mgr, esxi_host, esxi_user, es
             _pve_node_exec(pve_mgr, task.target_node,
                 f"nohup {copy_script} > /dev/null 2>&1 &", timeout=10)
             
-            # Verify process actually started
+            # Verify process actually started (look for either dd or qemu-img depending on src_format)
             time.sleep(2)
+            proc_pattern = "dd if=" if src_format == "raw" else "qemu-img convert"
             rc_ps, _, _ = _pve_node_exec(pve_mgr, task.target_node,
-                f"pgrep -f 'qemu-img convert.*{dev_path}' >/dev/null 2>&1 || "
+                f"pgrep -f '{proc_pattern}.*{di}' >/dev/null 2>&1 || "
                 f"pgrep -f 'v2p-copy-{task.proxmox_vmid}-{di}' >/dev/null 2>&1", timeout=5)
             if rc_ps != 0:
                 # Process didn't start -- check error
                 rc_err, out_err, _ = _pve_node_exec(pve_mgr, task.target_node,
                     f"cat {progress_log} 2>/dev/null", timeout=5)
                 err_msg = str(out_err or '').strip()
-                task.log(f"  ⚠ qemu-img did not start: {err_msg[:200]}")
-                
-                # Fallback: try without -U flag (older QEMU versions)
-                task.log(f"  Retrying without -U flag...")
-                script_body_noU = (
+                task.log(f"  ⚠ copy did not start: {err_msg[:200]}")
+
+                # Fallback: simpler dd command (drop progress=, drop conv=notrunc)
+                task.log(f"  Retrying with minimal dd...")
+                script_body_min = (
                     f"#!/bin/bash\n"
                     f"export TMPDIR='{v2p_tmpdir}'\n"
-                    f"qemu-img convert -p -n -f {src_format} -O raw "
-                    f"'{sshfs_src}' '{dev_path}' "
+                    f"dd if='{sshfs_src}' of='{dev_path}' bs=4M "
                     f"&> '{progress_log}'\n"
                     f"echo \"EXIT_CODE=$?\" >> '{progress_log}'\n"
                 )
                 _pve_node_exec(pve_mgr, task.target_node,
-                    f"cat > {copy_script} << 'EOFSCRIPT'\n{script_body_noU}EOFSCRIPT", timeout=10)
+                    f"cat > {copy_script} << 'EOFSCRIPT'\n{script_body_min}EOFSCRIPT", timeout=10)
                 _pve_node_exec(pve_mgr, task.target_node,
                     f"nohup {copy_script} > /dev/null 2>&1 &", timeout=10)
                 time.sleep(2)
-            
-            task.log(f"  qemu-img convert started ({src_format} → raw)")
+
+            task.log(f"  Background copy started ({'dd' if src_format == 'raw' else 'qemu-img'}: {src_format} → raw)")
             
             # Poll progress via /proc/PID/io (reliable, no buffering issues)
             start_t = time.time()
@@ -3008,14 +3690,17 @@ def _do_sshfs_boot_migration(pve_mgr, task, vmware_mgr, esxi_host, esxi_user, es
             while time.time() - start_t < 86400:
                 time.sleep(5)
                 
-                # Find qemu-img PID if not known
+                # Find copy PID if not known — match dd OR qemu-img depending on src_format
                 if not qimg_pid:
+                    pgrep_pat = f"dd if=.*{di}|qemu-img convert.*{di}"
                     rc_pid, out_pid, _ = _pve_node_exec(pve_mgr, task.target_node,
-                        "pgrep -f 'qemu-img convert' 2>/dev/null | head -1",
+                        f"pgrep -f 'v2p-copy-{task.proxmox_vmid}-{di}' 2>/dev/null | head -1; "
+                        f"pgrep -f '{pgrep_pat}' 2>/dev/null | head -1",
                         timeout=5)
-                    pid_str = str(out_pid or '').strip()
-                    if pid_str.isdigit():
-                        qimg_pid = pid_str
+                    for line in str(out_pid or '').splitlines():
+                        s = line.strip()
+                        if s.isdigit():
+                            qimg_pid = s; break
                 
                 # Method 1: Read /proc/PID/io for write_bytes (most reliable)
                 written = 0
@@ -3051,9 +3736,10 @@ def _do_sshfs_boot_migration(pve_mgr, task, vmware_mgr, esxi_host, esxi_user, es
                         copy_done = True
                         break
                 
-                # Check if process exited
+                # Check if process exited (dd or qemu-img)
                 rc_chk, _, _ = _pve_node_exec(pve_mgr, task.target_node,
                     f"pgrep -f 'v2p-copy-{task.proxmox_vmid}-{di}' >/dev/null 2>&1 || "
+                    f"pgrep -f 'dd if=.*{di}' >/dev/null 2>&1 || "
                     f"pgrep -f 'qemu-img convert' >/dev/null 2>&1", timeout=5)
                 if rc_chk != 0 and time.time() - start_t > 15:
                     # Process exited -- check EXIT_CODE
@@ -3409,6 +4095,30 @@ exit $((S + R))
                 f"grep -q '^bios:' {conf_path} || echo 'bios: ovmf' >> {conf_path}", timeout=5)
             _pve_node_exec(pve_mgr, task.target_node,
                 f"grep -q '^machine:' {conf_path} || echo 'machine: q35' >> {conf_path}", timeout=5)
+            # NS Apr 2026 — live-pivot path also needs the post-migrate fixes that the
+            # restart path applies later: persistent efidisk0, sector-size emulation,
+            # and BOOTX64.EFI fallback. Without these the VM works on this boot
+            # (already running) but won't survive a reboot.
+            _pve_node_exec(pve_mgr, task.target_node,
+                f"grep -q '^efidisk0:' {conf_path}", timeout=5)
+            rc_ef, _, _ = _pve_node_exec(pve_mgr, task.target_node,
+                f"grep -q '^efidisk0:' {conf_path}", timeout=5)
+            if rc_ef != 0:
+                _is_win = str(getattr(task, 'ostype_resolved', '') or '').lower().startswith('win') \
+                          or str(getattr(task, 'ostype', '') or '').lower().startswith('win')
+                pre_keys = '1' if _is_win else '0'
+                _pve_node_exec(pve_mgr, task.target_node,
+                    f"qm set {task.proxmox_vmid} --efidisk0 {task.target_storage}:1,efitype=4m,pre-enrolled-keys={pre_keys} 2>&1",
+                    timeout=15)
+                task.log(f"  EFI disk allocated (pre-enrolled-keys={pre_keys})")
+            try:
+                _ensure_guest_sector_size_512(pve_mgr, task, disk_bus, len(descriptor_files))
+            except Exception as _se:
+                task.log(f"  sector-size emulation skipped: {_se}")
+            try:
+                _register_uefi_fallback_loader(pve_mgr, task)
+            except Exception as _fe:
+                task.log(f"  EFI fallback loader skipped: {_fe}")
         task.log(f"  Boot: order={disk_bus}0")
         task.log(f"  VM {task.proxmox_vmid} continues running - ZERO downtime ✓")
         
@@ -3547,8 +4257,12 @@ exit $((S + R))
                     efi_line = line
                     break
 
-            pending = getattr(task, '_pending_efidisk', None) or {'efitype': '4m', 'pre_enrolled_keys': '0'}
-            pre_keys = pending.get('pre_enrolled_keys', '0')
+            # NS Apr 2026 — Windows-aware default (see main path)
+            _is_win = str(getattr(task, 'ostype_resolved', '') or '').lower().startswith('win') \
+                      or str(getattr(task, 'ostype', '') or '').lower().startswith('win')
+            _default_keys = '1' if _is_win else '0'
+            pending = getattr(task, '_pending_efidisk', None) or {'efitype': '4m', 'pre_enrolled_keys': _default_keys}
+            pre_keys = pending.get('pre_enrolled_keys', _default_keys)
 
             # if an efidisk0 line exists but points at the system disk (any attached system vol),
             # clear it before re-allocating. Signal: efi size mentioned as GB (should be 1M–4M).
@@ -3564,7 +4278,19 @@ exit $((S + R))
                     timeout=15)
                 task.log(f"  EFI disk allocated (OVMF, pre-enrolled-keys={pre_keys})")
             task.log(f"  BIOS: ovmf, Machine: q35 ✓")
-        
+
+        # NS Apr 2026 — apply 4K-LUN sector emulation + UEFI fallback loader on the
+        # sshfs-boot path too. Without this Windows VMs failed to boot post-cutover
+        # when the target LUN is 4Kn (very common with TrueNAS / enterprise SAN iSCSI).
+        try:
+            _ensure_guest_sector_size_512(pve_mgr, task, disk_bus, len(descriptor_files))
+        except Exception as _e:
+            task.log(f"sector-size emulation skipped: {_e}")
+        try:
+            _register_uefi_fallback_loader(pve_mgr, task)
+        except Exception as _e:
+            task.log(f"EFI fallback registration skipped: {_e}")
+
         # Start VM on local storage
         if task.start_after or vm_running_on_ssh:
             try:
@@ -3665,8 +4391,14 @@ def _do_offline_qemuimg_copy(pve_mgr, task, esxi_host, esxi_user, esxi_pass,
                 efi_line = line
                 break
 
-        pending = getattr(task, '_pending_efidisk', None) or {'efitype': '4m', 'pre_enrolled_keys': '0'}
-        pre_keys = pending.get('pre_enrolled_keys', '0')
+        # NS Apr 2026 — pre-enrolled-keys default mirrors the main path: '1' when
+        # the guest is Windows (ostype starts with 'win') so Microsoft KEK ends up
+        # in NVRAM and OVMF can validate bootmgfw.efi.
+        _is_win = str(getattr(task, 'ostype_resolved', '') or '').lower().startswith('win') \
+                  or str(getattr(task, 'ostype', '') or '').lower().startswith('win')
+        _default_keys = '1' if _is_win else '0'
+        pending = getattr(task, '_pending_efidisk', None) or {'efitype': '4m', 'pre_enrolled_keys': _default_keys}
+        pre_keys = pending.get('pre_enrolled_keys', _default_keys)
 
         # corrupt efidisk0 = pointing at a multi-GB volume (real EFI is 1-4 MB)
         if efi_line and ('size=' in efi_line.lower()) and ('G,' in efi_line or 'G ' in efi_line or efi_line.rstrip().endswith('G')):

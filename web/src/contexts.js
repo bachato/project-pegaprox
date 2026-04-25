@@ -58,6 +58,8 @@
                 { code: 'es', flag: '🇪🇸', label: 'ES', title: 'Español (LATAM)' },
                 { code: 'pt', flag: '🇧🇷', label: 'PT', title: 'Português' },
                 { code: 'ko', flag: '🇰🇷', label: 'KO', title: '한국어' },
+                // LW: IT contributed by @fabriziosalmi — PR #332
+                { code: 'it', flag: '🇮🇹', label: 'IT', title: 'Italiano' },
             ];
             const activeLanguage = langs.find(l => l.code === language) || langs[0];
 
@@ -112,7 +114,7 @@
         const AuthContext = createContext();
         
         function AuthProvider({ children }) {
-            const { applyLanguage } = useTranslation();
+            const { t, applyLanguage } = useTranslation();
             const [user, setUser] = useState(null);
             // NS: Security fix - session cookie is HttpOnly (can't be stolen by XSS)
             // But we also keep sessionId in memory for WebSocket auth (not in localStorage!)
@@ -207,22 +209,35 @@
             };
             
             // -lw: Main login handler - supports 2FA flow + remember me
-            const login = async (username, password, totpCode = '', remember = false) => {
+            const login = async (username, password, totpCode = '', remember = false, webauthnProof = '') => {
                 setError(null);
                 try {
                     const resp = await fetch(`${API_URL}/auth/login`, {
                         method: 'POST',
                         credentials: 'include',
                         headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({ username, password, totp_code: totpCode, remember })
+                        body: JSON.stringify({ username, password, totp_code: totpCode, remember, webauthn_proof: webauthnProof })
                     });
                     
                     const data = await resp.json();
                     
-                    // rate limit check
-                    if (resp.status === 429 && data.locked) {
-                        setError(`${data.error}`);
-                        return { success: false, locked: true, retry_after: data.retry_after };
+                    // Rate-limit / lockout — server returns 401+locked for user lockouts
+                    // (audit #5: uniform 401 stops username enumeration) and 429 for IP-level.
+                    // Both carry data.locked + data.retry_after.
+                    if (data.locked) {
+                        // user-friendly error message derived from retry_after, since
+                        // the server response stays generic ("Invalid credentials") to avoid
+                        // leaking which users exist
+                        const sec = data.retry_after || 0;
+                        const mins = Math.ceil(sec / 60);
+                        setError(t('accountLocked')
+                            ? t('accountLocked').replace('{mins}', mins)
+                            : `Too many failed attempts. Try again in ~${mins} min.`);
+                        return { success: false, locked: true, retry_after: sec };
+                    }
+                    if (resp.status === 429) {
+                        setError(data.error || 'Too many requests, slow down.');
+                        return { success: false, locked: false };
                     }
                     
                     // 2fa required?
@@ -233,7 +248,7 @@
                     if (resp.ok && data.success) {
                         // portal_only users can't use main dashboard
                         if (data.portal_only && !window.location.pathname.startsWith('/portal')) {
-                            setError('This account can only log in via the Client Portal (/portal)');
+                            setError(t('portalOnlyAccount') || 'This account can only log in via the Client Portal (/portal)');
                             return { success: false, portal_only: true };
                         }
                         setUser(data.user);

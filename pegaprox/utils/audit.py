@@ -179,9 +179,21 @@ def _is_trusted_proxy(addr):
         pass
     return False
 
+def _canonical_ip(addr):
+    """Normalize an IP so IPv4-mapped IPv6 (::ffff:1.2.3.4) and bare IPv4 (1.2.3.4)
+    key to the same value. Without this, lockout/rate-limit buckets split across
+    the two forms — pentest Apr 2026 showed a source could double its rate budget
+    by toggling XFF presence. NS."""
+    if not addr:
+        return addr
+    if addr.startswith('::ffff:'):
+        return addr[7:]
+    return addr
+
 def get_client_ip():
     """Get client IP address from request
     NS Feb 2026 - only trust X-Forwarded-For from trusted sources
+    NS 2026-04-24 - canonicalize to close the ::ffff:/IPv4 lockout-bucket split
     """
     if not has_request_context():
         return 'system'
@@ -189,11 +201,11 @@ def get_client_ip():
     if _is_trusted_proxy(request.remote_addr):
         xff = request.headers.get('X-Forwarded-For')
         if xff:
-            return xff.split(',')[0].strip()
+            return _canonical_ip(xff.split(',')[0].strip())
         xri = request.headers.get('X-Real-IP')
         if xri:
-            return xri
-    return request.remote_addr
+            return _canonical_ip(xri.strip())
+    return _canonical_ip(request.remote_addr)
 
 # Global users store (loaded at startup)
 users_db = {}

@@ -142,6 +142,20 @@ class UpdateTask:
             'duration_seconds': (datetime.now() - self.started_at).total_seconds()
         }
 
+
+# NS 2026-04-24 — When PegaProx SSH'es in as pegaprox@pam (NOPASSWD sudo), every
+# privileged command plus anything that writes to /etc or /opt needs to actually
+# run as root. Naive `sudo {cmd}` prefix breaks heredocs and pipe redirects —
+# `sudo cat > /etc/foo` opens the redirect in the unprivileged shell.
+# Base64 → `sudo bash` handles arbitrary multi-line shell payloads cleanly.
+def _wrap_with_sudo(cmd):
+    """Wrap a command so it runs entirely as root via sudo, safe for heredocs."""
+    import base64 as _b64
+    enc = _b64.b64encode(cmd.encode('utf-8')).decode('ascii')
+    # The -n flag makes sudo fail fast if NOPASSWD isn't configured (no prompt hang).
+    return f"echo {enc} | base64 -d | sudo -n bash"
+
+
 class PegaProxManager:
     """
     main cluster manager - NS
@@ -1975,9 +1989,17 @@ class PegaProxManager:
             return {'score': 0, 'trend': 'unknown', 'confidence': 0}
 
     def get_predictive_analysis(self):
-        """Get predictive migration analysis for all nodes"""
+        """Get predictive migration analysis for all nodes.
+
+        NS 2026-04-24 — was referencing self.node_status (doesn't exist) — always
+        500'd since v0.9.0 rename. Use get_node_status() which returns the merged
+        view from ha_node_status + live PVE data."""
         result = {}
-        for node_name in self.node_status:
+        try:
+            ns = self.get_node_status() or {}
+        except Exception:
+            ns = {}
+        for node_name in ns:
             result[node_name] = self._compute_predictive_score(node_name)
         return result
 
@@ -2089,6 +2111,36 @@ class PegaProxManager:
                         })
                         return True
                     else:
+                        # MK Apr 2026 (#340): HA + negative-affinity setups fail the original
+                        # `hamigrate` task because the requested target violates the rule,
+                        # then HA internally retries to a different node and succeeds.
+                        # Before declaring failure, verify the VM is still on the source node —
+                        # if it's moved anywhere else, the evacuation goal is met even if the
+                        # specific task we kicked off didn't land on its chosen target.
+                        try:
+                            current_vms = self.get_vm_resources()
+                            post = next((v for v in current_vms if v.get('vmid') == vmid), None)
+                            actual_node = post.get('node') if post else None
+                        except Exception as _e:
+                            actual_node = None
+                        if actual_node and actual_node != source_node:
+                            self.logger.info(
+                                f"[OK] Migration task reported failure, but {vm.get('name', 'unnamed')} "
+                                f"ended up on {actual_node} (HA likely re-routed from {target_node}). "
+                                "Treating as success."
+                            )
+                            self.last_migration_log.append({
+                                'timestamp': datetime.now().isoformat(),
+                                'vm': vm.get('name', 'unnamed'),
+                                'vmid': vmid,
+                                'from_node': source_node,
+                                'to_node': actual_node,
+                                'requested_target': target_node,
+                                'dry_run': False,
+                                'success': True,
+                                'note': 'HA re-routed during evacuation',
+                            })
+                            return True
                         self.logger.error(f"[ERROR] Migration task failed for {vm.get('name', 'unnamed')}")
                         self.last_migration_log.append({
                             'timestamp': datetime.now().isoformat(),
@@ -2161,16 +2213,22 @@ class PegaProxManager:
         self.logger.error(f"Task {task_id} timed out after {timeout} seconds")
         return False
     
-    def enter_maintenance_mode(self, node_name, skip_evacuation=False):
+    def enter_maintenance_mode(self, node_name, skip_evacuation=False, allow_local_disks=False):
         # NS: tries native HA first, falls back to our own evacuation logic
+        # NS Apr 2026 (#330): allow_local_disks opts the evacuator into
+        # --with-local-disks migration for local-storage VMs. Off by default
+        # because it copies disks across the cluster network and can take ages
+        # on bigger VMs; xrcam needed it for a nothing-shared setup.
         with self.maintenance_lock:
             if node_name in self.nodes_in_maintenance:
                 return self.nodes_in_maintenance[node_name]
 
             task = MaintenanceTask(node_name)
+            task.allow_local_disks = bool(allow_local_disks)
             self.nodes_in_maintenance[node_name] = task
 
-        self.logger.info(f"[MAINT] Entering maintenance mode for node: {node_name}")
+        self.logger.info(f"[MAINT] Entering maintenance mode for node: {node_name}"
+                         f"{' (with-local-disks ENABLED)' if allow_local_disks else ''}")
 
         # set ceph flags before evacuating (#141)
         self._set_ceph_maintenance_flags(node_name)
@@ -2197,20 +2255,77 @@ class PegaProxManager:
         return task
 
     def _set_ceph_maintenance_flags(self, node_name):
-        """Set ceph noout+norebalance before maintenance to prevent unnecessary data movement (#141)"""
+        """Set ceph noout+norebalance before maintenance to prevent unnecessary data movement (#141).
+
+        Returns a dict: {'present': bool, 'flags_set': bool, 'error': str|None}
+        The rolling-update flow reads this to report Ceph status to the admin (#181).
+        """
+        result = {'present': False, 'flags_set': False, 'error': None}
         try:
             node_ip = self._get_node_ip(node_name)
             if not node_ip:
-                return
+                result['error'] = 'node not reachable'
+                return result
             # check if ceph is even installed
             cmd = "which ceph >/dev/null 2>&1 && ceph osd set norebalance 2>&1 && ceph osd add-noout " + node_name + " 2>&1 && echo CEPH_OK || echo CEPH_SKIP"
             out = self._ssh_node_output(node_name, cmd, timeout=30)
             if out and 'CEPH_OK' in out:
+                result['present'] = True
+                result['flags_set'] = True
                 self.logger.info(f"[MAINT] Ceph flags set for {node_name} (norebalance + noout)")
             else:
                 self.logger.debug(f"[MAINT] No ceph on {node_name} or flags skipped")
         except Exception as e:
+            result['error'] = str(e)
             self.logger.debug(f"[MAINT] Ceph flag set failed for {node_name}: {e}")
+        return result
+
+    def get_ceph_health_summary(self, via_node=None):
+        """Fetch a one-shot Ceph health snapshot via SSH for the rolling-update log (#181).
+
+        Returns None if ceph isn't present. On success:
+          {'status': 'HEALTH_OK|HEALTH_WARN|HEALTH_ERR', 'osd_up': int, 'osd_in': int,
+           'pgs': '1024 active+clean', 'warnings': [str, ...]}
+        Best-effort: any parse failure collapses to a minimal dict with status='unknown'.
+        """
+        try:
+            if not via_node:
+                # pick any online node
+                try:
+                    node_status = self.get_node_status()
+                    for nn, info in node_status.items():
+                        if info.get('status') == 'online':
+                            via_node = nn; break
+                except Exception:
+                    pass
+            if not via_node:
+                return None
+            cmd = "which ceph >/dev/null 2>&1 && ceph -s --format=json 2>/dev/null || echo NO_CEPH"
+            out = self._ssh_node_output(via_node, cmd, timeout=15)
+            if not out or 'NO_CEPH' in out:
+                return None
+            import json as _json
+            # sometimes there's a leading banner — pluck the first JSON object
+            start = out.find('{')
+            if start < 0:
+                return {'status': 'unknown', 'osd_up': 0, 'osd_in': 0, 'pgs': '', 'warnings': []}
+            data = _json.loads(out[start:])
+            health = data.get('health', {}) or {}
+            status = health.get('status') or 'unknown'
+            checks = health.get('checks', {}) or {}
+            warnings = [k for k in checks.keys()][:5]
+            osdmap = data.get('osdmap', {}) or {}
+            osd_up = osdmap.get('num_up_osds', osdmap.get('osdmap', {}).get('num_up_osds', 0))
+            osd_in = osdmap.get('num_in_osds', osdmap.get('osdmap', {}).get('num_in_osds', 0))
+            pgmap = data.get('pgmap', {}) or {}
+            pg_summary = ''
+            states = pgmap.get('pgs_by_state') or []
+            if states:
+                pg_summary = ', '.join(f"{s.get('count', 0)} {s.get('state_name', '')}" for s in states[:3])
+            return {'status': status, 'osd_up': osd_up, 'osd_in': osd_in, 'pgs': pg_summary, 'warnings': warnings}
+        except Exception as e:
+            self.logger.debug(f"[CEPH] health summary failed: {e}")
+            return {'status': 'unknown', 'osd_up': 0, 'osd_in': 0, 'pgs': '', 'warnings': []}
 
     def _unset_ceph_maintenance_flags(self, node_name):
         """Remove ceph noout+norebalance after maintenance (#141)
@@ -2412,6 +2527,22 @@ class PegaProxManager:
                     task.failed_vms.append({'vmid': vmid, 'name': vm_name, 'error': 'No target node available'})
                     task.pending_vms = [v for v in task.pending_vms if v.get('vmid') != vmid]
                     continue
+
+                # NS Apr 2026 (#330): when the user opted into local-disk evacuation,
+                # probe storage type here and tag the dict so migrate_vm emits
+                # --with-local-disks. Pre-flight check keeps the migrate path honest.
+                if getattr(task, 'allow_local_disks', False):
+                    try:
+                        stor_type = self.check_vm_storage_type(node_name, vmid, vm.get('type'))
+                    except Exception as e:
+                        stor_type = None
+                        self.logger.debug(f"[MAINT] storage type probe for {vmid} failed: {e}")
+                    if stor_type == 'local':
+                        vm['_has_local_disks'] = True
+                        self.logger.info(
+                            f"[MAINT] {vm_name} ({vmid}) has local disks -- migrating with "
+                            "--with-local-disks (this can take a while on big VMs)"
+                        )
 
                 self.logger.info(f"[SYNC] Evacuating {vm_name} (VMID: {vmid}) to {target_node}")
 
@@ -4862,6 +4993,10 @@ echo "AGENT_INSTALLED_OK"
 
         NS: Jan 2026 - HA status checks bypass semaphore for immediate execution
         """
+        # NS 2026-04-24 — auto-sudo for non-root SSH users (pegaprox@pam etc).
+        # Wrap multi-line/shell-redirect commands through base64 → `sudo bash`.
+        if user and user != 'root':
+            command = _wrap_with_sudo(command)
         if host and host.startswith('[') and host.endswith(']'):
             host = host[1:-1]
         _ssh_track_connection('ha', +1)
@@ -4891,6 +5026,10 @@ echo "AGENT_INSTALLED_OK"
 
         NS: Jan 2026 - HA operations bypass semaphore
         """
+        # NS 2026-04-24 — auto-sudo for non-root SSH users (pegaprox@pam etc).
+        # Wrap multi-line/shell-redirect commands through base64 → `sudo bash`.
+        if user and user != 'root':
+            command = _wrap_with_sudo(command)
         if host and host.startswith('[') and host.endswith(']'):
             host = host[1:-1]
         _ssh_track_connection('ha', +1)
@@ -4930,6 +5069,10 @@ echo "AGENT_INSTALLED_OK"
 
         NS: Jan 2026 - HA operations bypass semaphore
         """
+        # NS 2026-04-24 — auto-sudo for non-root SSH users (pegaprox@pam etc).
+        # Wrap multi-line/shell-redirect commands through base64 → `sudo bash`.
+        if user and user != 'root':
+            command = _wrap_with_sudo(command)
         if host and host.startswith('[') and host.endswith(']'):
             host = host[1:-1]
         _ssh_track_connection('ha', +1)
@@ -5734,6 +5877,10 @@ echo "AGENT_INSTALLED_OK"
         2. They are short (< 5 seconds typically)
         3. They are rare (only during actual failures)
         """
+        # NS 2026-04-24 — auto-sudo for non-root SSH users (pegaprox@pam etc).
+        # Wrap multi-line/shell-redirect commands through base64 → `sudo bash`.
+        if user and user != 'root':
+            command = _wrap_with_sudo(command)
         if host and host.startswith('[') and host.endswith(']'):
             host = host[1:-1]
         _ssh_track_connection('ha', +1)
@@ -5771,6 +5918,10 @@ echo "AGENT_INSTALLED_OK"
         MK: Security fix - writes key to temp file with strict permissions,
         uses it for SSH, then immediately deletes it.
         """
+        # NS 2026-04-24 — auto-sudo for non-root SSH users (pegaprox@pam etc).
+        # Wrap multi-line/shell-redirect commands through base64 → `sudo bash`.
+        if user and user != 'root':
+            command = _wrap_with_sudo(command)
         import tempfile
         if host and host.startswith('[') and host.endswith(']'):
             host = host[1:-1]
@@ -5825,6 +5976,10 @@ echo "AGENT_INSTALLED_OK"
 
         NS: Jan 2026 - HA operations bypass semaphore for immediate execution
         """
+        # NS 2026-04-24 — auto-sudo for non-root SSH users (pegaprox@pam etc).
+        # Wrap multi-line/shell-redirect commands through base64 → `sudo bash`.
+        if user and user != 'root':
+            command = _wrap_with_sudo(command)
         if host and host.startswith('[') and host.endswith(']'):
             host = host[1:-1]
         _ssh_track_connection('ha', +1)
@@ -12115,15 +12270,22 @@ echo "AGENT_INSTALLED_OK"
 
     def _ssh_node_output(self, node_name, cmd, timeout=60):
         """Run command on a node, tries all available SSH auth methods.
-        Returns stdout string or None."""
+        Returns stdout string or None.
+
+        NS 2026-04-24: For non-root SSH users (common: pegaprox@pam with NOPASSWD sudo)
+        we wrap the command via base64 → `sudo bash`. A naive `sudo {cmd}` prefix breaks
+        anything with shell redirects / heredocs: `sudo cat > /etc/foo` opens the redirect
+        in the non-privileged shell, cat gets root but the file write is done pre-sudo
+        and fails with Permission denied. The base64 path preserves the full command
+        intact and hands it to a root bash.
+        """
         node_ip = self._get_node_ip(node_name)
         if not node_ip:
             return None
 
         ssh_user = (self.config.user or 'root').split('@')[0]
-        # non-root users need sudo for package queries
-        if ssh_user != 'root':
-            cmd = f"sudo {cmd}"
+        # Sudo wrap is handled inside the _ssh_run_command_* helpers so we don't
+        # double-wrap when the call chain goes through multiple layers.
 
         ssh_key = getattr(self.config, 'ssh_key', '')
         if ssh_key:
@@ -12876,6 +13038,58 @@ echo DONE""",
             'verbose_check': """systemctl is-active auditd 2>/dev/null || echo 'not active' ; if command -v auditctl >/dev/null 2>&1 ; then auditctl -s 2>/dev/null | grep -E 'enabled|pid|rate' | head -5 ; auditctl -l 2>/dev/null | wc -l | awk '{print \"active rules: \"$1}' ; fi""",
             'apply': """apt-get install -y auditd audispd-plugins >/dev/null 2>&1
 systemctl enable --now auditd 2>/dev/null
+echo DONE""",
+        },
+        # MK Apr 2026 — fail2ban for sshd + Proxmox Web-UI login failures.
+        # Default policy: 5 retries in 10min → 24h ban. Idempotent: the marker file
+        # `/etc/fail2ban/jail.d/pegaprox-pve.conf` gates re-application, so apply is
+        # safe to run repeatedly.
+        'pve_fail2ban': {
+            'check': """systemctl is-active fail2ban 2>/dev/null | grep -q active && [ -f /etc/fail2ban/jail.d/pegaprox-pve.conf ] && echo OK || echo FAIL""",
+            'verbose_check': """systemctl is-active fail2ban 2>/dev/null || echo 'service inactive' ; echo '---jails---' ; fail2ban-client status 2>/dev/null | grep 'Jail list' || echo 'no jails' ; echo '---banned (summary)---' ; for j in $(fail2ban-client status 2>/dev/null | awk -F: '/Jail list/ {print $2}' | tr ',' ' ') ; do n=$(fail2ban-client status $j 2>/dev/null | awk '/Currently banned/ {print $NF}') ; echo "$j: ${n:-0} banned" ; done""",
+            'apply': """set -e
+apt-get install -y fail2ban >/dev/null 2>&1 || { echo 'INSTALL FAILED'; exit 1; }
+
+# Filter for PVE daemon auth failures (covers both API and Web-UI logins)
+cat > /etc/fail2ban/filter.d/proxmox.conf << 'F2BFILTER'
+# pegaprox managed — matches pvedaemon authentication failures
+# sample: pvedaemon[12345]: authentication failure; rhost=1.2.3.4 user=root@pam msg=...
+[Definition]
+failregex = pvedaemon\\[.*\\]: authentication failure; rhost=<HOST>
+ignoreregex =
+F2BFILTER
+
+# Jail: sshd (hardened defaults) + proxmox (PVE API/Web auth)
+cat > /etc/fail2ban/jail.d/pegaprox-pve.conf << 'F2BJAIL'
+# pegaprox managed — do not hand-edit; re-apply the CIS control to update
+[DEFAULT]
+bantime   = 86400
+findtime  = 600
+maxretry  = 5
+banaction = iptables-multiport
+
+[sshd]
+enabled  = true
+port     = ssh
+logpath  = %(sshd_log)s
+backend  = %(sshd_backend)s
+
+[proxmox]
+enabled  = true
+port     = https,http,8006
+filter   = proxmox
+logpath  = /var/log/daemon.log
+maxretry = 5
+findtime = 600
+bantime  = 86400
+F2BJAIL
+
+systemctl enable fail2ban >/dev/null 2>&1 || true
+systemctl restart fail2ban >/dev/null 2>&1 || { echo 'RESTART FAILED'; exit 1; }
+
+# Give it a second to pick up jails before we verify
+sleep 2
+fail2ban-client ping >/dev/null 2>&1 || { echo 'PING FAILED'; exit 1; }
 echo DONE""",
         },
     }

@@ -3362,6 +3362,67 @@ def get_vm_guest_info_api(cluster_id, node, vm_type, vmid):
     return jsonify(result)
 
 
+# MK #334 — surface the guest agent's fsinfo so scripts can monitor mountpoint
+# usage without having to call both PegaProx + Proxmox. Returns [] + agent_running=False
+# when the agent isn't installed / the VM isn't running — callers treat it as "no data".
+@bp.route('/api/clusters/<cluster_id>/vms/<node>/<vm_type>/<int:vmid>/guest-fsinfo', methods=['GET'])
+@require_auth(perms=['vm.view'])
+def get_vm_guest_fsinfo_api(cluster_id, node, vm_type, vmid):
+    """Proxy for qemu-agent get-fsinfo — list mounted filesystems with used/total bytes."""
+    ok, err = check_cluster_access(cluster_id)
+    if not ok: return err
+
+    if cluster_id not in cluster_managers:
+        return jsonify({'error': 'Cluster not found'}), 404
+
+    # LXC doesn't speak qemu-agent — no-op response keeps the frontend uniform
+    if vm_type != 'qemu':
+        return jsonify({'agent_running': False, 'filesystems': [], 'reason': 'lxc_not_supported'}), 200
+
+    mgr = cluster_managers[cluster_id]
+    payload = {'agent_running': False, 'filesystems': [], 'reason': None}
+
+    try:
+        session = mgr._create_session()
+        url = f"https://{mgr.host}:8006/api2/json/nodes/{node}/qemu/{vmid}/agent/get-fsinfo"
+        resp = session.get(url, timeout=10)
+        if resp.status_code == 200:
+            data = (resp.json().get('data') or {}).get('result') or []
+            out = []
+            for fs in data:
+                total = fs.get('total-bytes')
+                used = fs.get('used-bytes')
+                mount = fs.get('mountpoint')
+                if not mount:
+                    continue
+                pct = None
+                if isinstance(total, (int, float)) and total > 0 and isinstance(used, (int, float)):
+                    pct = round((used / total) * 100, 1)
+                out.append({
+                    'name': fs.get('name'),
+                    'mountpoint': mount,
+                    'type': fs.get('type'),
+                    'used_bytes': used,
+                    'total_bytes': total,
+                    'used_pct': pct,
+                })
+            payload['agent_running'] = True
+            payload['filesystems'] = out
+        elif resp.status_code == 500:
+            # Proxmox returns 500 with "QEMU guest agent is not running" in body
+            body = (resp.text or '').lower()
+            if 'not running' in body or 'not installed' in body:
+                payload['reason'] = 'agent_not_running'
+            else:
+                payload['reason'] = f'proxmox_{resp.status_code}'
+        else:
+            payload['reason'] = f'proxmox_{resp.status_code}'
+    except Exception as e:
+        payload['reason'] = f'error: {e}'
+
+    return jsonify(payload)
+
+
 @bp.route('/api/clusters/<cluster_id>/vms/<node>/<vm_type>/<int:vmid>/rrd/<timeframe>', methods=['GET'])
 @require_auth(perms=['vm.view'])
 def get_vm_rrd_api(cluster_id, node, vm_type, vmid, timeframe):
@@ -5900,20 +5961,53 @@ def start_vnc_websocket_server(port=5001, ssl_cert=None, ssl_key=None, host='0.0
                     stop_evt.set()
 
             async def pve_keepalive():
-                """Ping Proxmox every 15s so pvedaemon doesn't close an idle session (#312).
-                Uses wait_for on stop_evt so we bail out instantly when the session ends."""
+                """Keepalive for pvedaemon idle timeout (#312).
+
+                Two-layer: WS ping every 15s AND an RFB-level FramebufferUpdateRequest
+                every 20s. pveproxy sits between us and qemu and can timeout based on
+                RFB traffic, not WS frames — the browser's WS ping alone doesn't always
+                count as activity on the qemu side. By injecting an RFB incremental
+                update request we produce real RFB traffic that flows end-to-end.
+
+                RFB FramebufferUpdateRequest wire format (8 bytes, Big-Endian):
+                  U8  message-type = 3
+                  U8  incremental  = 1   (only changed regions -> cheap)
+                  U16 x            = 0
+                  U16 y            = 0
+                  U16 width        = 0xFFFF  (server clamps to FB size)
+                  U16 height       = 0xFFFF
+
+                15s grace before first RFB frame so the RFB handshake completes first —
+                injecting our bytes into the handshake would confuse qemu.
+                """
+                import time as _time
+                RFB_FB_UPDATE_REQUEST = b'\x03\x01\x00\x00\x00\x00\xff\xff\xff\xff'
+                session_start = _time.monotonic()
+                ws_ping_interval = 15
+                rfb_interval = 20
+                next_rfb_at = session_start + 15 + rfb_interval  # 15s grace + 20s first interval
                 while running:
                     try:
-                        await asyncio.wait_for(stop_evt.wait(), timeout=15)
+                        await asyncio.wait_for(stop_evt.wait(), timeout=ws_ping_interval)
                         break  # stop_evt was set — session ending
                     except asyncio.TimeoutError:
                         pass
                     if not running:
                         break
+                    # WS-layer ping (cheap, keeps any websocket-aware intermediary happy)
                     try:
                         await asyncio.to_thread(pve_ws.ping)
                     except Exception:
                         break
+                    # RFB-layer keepalive (keeps pveproxy/qemu from declaring the session idle)
+                    now = _time.monotonic()
+                    if now >= next_rfb_at:
+                        try:
+                            await asyncio.to_thread(pve_ws.send_binary, RFB_FB_UPDATE_REQUEST)
+                            next_rfb_at = now + rfb_interval
+                        except Exception as e:
+                            logging.debug(f"[VNC] RFB keepalive send failed: {e}")
+                            break
 
             task1 = asyncio.create_task(proxmox_to_client())
             task2 = asyncio.create_task(client_to_proxmox())

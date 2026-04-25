@@ -14,6 +14,9 @@
             const [loading, setLoading] = useState(false);
             const [showPassword, setShowPassword] = useState(false);
             const [requires2FA, setRequires2FA] = useState(false);
+            // NS Apr 2026 — which 2FA methods are available for the user who just entered password
+            const [twoFAMethods, setTwoFAMethods] = useState([]);
+            const [webauthnBusy, setWebauthnBusy] = useState(false);
             const [rememberMe, setRememberMe] = useState(() => localStorage.getItem('pegaprox-remember') === 'true');
             
             const [oidcLoading, setOidcLoading] = useState(false);
@@ -81,15 +84,81 @@
                 e.preventDefault();
                 if (!username || !password) return;
                 if (requires2FA && !totpCode) return;
-                
+
                 setLoading(true);
                 localStorage.setItem('pegaprox-remember', rememberMe);
                 const result = await login(username, password, totpCode, rememberMe);
-                
+
                 if (result?.requires_2fa) {
                     setRequires2FA(true);
+                    // server hints which 2FA methods the user has configured
+                    if (Array.isArray(result.methods)) setTwoFAMethods(result.methods);
                 }
                 setLoading(false);
+            };
+
+            // NS Apr 2026 — WebAuthn flow for 2FA step. Hits /webauthn/auth/begin,
+            // asks the browser, then /webauthn/auth/finish returns a one-shot proof
+            // token we pipe into /auth/login so the session can be minted.
+            const handleWebauthnLogin = async () => {
+                if (!('credentials' in navigator) || !navigator.credentials.get) {
+                    return;
+                }
+                setWebauthnBusy(true);
+                try {
+                    // helpers — same shape as create_modals.js but inline here to avoid a new import
+                    const b64urlToBuf = (s) => {
+                        const pad = '='.repeat((4 - s.length % 4) % 4);
+                        const bin = atob((s + pad).replace(/-/g, '+').replace(/_/g, '/'));
+                        const buf = new Uint8Array(bin.length);
+                        for (let i = 0; i < bin.length; i++) buf[i] = bin.charCodeAt(i);
+                        return buf.buffer;
+                    };
+                    const bufToB64url = (buf) => {
+                        const bin = String.fromCharCode(...new Uint8Array(buf));
+                        return btoa(bin).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+                    };
+                    const begin = await fetch(`${API_URL}/webauthn/auth/begin`, {
+                        method: 'POST', headers: { 'Content-Type': 'application/json' },
+                        credentials: 'include', body: JSON.stringify({ username })
+                    });
+                    if (!begin.ok) throw new Error((await begin.json().catch(() => ({}))).error || `begin ${begin.status}`);
+                    const opts = await begin.json();
+                    const pko = opts.publicKey || opts;
+                    const publicKey = {
+                        ...pko,
+                        challenge: b64urlToBuf(pko.challenge),
+                        allowCredentials: (pko.allowCredentials || []).map(c => ({ ...c, id: b64urlToBuf(c.id) })),
+                    };
+                    const assertion = await navigator.credentials.get({ publicKey });
+                    if (!assertion) throw new Error('cancelled');
+                    const finishBody = {
+                        username,
+                        id: assertion.id,
+                        rawId: bufToB64url(assertion.rawId),
+                        type: assertion.type,
+                        response: {
+                            clientDataJSON: bufToB64url(assertion.response.clientDataJSON),
+                            authenticatorData: bufToB64url(assertion.response.authenticatorData),
+                            signature: bufToB64url(assertion.response.signature),
+                            userHandle: assertion.response.userHandle ? bufToB64url(assertion.response.userHandle) : null,
+                        },
+                    };
+                    const finish = await fetch(`${API_URL}/webauthn/auth/finish`, {
+                        method: 'POST', headers: { 'Content-Type': 'application/json' },
+                        credentials: 'include', body: JSON.stringify(finishBody)
+                    });
+                    const fd = await finish.json().catch(() => ({}));
+                    if (!finish.ok || !fd.proof) throw new Error(fd.error || `finish ${finish.status}`);
+                    // Now complete login with the proof
+                    setLoading(true);
+                    const result = await login(username, password, '', rememberMe, fd.proof);
+                    setLoading(false);
+                    if (result?.requires_2fa) setRequires2FA(true);  // shouldn't happen on success
+                } catch (e) {
+                    console.warn('webauthn login:', e);
+                }
+                setWebauthnBusy(false);
             };
             
             return(
@@ -182,22 +251,40 @@
                                         </div>
                                     </>
                                 ) : (
-                                    <div>
-                                        <label className="block text-sm font-medium text-gray-300 mb-2">
-                                            {t('enter2FACode')}
-                                        </label>
-                                        <input
-                                            type="text"
-                                            value={totpCode}
-                                            onChange={(e) => setTotpCode(e.target.value.replace(/\D/g, '').slice(0, 6))}
-                                            className="w-full px-4 py-3 bg-proxmox-dark border border-proxmox-border rounded-xl text-white text-center text-2xl tracking-widest placeholder-gray-500 focus:outline-none focus:border-proxmox-orange transition-colors"
-                                            placeholder="000000"
-                                            maxLength={6}
-                                            autoFocus
-                                        />
-                                        <p className="text-gray-400 text-sm mt-2 text-center">
-                                            {t('scan2FACode')}
-                                        </p>
+                                    <div className="space-y-4">
+                                        {twoFAMethods.includes('webauthn') && (
+                                            <button type="button" onClick={handleWebauthnLogin} disabled={webauthnBusy}
+                                                className="w-full flex items-center justify-center gap-3 px-4 py-3 bg-proxmox-dark hover:bg-proxmox-hover border border-proxmox-border rounded-xl text-white font-medium transition-colors disabled:opacity-50">
+                                                {webauthnBusy ? <Icons.Loader className="w-5 h-5 animate-spin" /> : <Icons.Key className="w-5 h-5 text-proxmox-orange" />}
+                                                {t('useSecurityKey') || 'Use Security Key'}
+                                            </button>
+                                        )}
+                                        {twoFAMethods.includes('webauthn') && twoFAMethods.includes('totp') && (
+                                            <div className="flex items-center gap-3">
+                                                <div className="flex-1 h-px bg-proxmox-border"></div>
+                                                <span className="text-xs text-gray-500 uppercase">{t('or') || 'or'}</span>
+                                                <div className="flex-1 h-px bg-proxmox-border"></div>
+                                            </div>
+                                        )}
+                                        {(twoFAMethods.length === 0 || twoFAMethods.includes('totp')) && (
+                                            <div>
+                                                <label className="block text-sm font-medium text-gray-300 mb-2">
+                                                    {t('enter2FACode')}
+                                                </label>
+                                                <input
+                                                    type="text"
+                                                    value={totpCode}
+                                                    onChange={(e) => setTotpCode(e.target.value.replace(/\D/g, '').slice(0, 6))}
+                                                    className="w-full px-4 py-3 bg-proxmox-dark border border-proxmox-border rounded-xl text-white text-center text-2xl tracking-widest placeholder-gray-500 focus:outline-none focus:border-proxmox-orange transition-colors"
+                                                    placeholder="000000"
+                                                    maxLength={6}
+                                                    autoFocus
+                                                />
+                                                <p className="text-gray-400 text-sm mt-2 text-center">
+                                                    {t('scan2FACode')}
+                                                </p>
+                                            </div>
+                                        )}
                                     </div>
                                 )}
                                 
@@ -206,23 +293,26 @@
                                     {t('rememberMe') || 'Remember me'}
                                 </label>
 
-                                <button
-                                    type="submit"
-                                    disabled={loading || !username || !password}
-                                    className="w-full py-3 bg-proxmox-orange rounded-xl text-white font-semibold hover:bg-orange-600 transition-colors disabled:opacity-50 disabled:cursor-not-allowed flex items-center justify-center gap-2"
-                                >
-                                    {loading ? (
-                                        <>
-                                            <svg className="w-5 h-5 animate-spin" fill="none" viewBox="0 0 24 24">
-                                                <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
-                                                <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
-                                            </svg>
-                                            {t('loggingIn')}
-                                        </>
-                                    ) : (
-                                        t('loginButton')
-                                    )}
-                                </button>
+                                {/* submit button: hidden when user only has WebAuthn (the Use Security Key button handles it) */}
+                                {!(requires2FA && twoFAMethods.length === 1 && twoFAMethods[0] === 'webauthn') && (
+                                    <button
+                                        type="submit"
+                                        disabled={loading || !username || !password || (requires2FA && twoFAMethods.includes('totp') && totpCode.length !== 6)}
+                                        className="w-full py-3 bg-proxmox-orange rounded-xl text-white font-semibold hover:bg-orange-600 transition-colors disabled:opacity-50 disabled:cursor-not-allowed flex items-center justify-center gap-2"
+                                    >
+                                        {loading ? (
+                                            <>
+                                                <svg className="w-5 h-5 animate-spin" fill="none" viewBox="0 0 24 24">
+                                                    <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
+                                                    <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+                                                </svg>
+                                                {t('loggingIn')}
+                                            </>
+                                        ) : (
+                                            t('loginButton')
+                                        )}
+                                    </button>
+                                )}
                             </form>
                             
                             {/* NS: Feb 2026 - OIDC / Entra ID login */}
