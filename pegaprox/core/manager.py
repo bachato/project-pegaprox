@@ -10363,9 +10363,15 @@ echo "AGENT_INSTALLED_OK"
             
             if response.status_code == 200:
                 networks = response.json()['data']
-                # Filter to just bridges and OVS bridges
+                # MK May 2026 (#385 maxilee): only actual bridge types here.
+                # OVSIntPort is an OVS *internal* port — typically used for
+                # host-side L3 attachment (mgmt IP, iscsi access port, etc.)
+                # and NOT a valid target for a VM NIC's `bridge=` config.
+                # PVE's own web UI doesn't expose those either; we were
+                # over-listing them, which on OVS setups polluted the
+                # dropdown with mgmt/iscsi-style ports.
                 for n in networks:
-                    if n.get('type') in ['bridge', 'OVSBridge', 'OVSIntPort']:
+                    if n.get('type') in ['bridge', 'OVSBridge']:
                         n['source'] = 'local'
                         result.append(n)
                         if n.get('iface'):
