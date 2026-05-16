@@ -137,6 +137,7 @@
             const [storageList, setStorageList] = useState([]);
             const [bridgeList, setBridgeList] = useState([]);
             const [isoList, setIsoList] = useState([]);
+            const [dcMacPrefix, setDcMacPrefix] = useState('');  // MK May 2026 (#365): datacenter MAC prefix for generateMAC
             
             // Snapshot states
             const [snapshots, setSnapshots] = useState([]);
@@ -1361,14 +1362,39 @@
                 }
             };
 
+            // MK May 2026 (#365 j0c00): fetch datacenter MAC prefix once on mount so
+            // generateMAC can honour Datacenter → Options → MAC address prefix.
+            // PVE itself uses this prefix when it auto-generates MACs; our button
+            // was just rolling random `02:xx:xx:xx:xx:xx` regardless.
+            useEffect(() => {
+                if (!clusterId) return;
+                let cancelled = false;
+                (async () => {
+                    try {
+                        const r = await dashboardAuthFetch(`${API_URL}/clusters/${clusterId}/datacenter/options`);
+                        if (r?.ok && !cancelled) {
+                            const data = await r.json();
+                            if (data?.mac_prefix) setDcMacPrefix(String(data.mac_prefix));
+                        }
+                    } catch (e) { /* non-fatal — generateMAC falls back to '02:' */ }
+                })();
+                return () => { cancelled = true; };
+            }, [clusterId]);
+
             // Helper functions
             const generateMAC = () => {
                 const hex = '0123456789ABCDEF';
-                let mac = '02';
-                for (let i = 0; i < 5; i++) {
-                    mac += ':' + hex[Math.floor(Math.random() * 16)] + hex[Math.floor(Math.random() * 16)];
+                const rand = () => hex[Math.floor(Math.random() * 16)] + hex[Math.floor(Math.random() * 16)];
+                // MK May 2026 (#365): honour the cluster's MAC prefix when set.
+                // PVE accepts 1–3 octets (BC, BC:24, BC:24:11); we mirror that.
+                const prefix = (dcMacPrefix || '').trim();
+                let parts = [];
+                if (/^[A-Fa-f0-9]{2}(:[A-Fa-f0-9]{2}){0,2}$/.test(prefix)) {
+                    parts = prefix.toUpperCase().split(':');
                 }
-                return mac;
+                if (parts.length === 0) parts = ['02'];  // fall back to locally-administered prefix
+                while (parts.length < 6) parts.push(rand());
+                return parts.join(':');
             };
 
             const getNextDiskId = (busType = 'scsi') => {
