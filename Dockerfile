@@ -1,4 +1,4 @@
-FROM python:3.12-slim
+FROM python:3.12-slim@sha256:9d3abd9fc11d06998ccdbdd93b4dd49b5ad7d67fcbbc11c016eb0eb2c2194891
 
 LABEL org.label-schema.name="PegaProx"
 LABEL org.label-schema.description="Modern Multi-Cluster Management for Proxmox VE"
@@ -8,7 +8,7 @@ LABEL org.label-schema.vcs-url="https://github.com/PegaProx/project-pegaprox"
 LABEL maintainer="support@pegaprox.com"
 
 # Install system dependencies
-RUN apt-get update && apt-get install -y --no-install-recommends \
+RUN apt-get update && apt-get upgrade -y && apt-get install -y --no-install-recommends \
     gcc libffi-dev libssl-dev \
     openssh-client sshpass \
     && rm -rf /var/lib/apt/lists/*
