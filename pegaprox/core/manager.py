@@ -344,9 +344,20 @@ class PegaProxManager:
             fh.setFormatter(formatter)
             self.logger.addHandler(fh)
 
-        # Console handler - INFO level (no DEBUG spam)
+        # Console handler — defaults to INFO so the systemd journal stays
+        # readable on busy clusters, but the operator can raise the floor via
+        # PEGAPROX_LOG_LEVEL.
+        # MK May 2026 (#357 follow-up @SeeJayEmm) — earlier the per-cluster
+        # logger had `propagate=False` AND a hardcoded INFO StreamHandler, so
+        # PEGAPROX_LOG_LEVEL=WARNING only quieted the root logger; per-cluster
+        # INFO lines kept landing in journald. Honour the env var on the
+        # StreamHandler too: env-level wins iff it's stricter than INFO.
+        from pegaprox.constants import LOG_LEVEL as _ENV_LOG_LEVEL
         ch = logging.StreamHandler()
-        ch.setLevel(logging.INFO)
+        _stream_level = logging.INFO
+        if _ENV_LOG_LEVEL is not None and _ENV_LOG_LEVEL > _stream_level:
+            _stream_level = _ENV_LOG_LEVEL
+        ch.setLevel(_stream_level)
         ch.setFormatter(formatter)
         self.logger.addHandler(ch)
         

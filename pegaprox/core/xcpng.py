@@ -144,8 +144,15 @@ class XcpngManager:
             fh.setLevel(_FH_LVL)
             fh.setFormatter(fmt)
             self.logger.addHandler(fh)
+        # MK May 2026 (#357 follow-up) — honour PEGAPROX_LOG_LEVEL on the
+        # per-cluster stream handler too; the logger has propagate=False so the
+        # root level alone isn't enough.
+        from pegaprox.constants import LOG_LEVEL as _ENV_LOG_LEVEL
         ch = logging.StreamHandler()
-        ch.setLevel(logging.INFO)
+        _stream_level = logging.INFO
+        if _ENV_LOG_LEVEL is not None and _ENV_LOG_LEVEL > _stream_level:
+            _stream_level = _ENV_LOG_LEVEL
+        ch.setLevel(_stream_level)
         ch.setFormatter(fmt)
         self.logger.addHandler(ch)
 
