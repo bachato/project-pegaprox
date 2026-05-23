@@ -1185,6 +1185,28 @@ class PegaProxManager:
                 nodes = response.json()['data']
                 node_status = {}
 
+                # MK May 2026 — recovery path for the per-node circuit breaker.
+                # /api2/json/nodes is PVE's cluster-wide aggregate; Corosync
+                # propagates rejoin within 1-2s so this is the ground truth
+                # for "is the node back?". If PVE says status=online for a
+                # node we currently have blocked, clear the breaker so the
+                # very next call hits it again instead of waiting out the
+                # full backoff window. Avoids the 60s/5min/30min UI-lag-on-
+                # node-recovery that the passive backoff alone would give.
+                for n in nodes:
+                    nname = n.get('node')
+                    if not nname:
+                        continue
+                    if n.get('status') == 'online':
+                        with self._node_lock:
+                            had_block = nname in self._node_blocked_until or nname in self._node_failures
+                        if had_block:
+                            self.logger.info(
+                                f"[NODE] cluster '{self.config.name}' observed '{nname}' "
+                                f"back online via /nodes aggregate — clearing breaker"
+                            )
+                            self._reset_node_failures(nname)
+
                 # MK May 2026 (#419, SpyrosPsarras): previous version queried
                 # /cluster/resources?type=node and read netin/netout off the
                 # returned records — but those keys only exist on type=vm rows,
