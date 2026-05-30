@@ -24,33 +24,39 @@ jobs:
   # ----------------------------------------------------------------------
   # 1) Version ermitteln + warten bis Release-Paket im gyptazy-Repo ist
   # ----------------------------------------------------------------------
-  prepare:
+prepare:
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.ver.outputs.version }}
+      is_release: ${{ steps.ver.outputs.is_release }}
     steps:
       - id: ver
         name: Release-Version ermitteln
         run: |
           if [ -n "${{ github.event.release.tag_name }}" ]; then
             V="${{ github.event.release.tag_name }}"
+            REL="true"
           elif [ -n "${{ inputs.tag }}" ]; then
             V="${{ inputs.tag }}"
+            REL="true"
           else
             V="dev-$(date +%Y%m%d-%H%M%S)"
+            REL="false"
           fi
-          echo "Version: $V"
-          echo "version=$V" >> "$GITHUB_OUTPUT"
+          echo "Version: $V (is_release=$REL)"
+          echo "version=$V"      >> "$GITHUB_OUTPUT"
+          echo "is_release=$REL" >> "$GITHUB_OUTPUT"
 
       - name: Tools
+        if: steps.ver.outputs.is_release == 'true'
         run: |
           sudo apt-get update
           sudo apt-get install -y curl gnupg ca-certificates
 
       - name: Auf PegaProx-Paket im APT-Repo warten
+        if: steps.ver.outputs.is_release == 'true'
         run: |
           set -e
-          # Key + Sources-Liste lokal im Workspace ablegen (kein /etc, kein sudo nötig)
           curl -fsSL https://git.gyptazy.com/api/packages/gyptazy/debian/repository.key \
             -o gyptazy.asc
           mkdir -p apt-root/etc/apt/sources.list.d \
@@ -64,7 +70,6 @@ jobs:
           WANT="$(echo '${{ steps.ver.outputs.version }}' | sed 's/^v//')"
           echo "Erwarte Paketversion (Präfix): $WANT"
 
-          # apt komplett auf das lokale Verzeichnis umbiegen -> keine Root-Rechte nötig
           APT_OPTS="-o Dir::Etc::sourcelist=$(pwd)/apt-root/etc/apt/sources.list.d/gyptazy.list \
                     -o Dir::Etc::sourceparts=- \
                     -o Dir::Etc::trusted=$(pwd)/apt-root/etc/apt/keyrings/gyptazy.asc \
@@ -91,6 +96,12 @@ jobs:
           fi
           echo "Release-Paket ist verfügbar, Build kann starten."
 
+      - name: Dev-Build - Poll übersprungen
+        if: steps.ver.outputs.is_release != 'true'
+        run: |
+          echo "Manueller Dev-Build ohne Tag ('${{ steps.ver.outputs.version }}')."
+          echo "Repo-Poll wird übersprungen. Es wird die aktuell neueste pegaprox-Version installiert."
+          
   # ----------------------------------------------------------------------
   # 2) LXC-Template per distrobuilder (Snap) + Smoke-Test
   # ----------------------------------------------------------------------
