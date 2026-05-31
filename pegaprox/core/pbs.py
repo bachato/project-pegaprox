@@ -21,27 +21,21 @@ from pegaprox.core.db import get_db
 from pegaprox.globals import pbs_managers
 
 def _validate_pbs_host(host: str) -> bool:
-    """Validate PBS host against allowlist.
-    
-    Returns True if host is allowed, False otherwise.
+    """Format-only check on the PBS host string.
+
+    MK 2026-05-31 (#514 jostrasser) — the original Aikido patch (#475)
+    shipped a domain allowlist defaulting to ['example.com'], which
+    rejected every real customer PBS at startup. Allowlisting FQDNs
+    makes no sense here: PBS hosts are per-customer config
+    (pbs.internal, 10.0.x.x, etc.) — no operator-side list can know
+    them ahead of time. The format regex IS the SSRF defence:
+    refusing 'http://...', paths, quoting and shell metachars means
+    a malicious value can't redirect the request off-host.
     """
-    # Domain allowlist - add your allowed PBS server domains here
-    allowed_domains = ['example.com']  # add your allowed domains here
-    
     if not host:
         return False
-    
-    # Validate host format (hostname or IP, no protocol/path)
-    # Allow alphanumeric, dots, hyphens, and colons (for IPv6)
-    if not re.match(r'^[a-zA-Z0-9\.\-\:]+$', host):
-        return False
-    
-    # Check if host matches any allowed domain (exact match or subdomain)
-    for allowed_domain in allowed_domains:
-        if host == allowed_domain or host.endswith('.' + allowed_domain):
-            return True
-    
-    return False
+    # hostname, FQDN, IPv4, or IPv6 — no scheme, no path, no whitespace
+    return bool(re.match(r'^[a-zA-Z0-9\.\-\:]+$', host))
 
 class PBSManager:
     """Manages connection to a Proxmox Backup Server instance
