@@ -58,9 +58,12 @@ jobs:
         name: Auf PegaProx-Paket im APT-Repo warten
         run: |
           set -e
-          install -d -m 0755 /etc/apt/keyrings
+          # MK May 2026: ubuntu-latest moved to 24.04 and /etc/apt/keyrings
+          # is now root-owned 0755 again — runner user can't write the key
+          # directly anymore. sudo + curl-piped-to-tee.
+          sudo install -d -m 0755 /etc/apt/keyrings
           curl -fsSL https://git.gyptazy.com/api/packages/gyptazy/debian/repository.key \
-            -o /etc/apt/keyrings/gyptazy.asc
+            | sudo tee /etc/apt/keyrings/gyptazy.asc > /dev/null
           echo "deb [signed-by=/etc/apt/keyrings/gyptazy.asc] https://packages.gyptazy.com/api/packages/gyptazy/debian ${DEBIAN_RELEASE} main" \
             | sudo tee /etc/apt/sources.list.d/gyptazy.list
 
