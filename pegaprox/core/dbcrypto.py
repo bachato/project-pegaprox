@@ -178,25 +178,28 @@ def _apply_sqlcipher_pragmas(conn, db_path: str) -> None:
     mk = load_master_key()
     hex_key = mk.key_raw.hex()
 
-    # PRAGMA key MUST be the very first statement.  Using the x'...' form
-    # tells SQLCipher to use the literal 32-byte key (skipping its internal
-    # PBKDF2 derivation from a passphrase, which would otherwise add ~100ms
-    # to every connection open).
+    # SQLCipher requires PRAGMA key before any data access, but a handful of
+    # *configuration* pragmas (cipher_memory_security, cipher_kdf_algorithm,
+    # cipher_default_*) must come BEFORE the key — they configure the page-
+    # cache mlock + the key-derivation path that the keying step then uses.
+    # Using the x'...' form on PRAGMA key tells SQLCipher to use the literal
+    # 32-byte key (skipping its internal PBKDF2 derivation from a passphrase,
+    # which would otherwise add ~100ms to every connection open).
     cur = conn.cursor()
     try:
+        # MK 2026-06-01 (#509 davinkevin re-open) — cipher_memory_security has
+        # to be issued BEFORE PRAGMA key. SQLCipher does the page-cache
+        # mlock() at key time, so setting OFF afterwards (as we did in the
+        # v0.9.12 first-cut) was too late — the failing mlock + warning had
+        # already fired by the time the pragma landed. Per-connection, since
+        # the setting is per-connection.
+        if not _MEMORY_SECURITY_ON:
+            cur.execute("PRAGMA cipher_memory_security = OFF")
         cur.execute(f"PRAGMA key = \"x'{hex_key}'\"")
         # Format version 4 = current SQLCipher format (2019+).  Locking us
         # to v4 means future SQLCipher upgrades don't silently change the
         # at-rest format.
         cur.execute("PRAGMA cipher_compatibility = 4")
-        # NS May 2026 (#509 davinkevin) — when running rootless / container
-        # the mlock() SQLCipher uses to pin page-cache pages fails with
-        # ENOMEM and floods stderr. Disabling the in-memory pinning here is
-        # safe — at-rest AES-256 + HMAC-SHA512 stays in place — and clears
-        # the log spam. Heuristic + env override decided once at module
-        # load; see _resolve_memory_security_setting().
-        if not _MEMORY_SECURITY_ON:
-            cur.execute("PRAGMA cipher_memory_security = OFF")
         # Verify the key works — if wrong, SQLCipher returns OK on the
         # PRAGMA key but the next read throws "file is not a database".
         # The smoke read catches that immediately with a clearer message.
