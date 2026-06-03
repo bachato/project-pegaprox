@@ -4699,6 +4699,12 @@ class PegaProxManager:
 MANAGER_IP="__MANAGER_IP__"
 OTHER_NODES="__OTHER_NODES__"  # comma-separated list
 PEGAPROX_VMID="__PEGAPROX_VMID__"
+# MK 2026-06-03: 'quorum' (default for 3+ nodes or 2-node-with-qdevice)
+# uses corosync's vote to gate destructive actions. 'wait' (2-node WITHOUT
+# qdevice) skips fencing entirely because corosync loses quorum on every
+# single-node reboot and an aggressive fence would tear the cluster down
+# on every planned maintenance. Detected at install time from `pvecm status`.
+FENCE_STRATEGY="__FENCE_STRATEGY__"
 CHECK_INTERVAL=5
 FAIL_THRESHOLD=3
 FAIL_COUNT=0
@@ -4724,6 +4730,18 @@ can_reach_other_nodes() {
         fi
     done
     return 1
+}
+
+# MK 2026-06-03: quorum-aware gate. Before any destructive action we ask
+# corosync whether the cluster is currently quorate. If yes, we're not
+# isolated regardless of what ICMP says — corosync sees us as part of a
+# voting majority, and a destructive self-fence here would be a false
+# positive (typical trigger: a peer node rebooting briefly drops manager
+# pings while corosync stays quorate for the rest of us). Returns 0
+# when quorate, 1 otherwise (including pvecm absent / non-PVE host).
+is_quorate() {
+    command -v pvecm >/dev/null 2>&1 || return 1
+    pvecm status 2>/dev/null | grep -qE "^Quorate:[[:space:]]+Yes"
 }
 
 stop_all_vms() {
@@ -4821,8 +4839,34 @@ while true; do
         log "WARNING: Cannot reach anyone! $FAIL_COUNT/$FAIL_THRESHOLD"
 
         if [ $FAIL_COUNT -ge $FAIL_THRESHOLD ]; then
+            # MK 2026-06-03: quorum-aware gate. Before fencing, ask corosync
+            # whether the cluster considers us quorate. If yes, this is a
+            # transient ICMP blip (peer reboot / brief network glitch), not
+            # genuine isolation — fencing here would be a false positive
+            # that kills VMs unnecessarily. Reset FAIL_COUNT and keep going.
+            if is_quorate; then
+                log "FAIL_THRESHOLD reached but pvecm says Quorate: Yes — skipping fence (transient blip, not real isolation)"
+                FAIL_COUNT=0
+                sleep $CHECK_INTERVAL
+                continue
+            fi
+            # MK 2026-06-03: 2-node cluster WITHOUT qdevice can never be
+            # quorate during a peer reboot. The original ping-isolation
+            # behaviour would fence the surviving node on every planned
+            # maintenance and take down ALL VMs cluster-wide. FENCE_STRATEGY
+            # is detected at install time and baked in. 'wait' means we
+            # log + sit on our hands — admin must add a qdevice to enable
+            # safe automatic fencing, OR live with the no-auto-fence trade-off.
+            if [ "$FENCE_STRATEGY" = "wait" ]; then
+                log "ISOLATED but FENCE_STRATEGY=wait (2-node cluster, no qdevice)"
+                log "Keeping VMs running — add a qdevice to enable proper quorum-based fencing"
+                FAIL_COUNT=0
+                sleep $CHECK_INTERVAL
+                continue
+            fi
             log "════════════════════════════════════════════════════════"
             log "ISOLATED! Self-fencing to prevent split-brain..."
+            log "(pvecm not quorate AND manager/peers unreachable for ${FAIL_THRESHOLD} cycles)"
             log "════════════════════════════════════════════════════════"
             stop_all_vms
 
@@ -4862,6 +4906,11 @@ done
             agent_script = agent_script.replace('__MANAGER_IP__', manager_ip)
             agent_script = agent_script.replace('__OTHER_NODES__', other_nodes_str)
             agent_script = agent_script.replace('__PEGAPROX_VMID__', str(self.ha_config.get('pegaprox_vmid', '')))
+            # MK 2026-06-03: bake the fence-strategy decision in at install
+            # time. Default to 'quorum' if detection fails; 'wait' is only
+            # selected for confirmed 2-node-no-qdevice topology so admins
+            # of those clusters don't lose every VM on a planned reboot.
+            agent_script = agent_script.replace('__FENCE_STRATEGY__', self._ha_detect_fence_strategy())
             
             # SSH credentials - try multiple sources
             ssh_user = getattr(self.config, 'ssh_user', None) or 'root'
@@ -5142,10 +5191,152 @@ echo "AGENT_UNINSTALLED"
                         self._ssh_run_command_output(node_ip, ssh_user, stop_cmd)
                         
                     self.logger.info(f"[HA] Stopped self-fence agent on {node_name}")
-                    
+
         except Exception as e:
             self.logger.error(f"[HA] Error stopping self-fence agents: {e}")
-    
+
+    def _ha_detect_fence_strategy(self) -> str:
+        """Pick the agent fence-strategy by SSH-querying corosync's view.
+
+        Returns:
+          'quorum' — 3+ nodes OR qdevice configured. Quorum-aware fencing is
+                     safe: corosync's vote majority + agent's quorum-gate
+                     reliably distinguish transient blips from real partitions.
+          'wait'   — Exactly 2 nodes AND no qdevice. Corosync loses quorum on
+                     every single-node reboot, so an aggressive fence would
+                     tear down the whole cluster on planned maintenance.
+                     Agent logs but does NOT auto-fence; admin must either
+                     add a qdevice or accept manual intervention on split.
+
+        Defaults to 'quorum' when detection fails — keeps the historical
+        behaviour for users who already had self-fence working, rather than
+        silently switching them into a more permissive mode without intent.
+        """
+        try:
+            host = self.host
+            url = f"https://{host}:{self.api_port}/api2/json/nodes"
+            resp = self._create_session().get(url, timeout=10)
+            if resp.status_code != 200:
+                return 'quorum'
+
+            ssh_user = getattr(self.config, 'ssh_user', None) or 'root'
+            ssh_key = getattr(self.config, 'ssh_key_path', None) or getattr(self.config, 'ssh_key', None)
+            ssh_password = getattr(self.config, 'ssh_password', None) or self.config.pass_
+
+            import re as _re
+            cmd = "pvecm status 2>/dev/null"
+            for node in resp.json().get('data', []):
+                node_name = node.get('node', '')
+                node_ip = self._ha_get_node_ip(node_name) if node_name else None
+                if not node_ip:
+                    continue
+
+                out = None
+                if ssh_key:
+                    out = self._ssh_run_command_with_key_output(node_ip, ssh_user, cmd, ssh_key)
+                if out is None and ssh_password:
+                    out = self._ssh_run_command_with_password_output(node_ip, ssh_user, cmd, ssh_password)
+                if out is None:
+                    out = self._ssh_run_command_output(node_ip, ssh_user, cmd)
+                if not out or 'Expected votes' not in out:
+                    continue
+
+                exp_m = _re.search(r'^Expected votes:\s+(\d+)', out, _re.MULTILINE)
+                expected = int(exp_m.group(1)) if exp_m else 0
+                flags_m = _re.search(r'^Flags:\s+(.+)$', out, _re.MULTILINE)
+                flags = flags_m.group(1) if flags_m else ''
+                has_qdevice = 'Qdevice' in flags
+
+                if expected >= 3 or has_qdevice:
+                    self.logger.info(
+                        f"[HA] fence_strategy=quorum (expected_votes={expected}, qdevice={has_qdevice})"
+                    )
+                    return 'quorum'
+                else:
+                    self.logger.warning(
+                        f"[HA] 2-node cluster WITHOUT qdevice detected (expected_votes={expected}) — "
+                        f"fence_strategy=wait. The agent will NOT auto-stop VMs on isolation, "
+                        f"because corosync loses quorum on every single-node reboot in this "
+                        f"topology. Add a qdevice to enable safe automatic fencing."
+                    )
+                    return 'wait'
+            return 'quorum'
+        except Exception as e:
+            self.logger.warning(f"[HA] fence-strategy detection failed: {e} — defaulting to 'quorum'")
+            return 'quorum'
+
+    def _ha_cleanup_storage_heartbeat(self) -> dict:
+        """Wipe the `.pegaprox` heartbeat directory on the shared storage path
+        used by the node-agent's poison-pill mechanism.
+
+        MK 2026-06-03 — companion to the proper HA-disable teardown. Without
+        this, stale `poison_<node>` / `heartbeat_<node>` files from the
+        previous enable-cycle would survive into the next install, and the
+        first poll of the freshly-installed node-agent would read a leftover
+        poison and stop every VM on the node. Best-effort: returns a dict
+        describing what we cleaned + what we couldn't reach. Never raises.
+        """
+        storage_path = (self.ha_config or {}).get('storage_heartbeat_path') or ''
+        result = {'attempted': False, 'cleaned': False, 'path': storage_path, 'error': None}
+        if not storage_path:
+            return result
+        result['attempted'] = True
+
+        # Operate via the same SSH path the agent installer uses. We pick the
+        # first reachable cluster node and rm -rf the dir from there — the
+        # storage is shared so any node sees the same tree.
+        try:
+            host = self.host
+            url = f"https://{host}:{self.api_port}/api2/json/nodes"
+            resp = self._create_session().get(url, timeout=10)
+            if resp.status_code != 200:
+                result['error'] = f'list-nodes HTTP {resp.status_code}'
+                return result
+
+            ssh_user = getattr(self.config, 'ssh_user', None) or 'root'
+            ssh_key = getattr(self.config, 'ssh_key_path', None) or getattr(self.config, 'ssh_key', None)
+            ssh_password = getattr(self.config, 'ssh_password', None) or self.config.pass_
+
+            # Defense-in-depth: refuse to rm -rf anything that doesn't look
+            # like a heartbeat dir. Path must end in `.pegaprox` exactly.
+            target = os.path.join(storage_path, '.pegaprox').rstrip('/')
+            if not target.endswith('/.pegaprox'):
+                result['error'] = 'safety-check: refusing to rm path that does not end in /.pegaprox'
+                return result
+
+            cleanup_cmd = (
+                f"if [ -d {shlex.quote(target)} ]; then "
+                f"  rm -rf {shlex.quote(target)} && echo HEARTBEAT_DIR_CLEANED; "
+                f"else echo HEARTBEAT_DIR_ABSENT; fi"
+            )
+
+            for node in resp.json().get('data', []):
+                node_name = node.get('node', '')
+                node_ip = self._ha_get_node_ip(node_name) if node_name else None
+                if not node_ip:
+                    continue
+
+                out = None
+                if ssh_key:
+                    out = self._ssh_run_command_with_key_output(node_ip, ssh_user, cleanup_cmd, ssh_key)
+                if out is None and ssh_password:
+                    out = self._ssh_run_command_with_password_output(node_ip, ssh_user, cleanup_cmd, ssh_password)
+                if out is None:
+                    out = self._ssh_run_command_output(node_ip, ssh_user, cleanup_cmd)
+
+                if out and ('HEARTBEAT_DIR_CLEANED' in out or 'HEARTBEAT_DIR_ABSENT' in out):
+                    result['cleaned'] = True
+                    self.logger.info(f"[HA] storage heartbeat dir cleanup via {node_name}: ok")
+                    return result
+                else:
+                    self.logger.debug(f"[HA] storage heartbeat cleanup via {node_name} no-answer, trying next node")
+
+            result['error'] = 'no node could reach the storage path to clean it'
+            return result
+        except Exception as e:
+            result['error'] = str(e)[:200]
+            return result
+
     def _ha_start_self_fence_agents(self):
         """Start self-fence agents on all nodes
         
@@ -5372,6 +5563,10 @@ echo "AGENT_UNINSTALLED"
 # This agent communicates via STORAGE network, not server network!
 
 STORAGE_PATH="__STORAGE_PATH__"
+# MK 2026-06-03: see _SELF_FENCE_AGENT_SCRIPT for the rationale — same
+# strategy choice gates the poison-pill response so 2-node-no-qdevice
+# clusters don't get torn down on every false-positive recovery trigger.
+FENCE_STRATEGY="__FENCE_STRATEGY__"
 HEARTBEAT_INTERVAL=5
 NODE_NAME=$(hostname)
 PEGAPROX_DIR="${STORAGE_PATH}/.pegaprox"
@@ -5380,6 +5575,17 @@ POISON_FILE="${PEGAPROX_DIR}/poison_${NODE_NAME}"
 POISON_ACK_FILE="${PEGAPROX_DIR}/poison_ack_${NODE_NAME}"
 
 log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" >> /var/log/pegaprox-agent.log; }
+
+# MK 2026-06-03: same quorum-aware gate as the self-fence agent. PegaProx's
+# server-side recovery worker can drop a poison pill in response to a
+# transient API unreachability (e.g. a peer node rebooting). If we're still
+# part of the corosync majority, that pill is a false positive and stopping
+# our VMs would shred the cluster. We refuse the pill in that case and the
+# server can re-evaluate on its next pass.
+is_quorate() {
+    command -v pvecm >/dev/null 2>&1 || return 1
+    pvecm status 2>/dev/null | grep -qE "^Quorate:[[:space:]]+Yes"
+}
 
 write_heartbeat() {
     mkdir -p "$PEGAPROX_DIR" 2>/dev/null
@@ -5390,6 +5596,20 @@ write_heartbeat() {
 
 check_poison() {
     if [ -f "$POISON_FILE" ]; then
+        if is_quorate; then
+            log "POISON PILL detected but pvecm reports Quorate: Yes — REFUSING to stop VMs"
+            log "(server-side recovery thinks we are partitioned, but corosync sees us in the majority — this is a false positive)"
+            echo "{\\"timestamp\\":\\"$(date -Iseconds)\\",\\"node\\":\\"$NODE_NAME\\",\\"poison_refused\\":\\"quorate\\"}" > "$POISON_ACK_FILE"
+            rm -f "$POISON_FILE"
+            return
+        fi
+        if [ "$FENCE_STRATEGY" = "wait" ]; then
+            log "POISON PILL detected but FENCE_STRATEGY=wait (2-node cluster, no qdevice)"
+            log "REFUSING to stop VMs — admin must add a qdevice to enable safe automatic fencing"
+            echo "{\\"timestamp\\":\\"$(date -Iseconds)\\",\\"node\\":\\"$NODE_NAME\\",\\"poison_refused\\":\\"wait_strategy\\"}" > "$POISON_ACK_FILE"
+            rm -f "$POISON_FILE"
+            return
+        fi
         log "POISON PILL DETECTED! Stopping all VMs..."
         for vmid in $(qm list 2>/dev/null | grep running | awk '{print $1}'); do
             log "Stopping VM $vmid"
@@ -5455,6 +5675,8 @@ WantedBy=multi-user.target
             
             # Prepare script with actual storage path
             agent_script = self._NODE_AGENT_SCRIPT.replace('__STORAGE_PATH__', storage_path)
+            # MK 2026-06-03 — same fence-strategy as the self-fence agent.
+            agent_script = agent_script.replace('__FENCE_STRATEGY__', self._ha_detect_fence_strategy())
             
             # Create the script file on the node
             # Use base64 to avoid escaping issues

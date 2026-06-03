@@ -1807,23 +1807,81 @@ def enable_ha(cluster_id):
 @bp.route('/api/clusters/<cluster_id>/ha/disable', methods=['POST'])
 @require_auth(perms=['ha.config'])
 def disable_ha(cluster_id):
+    # MK 2026-06-03 (Nico-reported HOCHGEFÄHRLICH bug): pre-fix this endpoint
+    # only flipped `ha_enabled = False` and stopped the server-side monitor —
+    # it never ran the SSH-side uninstaller for the agents that were deployed
+    # to every cluster node during `_ha_install_*_on_all_nodes`. Both shapes
+    # of agent (self-fence + node-agent/poison-pill) share `pegaprox-agent.
+    # service` + `/usr/local/bin/pegaprox-agent.sh`, so an orphaned systemd
+    # service kept running on the nodes silently. UI then claimed "HA off",
+    # admin rebooted a node thinking it was safe, the orphan agent on that
+    # node and/or its peers reached their ping-isolation threshold (15s),
+    # called `stop_all_vms` locally, and the cluster lost every running VM.
+    # `disable_ha` now actually tears down the systemd service + binary +
+    # storage-heartbeat dir on every reachable node before flipping the flag.
     ok, err = check_cluster_access(cluster_id)
     if not ok: return err
-    
+
     if cluster_id not in cluster_managers:
         return jsonify({'error': 'Cluster not found'}), 404
-    
+
     mgr = cluster_managers[cluster_id]
+
+    # Stop the server-side monitor first so it can't queue any
+    # recovery actions while we're tearing down the on-node agents.
     mgr.stop_ha_monitor()
+
+    # SSH-uninstall on every reachable node. The existing
+    # `_ha_uninstall_self_fence_on_all_nodes` removes both agent shapes
+    # because they share `pegaprox-agent.service` + the binary path.
+    uninstall_results = {}
+    try:
+        uninstall_results = mgr._ha_uninstall_self_fence_on_all_nodes() or {}
+    except Exception as e:
+        logging.error(f"[HA disable] agent teardown failed: {e}")
+
+    # Best-effort cleanup of the storage-heartbeat `.pegaprox` dir so
+    # stale `poison_<node>` / `heartbeat_<node>` files don't survive into
+    # the next HA-enable cycle and trip the node-agent on first install.
+    storage_cleanup = None
+    try:
+        if hasattr(mgr, '_ha_cleanup_storage_heartbeat'):
+            storage_cleanup = mgr._ha_cleanup_storage_heartbeat()
+    except Exception as e:
+        logging.warning(f"[HA disable] storage heartbeat cleanup: {e}")
+
+    # Flip the flag + clear in-memory ha_config bookkeeping last so the
+    # state we report back to the UI matches what's actually on disk.
     mgr.config.ha_enabled = False
+    if isinstance(mgr.ha_config.get('node_agent_installed'), dict):
+        mgr.ha_config['node_agent_installed'] = {}
     save_config()
-    
+
+    nodes_ok = sum(1 for v in uninstall_results.values() if v)
+    nodes_total = len(uninstall_results)
+    nodes_failed = sorted([n for n, ok in uninstall_results.items() if not ok])
+
     user = getattr(request, 'session', {}).get('user', 'system')
-    log_audit(user, 'ha.disabled', f"High Availability disabled for cluster {mgr.config.name}", cluster=mgr.config.name)
-    
+    audit_detail = (f"HA disabled for cluster {mgr.config.name} — "
+                    f"agents removed from {nodes_ok}/{nodes_total} nodes")
+    if nodes_failed:
+        audit_detail += f" (teardown FAILED on: {', '.join(nodes_failed)} — manual cleanup required)"
+    log_audit(user, 'ha.disabled', audit_detail, cluster=mgr.config.name)
+
     return jsonify({
-        'message': 'High Availability disabled',
-        'status': mgr.get_ha_status()
+        'message': 'HA disabled',
+        'agents_uninstalled': nodes_ok,
+        'agents_total': nodes_total,
+        'agents_failed': nodes_failed,
+        'storage_cleanup': storage_cleanup,
+        'status': mgr.get_ha_status(),
+        'warning': (
+            f"Could not tear down agents on {len(nodes_failed)} node(s): "
+            f"{', '.join(nodes_failed)}. SSH to those nodes manually and run "
+            f"`systemctl disable --now pegaprox-agent.service && "
+            f"rm -f /usr/local/bin/pegaprox-agent.sh "
+            f"/etc/systemd/system/pegaprox-agent.service && systemctl daemon-reload`"
+        ) if nodes_failed else None,
     })
 
 
