@@ -19,39 +19,25 @@ from flask import Blueprint, jsonify, request
 
 from pegaprox.globals import cluster_managers
 from pegaprox.utils.auth import require_auth
-from pegaprox.api.helpers import check_cluster_access, safe_error
+from pegaprox.api.helpers import check_cluster_access, safe_error, load_metrics_window
 from pegaprox.core.db import get_db
-from pegaprox.core.dbcrypto import run_heavy_read
 
 bp = Blueprint('insights', __name__)
 
 
 def _load_history(cluster_id, days=30):
     """Pull all snapshots for a cluster from metrics_history within the window.
-    Returns list of (ts_unix, cluster_data_dict) sorted oldest→newest."""
-    cutoff = (datetime.now() - timedelta(days=days)).isoformat()
+    Returns list of (ts_unix, cluster_data_dict) sorted oldest→newest.
+
+    NS 2026-06-04: fetch+parse happen off-hub + cached/single-flighted in
+    load_metrics_window (shared across clusters + cost/power); here we only do
+    the cheap per-cluster filter."""
     out = []
     try:
-        # NS 2026-06-04: off-hub read — a 30d scan freezes the gevent hub for
-        # seconds at fleet scale otherwise. See dbcrypto.run_heavy_read.
-        rows = run_heavy_read(
-            "SELECT timestamp, data FROM metrics_history "
-            "WHERE timestamp >= ? ORDER BY timestamp ASC",
-            (cutoff,))
-        for row in rows:
-            try:
-                d = json.loads(row['data'])
-                cd = (d.get('clusters') or {}).get(cluster_id)
-                if not cd: continue
-                ts = row['timestamp']
-                # ISO → unix
-                try:
-                    ts_unix = int(datetime.fromisoformat(ts).timestamp())
-                except Exception:
-                    continue
+        for ts_unix, clusters in load_metrics_window(days):
+            cd = clusters.get(cluster_id)
+            if cd:
                 out.append((ts_unix, cd))
-            except Exception:
-                continue
     except Exception as e:
         logging.warning(f"[insights] history load failed for {cluster_id}: {e}")
     return out

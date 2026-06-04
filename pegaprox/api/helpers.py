@@ -428,3 +428,60 @@ def parse_pve_error(response_text, fallback='Proxmox API error'):
     if '<html' in text.lower():
         return fallback
     return html.escape(text) if text else fallback
+
+
+# NS 2026-06-04 — shared metrics_history loader for insights/cost/power.
+# The expensive part of these three endpoints isn't the SQL fetch, it's
+# json.loads()'ing every snapshot blob (8.6k rows over 30d). Tier-1 moved the
+# fetch off the gevent hub; this moves the PARSE off too AND caches the parsed
+# result. The parse runs inside run_heavy_read's transform (worker thread), so
+# even the cold-cache caller doesn't block the hub, and concurrent callers for
+# the same window coalesce onto one fetch+parse (single-flight). Returns a list
+# of (ts_unix, clusters_dict) for ALL clusters; callers filter for their own id.
+def _history_stride(days):
+    # Snapshots land ~every 5 min. Parsing thousands of them is the GIL-bound
+    # ceiling (json.loads holds the GIL even in a worker thread), so for long
+    # windows we decimate to a coarser cadence. All three consumers are
+    # ratio/average/percentile based — sample COUNT doesn't change the result,
+    # only the resolution — so this is lossless for cost/power numbers and only
+    # smooths insights trends. Recent (<=2d) views keep full 5-min detail.
+    if days <= 2:
+        return 1     # 5-min, full resolution
+    if days <= 14:
+        return 3     # ~15-min
+    return 12        # ~hourly for month+ windows
+
+
+def load_metrics_window(days):
+    from datetime import timedelta
+    from pegaprox.core.dbcrypto import run_heavy_read
+    cutoff = (datetime.now() - timedelta(days=days)).isoformat()
+    stride = _history_stride(days)
+
+    def _parse(rows):
+        out = []
+        for row in rows:
+            try:
+                d = json.loads(row['data'])
+                ts_unix = int(datetime.fromisoformat(row['timestamp']).timestamp())
+                out.append((ts_unix, d.get('clusters') or {}))
+            except Exception:
+                continue
+        return out
+
+    # `id % stride = 0` picks ~every Nth snapshot. rowid lives in the timestamp
+    # index, so SQLite evaluates the modulo without a table lookup and only
+    # decrypts the `data` blob for rows it keeps — cuts BOTH decrypt and parse.
+    if stride > 1:
+        sql = ("SELECT timestamp, data FROM metrics_history "
+               "WHERE timestamp >= ? AND id % ? = 0 ORDER BY timestamp ASC")
+        sql_params = (cutoff, stride)
+    else:
+        sql = ("SELECT timestamp, data FROM metrics_history "
+               "WHERE timestamp >= ? ORDER BY timestamp ASC")
+        sql_params = (cutoff,)
+
+    # cache_key shared across every cluster + across insights/cost/power.
+    # NOTE: the returned dicts are the cached parsed structure — callers must
+    # treat them as read-only (the aggregation paths only read, never mutate).
+    return run_heavy_read(sql, sql_params, cache_key=f"mh_parsed:{days}", transform=_parse)

@@ -33,9 +33,8 @@ from flask import Blueprint, jsonify, request
 
 from pegaprox.globals import cluster_managers
 from pegaprox.utils.auth import require_auth
-from pegaprox.api.helpers import check_cluster_access
+from pegaprox.api.helpers import check_cluster_access, load_metrics_window
 from pegaprox.core.db import get_db
-from pegaprox.core.dbcrypto import run_heavy_read
 from pegaprox.models.permissions import ROLE_ADMIN
 
 bp = Blueprint('power', __name__)
@@ -92,20 +91,13 @@ def _current_user():
 
 
 def _load_history(cluster_id, days=30):
-    cutoff = (datetime.now() - timedelta(days=days)).isoformat()
+    # fetch+parse off-hub + cached in load_metrics_window (shared w/ insights/costs)
     out = []
     try:
-        # NS 2026-06-04: off-hub read (see dbcrypto.run_heavy_read).
-        rows = run_heavy_read("SELECT timestamp, data FROM metrics_history WHERE timestamp >= ? ORDER BY timestamp ASC", (cutoff,))
-        for row in rows:
-            try:
-                d = json.loads(row['data'])
-                cd = (d.get('clusters') or {}).get(cluster_id)
-                if not cd: continue
-                ts_unix = int(datetime.fromisoformat(row['timestamp']).timestamp())
+        for ts_unix, clusters in load_metrics_window(days):
+            cd = clusters.get(cluster_id)
+            if cd:
                 out.append((ts_unix, cd))
-            except Exception:
-                continue
     except Exception:
         pass
     return out
