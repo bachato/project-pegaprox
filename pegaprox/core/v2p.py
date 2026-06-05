@@ -389,7 +389,18 @@ def _run_v2p_migration(task):
 
         if not datastore:
             task.set_phase('failed', 'Could not determine ESXi datastore. Please specify it manually.'); return
-        
+
+        # NS 2026-06-05 (security audit C-2/M-2): datastore + vm_dir are now FINAL
+        # (whether user-supplied or auto-detected from VM config / ESXi output).
+        # From here on they get interpolated into root shell commands on the PVE
+        # node, so they must be safe single names — no '/', no shell metachars.
+        # Validate the chokepoint once; everything downstream is then safe.
+        from pegaprox.utils.sanitization import validate_esxi_path_component
+        if not validate_esxi_path_component(datastore):
+            task.set_phase('failed', f'Unsafe ESXi datastore name: {datastore!r}'); return
+        if vm_dir and not validate_esxi_path_component(vm_dir):
+            task.set_phase('failed', f'Unsafe ESXi VM directory name: {vm_dir!r}'); return
+
         # Verify VM files exist and find descriptor .vmdk files
         vm_path = f"/vmfs/volumes/{datastore}/{vm_dir}"
         rc, out, err = _ssh_exec(esxi_host, esxi_user, esxi_pass,
@@ -746,7 +757,7 @@ def _run_v2p_migration(task):
             f"mkdir -p {mnt_path} && "
             f"printf '%s' {safe_pass} | sshfs -o password_stdin,"
             f"{sshfs_ssh_opts},{sshfs_algo_opts} "
-            f"{esxi_user}@{esxi_host}:{ds_mount_path} {mnt_path}"
+            f"{esxi_user}@{esxi_host}:{shlex.quote(ds_mount_path)} {mnt_path}"
         )
         rc, out, err = _pve_node_exec(pve_mgr, task.target_node, mount_cmd, timeout=30)
         if rc != 0:
@@ -759,7 +770,7 @@ def _run_v2p_migration(task):
                 f"cache=yes,kernel_cache,"
                 f"max_read=1048576,big_writes,large_read,"
                 f"entry_timeout=3600,attr_timeout=3600 "
-                f"{esxi_user}@{esxi_host}:{ds_mount_path} {mnt_path}")
+                f"{esxi_user}@{esxi_host}:{shlex.quote(ds_mount_path)} {mnt_path}")
             rc, out, err = _pve_node_exec(pve_mgr, task.target_node, mount_cmd2, timeout=30)
         if rc != 0:
             # Fallback 2: minimal options (maximum compatibility)
@@ -769,7 +780,7 @@ def _run_v2p_migration(task):
                 f"StrictHostKeyChecking=no,UserKnownHostsFile=/dev/null,"
                 f"allow_other,reconnect,ServerAliveInterval=15,"
                 f"cache=yes "
-                f"{esxi_user}@{esxi_host}:{ds_mount_path} {mnt_path}")
+                f"{esxi_user}@{esxi_host}:{shlex.quote(ds_mount_path)} {mnt_path}")
             rc, out, err = _pve_node_exec(pve_mgr, task.target_node, mount_cmd3, timeout=30)
             if rc != 0:
                 task.set_phase('failed', f'SSHFS mount failed: {err}'); return
@@ -4010,7 +4021,7 @@ def _do_sshfs_boot_migration(pve_mgr, task, vmware_mgr, esxi_host, esxi_user, es
             f"StrictHostKeyChecking=no,UserKnownHostsFile=/dev/null,"
             f"allow_other,reconnect,ServerAliveInterval=15,"
             f"cache=yes,{sshfs_algo} "
-            f"{esxi_user}@{esxi_host}:{ds_remount} {mnt_path} 2>&1",
+            f"{esxi_user}@{esxi_host}:{shlex.quote(ds_remount)} {mnt_path} 2>&1",
             timeout=20)
         if rc_remount == 0:
             # Retry with NBD after remount

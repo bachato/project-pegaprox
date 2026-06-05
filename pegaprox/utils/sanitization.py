@@ -106,6 +106,27 @@ def validate_storage_name(storage) -> bool:
     return bool(re.match(pattern, storage))
 
 
+# NS 2026-06-05 (security audit C-2/M-2): ESXi datastore names and VM-directory
+# names flow UNQUOTED into root shell commands on the PVE node (sshfs mounts,
+# qemu-img, find). VMware allows letters/digits/space and a small punctuation
+# set in these; a single component never contains '/'. Anything with shell
+# metacharacters (; | & $ ` < > newlines quotes backslash) or a slash is an
+# injection attempt against the V2P shell pipeline — reject it hard, fail closed.
+_ESXI_NAME_RE = re.compile(r'^[A-Za-z0-9][A-Za-z0-9 ._()+\-]{0,127}$')
+
+def validate_esxi_path_component(value) -> bool:
+    """True if `value` is a safe single ESXi datastore / directory name.
+
+    NOT a full path — one path component only (no '/'). Used to gate the
+    user-supplied esxi_datastore / esxi_vm_dir before they reach the V2P
+    SSHFS + qemu-img shell calls. Empty is rejected; callers that allow
+    auto-detect must check for empty BEFORE calling this.
+    """
+    if not value or not isinstance(value, str):
+        return False
+    return bool(_ESXI_NAME_RE.match(value))
+
+
 def sanitize_csv_field(value) -> str:
     """Sanitize field for CSV export to prevent formula injection.
     

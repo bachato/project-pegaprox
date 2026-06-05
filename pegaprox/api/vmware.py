@@ -964,9 +964,18 @@ def start_vmware_migration(vmware_id, vm_id):
 
     # MK May 2026 (#481 port) — target_storage flows into `pvesm` calls on the
     # PVE node. Validate at the api boundary before the shell touches it.
-    from pegaprox.utils.sanitization import validate_storage_name
+    from pegaprox.utils.sanitization import validate_storage_name, validate_esxi_path_component
     if not validate_storage_name(data['target_storage']):
         return jsonify({'error': 'Invalid target_storage name. Must be alphanumeric with hyphens, underscores, or dots only.'}), 400
+
+    # NS 2026-06-05 (audit C-2/M-2): esxi_datastore / esxi_vm_dir are user-supplied
+    # and get interpolated into root shell commands on the PVE node. Empty = let
+    # the task auto-detect from the VM config; non-empty must be a safe single
+    # component name (no slashes, no shell metacharacters). Reject at the door.
+    for _f in ('esxi_datastore', 'esxi_vm_dir'):
+        _v = (data.get(_f) or '').strip()
+        if _v and not validate_esxi_path_component(_v):
+            return jsonify({'error': f'Invalid {_f}: only letters, digits, space and ._()+- are allowed (single name, no path).'}), 400
 
     if not data.get('esxi_password'):
         return jsonify({'error': 'esxi_password is required for SSHFS-based migration'}), 400
