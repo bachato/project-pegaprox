@@ -6582,6 +6582,37 @@ def get_hardware_options():
         })
 
 
+# NS 2026-06-05 (security audit H-1/H-2): the console WS proxies self-mint a PVE
+# ticket for whatever vmid is in the URL, so checking the `vm.console` permission
+# alone is a BOLA — a console-capable user could reach ANY VM on ANY cluster/
+# tenant. Every console entry point must also confirm THIS user is authorised for
+# THIS cluster AND VM. Works without request.session (the async/standalone
+# handlers don't have one) by taking the resolved user dict directly.
+def _console_authz(user, cluster_id, vmid, vm_type=None):
+    """Return (ok, reason) — user must have cluster access AND per-VM console access."""
+    from pegaprox.utils.rbac import get_user_clusters, load_vm_acls, user_can_access_vm
+    if not user:
+        return False, 'no user'
+    if user.get('role') == ROLE_ADMIN:
+        return True, None
+    username = user.get('username', '') or ''
+    # cluster gate (mirrors helpers.check_cluster_access, but no request.session)
+    allowed = get_user_clusters(user)
+    if allowed is not None and cluster_id not in allowed:
+        cluster_acls = load_vm_acls().get(cluster_id, {}) or {}
+        if not any(username in (a.get('users') or []) or '*' in (a.get('users') or [])
+                   for a in cluster_acls.values()):
+            return False, 'no cluster access'
+    # per-VM gate
+    try:
+        vmid_int = int(vmid)
+    except (TypeError, ValueError):
+        return False, 'bad vmid'
+    if not user_can_access_vm(user, cluster_id, vmid_int, 'vm.console', vm_type):
+        return False, 'no VM access'
+    return True, None
+
+
 # WebSocket proxy for VNC - using geventwebsocket
 def handle_vnc_websocket(ws, cluster_id, node, vm_type, vmid):
     """Handle VNC WebSocket connection"""
@@ -6789,6 +6820,12 @@ def vnc_websocket_route(cluster_id, node, vm_type, vmid):
     if 'vm.console' not in user_perms and auth_role != ROLE_ADMIN:
         return jsonify({'error': 'Permission denied', 'code': 'INSUFFICIENT_PERMISSIONS'}), 403
 
+    # H-1/H-2: cluster + per-VM gate (vm.console alone isn't enough)
+    user['username'] = auth_user
+    _ok, _why = _console_authz(user, cluster_id, vmid, vm_type)
+    if not _ok:
+        return jsonify({'error': 'Permission denied', 'code': 'INSUFFICIENT_PERMISSIONS'}), 403
+
     # This route is just a fallback - actual WebSocket handling is done by the
     # dedicated WebSocket server started in start_vnc_websocket_server()
     from flask import request
@@ -6900,6 +6937,7 @@ def start_vnc_websocket_server(port=5001, ssl_cert=None, ssl_key=None, host='0.0
                 print(f"ERROR: User {token_data['user']} lacks vm.console permission")
                 await websocket.close(1002, "Permission denied")
                 return
+            user['username'] = token_data['user']
             print(f"User {token_data['user']} authenticated for VNC (ws_token)")
         elif session_id:
             session = validate_session(session_id)
@@ -6914,6 +6952,7 @@ def start_vnc_websocket_server(port=5001, ssl_cert=None, ssl_key=None, host='0.0
                 print(f"ERROR: User {session['user']} lacks vm.console permission")
                 await websocket.close(1002, "Permission denied")
                 return
+            user['username'] = session['user']
             print(f"User {session['user']} authenticated for VNC (session)")
         else:
             print("ERROR: No token or session provided")
@@ -6930,9 +6969,16 @@ def start_vnc_websocket_server(port=5001, ssl_cert=None, ssl_key=None, host='0.0
         
         cluster_id, node, vm_type, vmid = match.groups()
         vmid = int(vmid)
-        
+
         print(f"Cluster: {cluster_id}, Node: {node}, Type: {vm_type}, VMID: {vmid}")
-        
+
+        # H-1/H-2: cluster + per-VM gate before we self-mint a PVE ticket for this vmid
+        _ok, _why = _console_authz(user, cluster_id, vmid, vm_type)
+        if not _ok:
+            print(f"ERROR: console authz denied ({_why}) for {cluster_id}/{vmid}")
+            await websocket.close(1002, "Permission denied")
+            return
+
         if cluster_id not in cluster_managers:
             print(f"ERROR: Cluster {cluster_id} not found")
             await websocket.close(1002, "Cluster not found")
@@ -7484,6 +7530,14 @@ def vnc_websocket_proxy(ws, cluster_id, node, vm_type, vmid):
 
     print(f"User {auth_user} authenticated for VNC")
 
+    # H-1/H-2: cluster + per-VM gate before this proxy self-mints a PVE ticket
+    user['username'] = auth_user
+    _ok, _why = _console_authz(user, cluster_id, vmid, vm_type)
+    if not _ok:
+        try: ws.send('Permission denied')
+        except: pass
+        return
+
     # MK 2026-06-04 (PR #523 / Aikido SSRF triage): `node` flows raw into the
     # PVE vncproxy URL path below. The route's string converter blocks '/'
     # but not '..', so a crafted node could path-manipulate the request on the
@@ -7691,6 +7745,16 @@ def get_termproxy_ticket_api(cluster_id, node, vm_type, vmid):
         return jsonify({'error': 'Cluster not found'}), 404
     if vm_type not in ('qemu', 'lxc'):
         return jsonify({'error': 'Unsupported vm_type'}), 400
+
+    # H-1/H-2: per-VM gate (cluster access alone isn't enough for a console)
+    from flask import g as _g
+    _u = getattr(_g, 'current_user', None)
+    if _u is None:
+        _u = get_db().get_user(request.session.get('user', '')) or {}
+    _u = dict(_u); _u['username'] = request.session.get('user', '')
+    _ok2, _why2 = _console_authz(_u, cluster_id, vmid, vm_type)
+    if not _ok2:
+        return jsonify({'error': 'Permission denied: no access to this VM'}), 403
 
     mgr = cluster_managers[cluster_id]
     pve_pwd = getattr(mgr.config, 'pass_', None) or getattr(mgr.config, 'password', None)
