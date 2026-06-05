@@ -55,6 +55,31 @@ if USE_GEVENT:
         from gevent import monkey
         monkey.patch_all()
         print("Gevent monkey-patching applied")
+        # NS 2026-06-05 — scale runtime limits for large fleets (30+ clusters /
+        # 100+ nodes). The node-status fan-out pools + keep-alive sessions need
+        # fd headroom, and gevent's default 10-thread pool (used by the DNS
+        # resolver AND off-hub DB reads) contends under that load — see #528.
+        # All env-overridable.
+        try:
+            import resource as _res
+            _soft, _hard = _res.getrlimit(_res.RLIMIT_NOFILE)
+            _cap = 65536 if _hard == _res.RLIM_INFINITY else _hard
+            _want = int(os.environ.get('PEGAPROX_NOFILE', _cap))
+            _newsoft = _want if _hard == _res.RLIM_INFINITY else min(_want, _hard)
+            _res.setrlimit(_res.RLIMIT_NOFILE, (_newsoft, _hard))
+            _eff = _res.getrlimit(_res.RLIMIT_NOFILE)[0]
+            print(f"File-descriptor limit: {_eff}")
+            if _eff < 8192:
+                print(f"WARNING: low fd limit ({_eff}) — for 20+ clusters set LimitNOFILE=65536 in the systemd unit")
+        except Exception as _e:
+            print(f"Could not raise fd limit: {_e}")
+        try:
+            from gevent import get_hub as _ghub
+            _tp = int(os.environ.get('PEGAPROX_THREADPOOL_SIZE', '50'))
+            _ghub().threadpool.maxsize = _tp
+            print(f"Gevent threadpool size: {_tp}")
+        except Exception as _e:
+            print(f"Could not set gevent threadpool size: {_e}")
     except ImportError:
         pass
 

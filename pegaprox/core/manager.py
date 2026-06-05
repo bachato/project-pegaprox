@@ -65,8 +65,12 @@ GEVENT_AVAILABLE = False
 GEVENT_POOL = None
 try:
     from gevent.pool import Pool as GeventPool
-    # NS: pool size 50 because 100 caused fd exhaustion on the Hetzner box (ulimit was 1024)
-    GEVENT_POOL = GeventPool(size=50)
+    # NS: was 50 (100 caused fd exhaustion on the old Hetzner box at ulimit 1024).
+    # 2026-06-05: env-tunable, default back to 100 — keep-alive sessions (#528)
+    # reuse connections so the per-node fan-out no longer burns one fd per call,
+    # and the entry point now raises RLIMIT_NOFILE. Shared across all managers,
+    # so this caps total concurrent node-fetches process-wide.
+    GEVENT_POOL = GeventPool(size=int(os.environ.get('PEGAPROX_NODE_POOL_SIZE', '100')))
     GEVENT_AVAILABLE = True
 except ImportError:
     pass
@@ -460,7 +464,12 @@ class PegaProxManager:
         # a throwaway connection instead of blocking on the pool lock (the old
         # deadlock path). The hot broadcast path hits one host per cluster, so a
         # small pool stays fully reused.
-        _pool_kw = dict(pool_connections=4, pool_maxsize=16, pool_block=False, max_retries=0)
+        # NS 2026-06-05: pool_maxsize matches the node-fan-out concurrency
+        # (PEGAPROX_NODE_POOL_SIZE). get_node_status can fire dozens of per-node
+        # calls at once on this one session; with only 16 keep-alive slots the
+        # excess churned throwaway connections (pool_block=False), re-incurring
+        # the handshake cost the cache is meant to remove.
+        _pool_kw = dict(pool_connections=8, pool_maxsize=64, pool_block=False, max_retries=0)
         # NS: use system CA store when verifying - certifi bundle doesn't include custom CAs (#246)
         if self._ssl_verify:
             _ca = ssl.get_default_verify_paths()

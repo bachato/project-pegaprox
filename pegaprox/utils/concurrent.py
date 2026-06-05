@@ -3,6 +3,7 @@
 PegaProx Concurrency Helpers - Layer 2
 """
 
+import os
 import logging
 from typing import Dict
 
@@ -10,9 +11,13 @@ GEVENT_AVAILABLE = False
 GEVENT_PATCHED = False
 GEVENT_POOL = None
 
+# NS 2026-06-05 — env-tunable (was hard 50). Default raised to 100 now that
+# managers reuse keep-alive sessions (#528): the fd pressure that forced 100→50
+# on the old fresh-session-per-call model is gone since connections are pooled.
+_NODE_POOL_SIZE = int(os.environ.get('PEGAPROX_NODE_POOL_SIZE', '100'))
 try:
     from gevent.pool import Pool as GeventPool
-    GEVENT_POOL = GeventPool(size=50)
+    GEVENT_POOL = GeventPool(size=_NODE_POOL_SIZE)
     GEVENT_AVAILABLE = True
     # Check if gevent has actually monkey-patched the socket module
     import gevent.monkey

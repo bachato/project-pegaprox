@@ -1018,8 +1018,14 @@ def main(debug_mode=False):
     #       per request handler are fine; the I/O-bound workload benefits
     #       from a generous pool when /health + /vms-backup-status + a
     #       dashboard refresh all fire at the same time.
+    # NS 2026-06-05 — raised floor + multiplier: EACH live SSE/WebSocket stream
+    # holds a pool slot for its whole lifetime, so max(8, cpu*4) (=16 on a 4c
+    # box) could be consumed by ~16 open dashboard tabs and starve all other API
+    # traffic (root of #526's "health spammed, absurdly large time"). Greenlets
+    # are cheap so a big pool is fine. Still PEGAPROX_WORKERS-overridable.
+    #           1c VM: 32    4c: 64    8c: 128    32c: 512
     cpu_count = multiprocessing.cpu_count()
-    workers = int(os.environ.get('PEGAPROX_WORKERS', max(8, cpu_count * 4)))
+    workers = int(os.environ.get('PEGAPROX_WORKERS', max(32, cpu_count * 16)))
 
     print(f"System: {cpu_count} CPU cores detected")
     print(f"Memory optimization: Garbage collection tuned for {workers} workers")
