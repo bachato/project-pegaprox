@@ -10436,8 +10436,44 @@ echo "AGENT_INSTALLED_OK"
         except Exception as e:
             return {'success': False, 'error': str(e)}
 
+    def mint_console_auth_ticket(self):
+        """Mint a FRESH PVE session ticket (PVEAuthCookie) for the console WS proxy.
+
+        NS 2026-06-05 (security audit C-1): the cluster-wide PVE ticket must NOT
+        transit the browser — it's effectively root on pve:8006. The standalone
+        WS subprocess fetches it server-side (via the internal cluster-creds /
+        ws-token-validate path) right before connecting to PVE's vncwebsocket.
+        Returns the ticket string, or None when the cluster has no stored
+        password (API-token clusters can't mint session tickets anyway, and
+        termproxy needs a real session cookie). Kept off self._ticket on purpose
+        so we always hand out a freshly-minted, non-stale cookie.
+        """
+        pwd = getattr(self.config, 'pass_', None) or getattr(self.config, 'password', None)
+        usr = getattr(self.config, 'user', None) or 'root@pam'
+        if not pwd:
+            return None
+        try:
+            import ssl as _ssl
+            import urllib.request as _ur
+            from urllib.parse import urlencode as _ue
+            ctx = _ssl.create_default_context()
+            ctx.check_hostname = False
+            ctx.verify_mode = _ssl.CERT_NONE
+            req = _ur.Request(
+                f"https://{self.host}:{self.api_port}/api2/json/access/ticket",
+                data=_ue({'username': usr, 'password': pwd}).encode('utf-8'),
+                method='POST',
+            )
+            with _ur.urlopen(req, context=ctx, timeout=10) as resp:
+                import json as _json
+                res = _json.loads(resp.read().decode('utf-8'))
+            return res['data']['ticket']
+        except Exception as e:
+            self.logger.warning(f"[CONSOLE] auth-ticket mint failed: {type(e).__name__}")
+            return None
+
     def get_vnc_ticket(self, node: str, vmid: int, vm_type: str) -> Dict[str, Any]:
-        
+
         if not self.is_connected:
             if not self.connect_to_proxmox():
                 return {'success': False, 'error': 'Could not connect to Proxmox'}
@@ -10464,6 +10500,9 @@ echo "AGENT_INSTALLED_OK"
                 port = data.get('port')
                 self.logger.info(f"[VNC] Got ticket for {vm_type}/{vmid}, port={port}")
                 
+                # NS 2026-06-05 (C-1): do NOT leak the cluster PVEAuthCookie to the
+                # browser. The in-process VNC proxy uses self._ticket server-side;
+                # this field was returned but never consumed client-side.
                 return {
                     'success': True,
                     'ticket': ticket,
@@ -10472,7 +10511,6 @@ echo "AGENT_INSTALLED_OK"
                     'node': node,
                     'vmid': vmid,
                     'vm_type': vm_type,
-                    'pve_auth_cookie': self._ticket
                 }
             else:
                 error_msg = response.text
@@ -10519,7 +10557,7 @@ echo "AGENT_INSTALLED_OK"
                     'node': node,
                     'vmid': vmid,
                     'vm_type': vm_type,
-                    'pve_auth_cookie': self._ticket
+                    # C-1: PVEAuthCookie stays server-side, fetched by the WS proxy
                 }
             else:
                 return {'success': False, 'error': f"Proxmox error: {response.text}"}

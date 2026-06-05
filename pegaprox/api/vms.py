@@ -7744,15 +7744,18 @@ def get_termproxy_ticket_api(cluster_id, node, vm_type, vmid):
               f'Terminal opened: {vm_type}/{vmid} on {node}',
               cluster=getattr(mgr.config, 'name', cluster_id))
 
+    # NS 2026-06-05 (security audit C-1): the PVE session ticket (auth_ticket =
+    # PVEAuthCookie = effectively root on pve:8006) is NO LONGER returned to the
+    # browser. The standalone WS subprocess fetches it server-side via the
+    # cluster-creds / ws-token-validate internal path right before the PVE WS
+    # connect. Only the per-console termproxy ticket (scoped to this vmid:port)
+    # leaves to the client.
     return jsonify({
         'success': True,
         'host': host,
         'port': term_port,
         'ticket': term_ticket,
         'user': term_user,
-        # auth_ticket is sent to the WS server, NOT held by the browser long-term.
-        # Used to set PVEAuthCookie: header on the PVE WS connect.
-        'auth_ticket': auth_ticket,
         'node': node,
         'vmid': vmid,
         'vm_type': vm_type,
@@ -8162,15 +8165,18 @@ async def termproxy_handler(client_ws, query, m_term, ws_token, session_id):
         await client_ws.close(1011, "auth")
         return
 
-    # Frontend gave us the termproxy ticket+port already (via POST /termproxy)
-    # plus the PVE session auth_ticket (used as PVEAuthCookie header).
+    # Frontend gave us the termproxy ticket+port already (via POST /termproxy).
+    # NS 2026-06-05 (security audit C-1): the PVE session cookie (auth_ticket =
+    # PVEAuthCookie, effectively root on pve:8006) is NO LONGER taken from the
+    # browser query — we resolve it server-side below from the validate /
+    # cluster-creds cluster_context.
     pve_ticket = query.get('ticket', [None])[0]
     pve_port = query.get('port', [None])[0]
     pve_host = query.get('host', [None])[0]
     pve_user = query.get('user', [None])[0]
-    pve_auth = query.get('auth_ticket', [None])[0]
-    if not (pve_ticket and pve_port and pve_host and pve_user and pve_auth):
-        print(f"[TERMPROXY] missing query params; got: ticket={bool(pve_ticket)} port={pve_port} host={pve_host} user={pve_user} auth={bool(pve_auth)}")
+    pve_auth = None  # resolved server-side from cluster_context, see below
+    if not (pve_ticket and pve_port and pve_host and pve_user):
+        print(f"[TERMPROXY] missing query params; got: ticket={bool(pve_ticket)} port={pve_port} host={pve_host} user={pve_user}")
         await client_ws.send('{"status":"error","message":"Missing termproxy params"}')
         await client_ws.close(1008, "params")
         return
@@ -8178,7 +8184,6 @@ async def termproxy_handler(client_ws, query, m_term, ws_token, session_id):
     pve_ticket = unquote(pve_ticket)
     pve_user = unquote(pve_user)
     pve_host = unquote(pve_host)
-    pve_auth = unquote(pve_auth)
 
     # MK May 2026 (CodeAnt CWE-918) - SSRF gate. Use the cluster_context already
     # returned by the validate call; fall back to cluster-creds only on the legacy
@@ -8188,6 +8193,9 @@ async def termproxy_handler(client_ws, query, m_term, ws_token, session_id):
     if ctx.get('host'):
         allowed_hosts.add(ctx['host'])
     allowed_hosts.update(v for v in (ctx.get('node_ips') or {}).values() if v)
+    # C-1: server-side PVE session cookie (ws-token flow)
+    if ctx.get('pve_auth_ticket'):
+        pve_auth = ctx['pve_auth_ticket']
     # MK 2026-06-04: pull per-cluster ssl_verify out of the same context for
     # the PVE wss-proxy below. Defaults to False because PVE ships self-signed
     # certs and most labs run them. Admins toggle on once they've installed
@@ -8205,6 +8213,9 @@ async def termproxy_handler(client_ws, query, m_term, ws_token, session_id):
                 # Honour the cluster-side ssl_verify flag from the creds payload.
                 if 'verify_pve_tls' in cr_data:
                     verify_pve_tls = bool(cr_data['verify_pve_tls'])
+                # C-1: server-side PVE session cookie (session-cookie flow)
+                if cr_data.get('pve_auth_ticket'):
+                    pve_auth = cr_data['pve_auth_ticket']
             else:
                 print(f"[TERMPROXY] cluster-creds non-200 ({cr.status_code}); allow-list empty")
         except Exception as e:
@@ -8217,6 +8228,15 @@ async def termproxy_handler(client_ws, query, m_term, ws_token, session_id):
             'message': f"Host {pve_host!r} is not a known node of cluster {cluster_id}."
         }))
         await client_ws.close(1008, "host not allowed")
+        return
+
+    # C-1: the PVE session cookie must have come from the server-side
+    # cluster_context (not the browser). If it's missing the cluster has no
+    # password auth (termproxy can't work) or the mint failed — fail closed.
+    if not pve_auth:
+        print(f"[TERMPROXY] no server-side PVE auth ticket for cluster {cluster_id}")
+        await client_ws.send('{"status":"error","message":"Console auth unavailable for this cluster (needs user/password auth)"}')
+        await client_ws.close(1011, "no-pve-auth")
         return
 
     # Connect to PVE WS — Cookie uses session auth ticket; URL uses termproxy ticket.

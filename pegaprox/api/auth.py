@@ -1274,12 +1274,22 @@ def get_cluster_creds_internal(cluster_id):
     # once they've installed a real cert + uploaded the CA).
     ssh_port = getattr(getattr(mgr, 'config', None), 'ssh_port', 22) or 22
     verify_pve_tls = bool(getattr(mgr, 'ssl_verify', False))
-    return jsonify({
+    # NS 2026-06-05 (C-1): the termproxy WS proxy gets the PVE session cookie
+    # from here (server-side) instead of the browser. Mint fresh; None for
+    # token-only clusters. Other consumers (SSH) ignore the field.
+    resp = {
         'host': cluster_host,
         'node_ips': node_ips,
         'ssh_port': ssh_port,
         'verify_pve_tls': verify_pve_tls,
-    })
+    }
+    try:
+        _tk = mgr.mint_console_auth_ticket()
+        if _tk:
+            resp['pve_auth_ticket'] = _tk
+    except Exception:
+        pass
+    return jsonify(resp)
 
 
 @bp.route('/api/auth/verify-password', methods=['POST'])

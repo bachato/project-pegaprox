@@ -92,6 +92,9 @@ async def ssh_handler(websocket):
 
         headers = {'X-Session-ID': session_id} if session_id else {}
         cookies = {'session': session_id} if session_id else {}
+        # nosec B501 — localhost-to-PegaProx (PEGAPROX_URL = 127.0.0.1:port) with our
+        # own self-signed cert. Same-host trust boundary; attacker with local
+        # cert-read access already has more direct attack paths. MK 2026-06-04.
         r = requests.get(validate_url, cookies=cookies, headers=headers, timeout=8, verify=False)
 
         if r.status_code == 403:
@@ -121,6 +124,7 @@ async def ssh_handler(websocket):
         if not ws_token and session_id:
             try:
                 print(f"Fetching cluster creds from: {PEGAPROX_URL}/api/internal/cluster-creds/{cluster_id}")
+                # nosec B501 — same-host PegaProx self-signed cert, see MK 2026-06-04 audit
                 rc = requests.get(f"{PEGAPROX_URL}/api/internal/cluster-creds/{cluster_id}",
                                   cookies={'session': session_id}, timeout=10, verify=False)
                 if rc.status_code == 200:
@@ -363,6 +367,9 @@ async def termproxy_handler(client_ws, query, m_term, ws_token, session_id):
             validate_url = f"{PEGAPROX_URL}/api/auth/validate"
         headers = {'X-Session-ID': session_id} if session_id else {}
         cookies = {'session': session_id} if session_id else {}
+        # nosec B501 — localhost-to-PegaProx (PEGAPROX_URL = 127.0.0.1:port) with our
+        # own self-signed cert. Same-host trust boundary; attacker with local
+        # cert-read access already has more direct attack paths. MK 2026-06-04.
         r = requests.get(validate_url, cookies=cookies, headers=headers, timeout=8, verify=False)
         if r.status_code == 403:
             await client_ws.send(json.dumps({'status': 'error', 'message': f'No access to cluster {cluster_id}'}))
@@ -382,15 +389,18 @@ async def termproxy_handler(client_ws, query, m_term, ws_token, session_id):
         await client_ws.close(1011, "auth")
         return
 
-    # Frontend gave us the termproxy ticket+port already (via POST /termproxy)
-    # plus the PVE session auth_ticket (used as PVEAuthCookie header).
+    # Frontend gave us the termproxy ticket+port already (via POST /termproxy).
+    # NS 2026-06-05 (security audit C-1): the PVE session cookie (auth_ticket =
+    # PVEAuthCookie, effectively root on pve:8006) is NO LONGER taken from the
+    # browser query — we resolve it server-side below from the validate /
+    # cluster-creds cluster_context.
     pve_ticket = query.get('ticket', [None])[0]
     pve_port = query.get('port', [None])[0]
     pve_host = query.get('host', [None])[0]
     pve_user = query.get('user', [None])[0]
-    pve_auth = query.get('auth_ticket', [None])[0]
-    if not (pve_ticket and pve_port and pve_host and pve_user and pve_auth):
-        print(f"[TERMPROXY] missing query params; got: ticket={bool(pve_ticket)} port={pve_port} host={pve_host} user={pve_user} auth={bool(pve_auth)}")
+    pve_auth = None  # resolved server-side from cluster_context, see below
+    if not (pve_ticket and pve_port and pve_host and pve_user):
+        print(f"[TERMPROXY] missing query params; got: ticket={bool(pve_ticket)} port={pve_port} host={pve_host} user={pve_user}")
         await client_ws.send('{"status":"error","message":"Missing termproxy params"}')
         await client_ws.close(1008, "params")
         return
@@ -398,7 +408,6 @@ async def termproxy_handler(client_ws, query, m_term, ws_token, session_id):
     pve_ticket = unquote(pve_ticket)
     pve_user = unquote(pve_user)
     pve_host = unquote(pve_host)
-    pve_auth = unquote(pve_auth)
 
     # MK May 2026 (CodeAnt CWE-918) - SSRF gate. Use the cluster_context already
     # returned by the validate call; fall back to cluster-creds only on the legacy
@@ -408,15 +417,29 @@ async def termproxy_handler(client_ws, query, m_term, ws_token, session_id):
     if ctx.get('host'):
         allowed_hosts.add(ctx['host'])
     allowed_hosts.update(v for v in (ctx.get('node_ips') or {}).values() if v)
+    # C-1: server-side PVE session cookie (ws-token flow)
+    if ctx.get('pve_auth_ticket'):
+        pve_auth = ctx['pve_auth_ticket']
+    # MK 2026-06-04: pull per-cluster ssl_verify out of the same context for
+    # the PVE wss-proxy below. Defaults to False because PVE ships self-signed
+    # certs and most labs run them. Admins toggle on once they've installed
+    # a real cert + the cluster's `ssl_verify` config field is true.
+    verify_pve_tls = bool(ctx.get('verify_pve_tls', False))
     if not allowed_hosts and session_id:
         try:
             cr = requests.get(f"{PEGAPROX_URL}/api/internal/cluster-creds/{cluster_id}",
-                              cookies={'session': session_id}, timeout=10, verify=False)
+                              cookies={'session': session_id}, timeout=10, verify=False)  # nosec B501 — localhost-to-PegaProx self-signed cert; same-host trust boundary, see MK 2026-06-04 audit
             if cr.status_code == 200:
                 cr_data = cr.json() or {}
                 if cr_data.get('host'):
                     allowed_hosts.add(cr_data['host'])
                 allowed_hosts.update(v for v in (cr_data.get('node_ips') or {}).values() if v)
+                # Honour the cluster-side ssl_verify flag from the creds payload.
+                if 'verify_pve_tls' in cr_data:
+                    verify_pve_tls = bool(cr_data['verify_pve_tls'])
+                # C-1: server-side PVE session cookie (session-cookie flow)
+                if cr_data.get('pve_auth_ticket'):
+                    pve_auth = cr_data['pve_auth_ticket']
             else:
                 print(f"[TERMPROXY] cluster-creds non-200 ({cr.status_code}); allow-list empty")
         except Exception as e:
@@ -431,13 +454,30 @@ async def termproxy_handler(client_ws, query, m_term, ws_token, session_id):
         await client_ws.close(1008, "host not allowed")
         return
 
+    # C-1: the PVE session cookie must have come from the server-side
+    # cluster_context (not the browser). If it's missing the cluster has no
+    # password auth (termproxy can't work) or the mint failed — fail closed.
+    if not pve_auth:
+        print(f"[TERMPROXY] no server-side PVE auth ticket for cluster {cluster_id}")
+        await client_ws.send('{"status":"error","message":"Console auth unavailable for this cluster (needs user/password auth)"}')
+        await client_ws.close(1011, "no-pve-auth")
+        return
+
     # Connect to PVE WS — Cookie uses session auth ticket; URL uses termproxy ticket.
     pve_path = f"/api2/json/nodes/{node}/{vm_type}/{vmid_str}/vncwebsocket?port={pve_port}&vncticket={quote_plus(pve_ticket)}"
     pve_url = f"wss://{pve_host}:8006{pve_path}"
     print(f"[TERMPROXY] connecting to PVE: {pve_url}")
+    # MK 2026-06-04: TLS verify is gated by the per-cluster ssl_verify flag
+    # (exposed via /api/internal/cluster-creds as `verify_pve_tls`). Default
+    # is False because PVE ships self-signed certs by default; admins flip
+    # it on once they have a real cert + uploaded the CA. Hard-disabling
+    # check_hostname + verify_mode used to be unconditional — now it's the
+    # opt-out path with a logged warning so cert posture is observable.
     pve_ssl = ssl.create_default_context()
-    pve_ssl.check_hostname = False
-    pve_ssl.verify_mode = ssl.CERT_NONE
+    if not verify_pve_tls:
+        pve_ssl.check_hostname = False
+        pve_ssl.verify_mode = ssl.CERT_NONE
+        print(f"[TERMPROXY] TLS verify DISABLED for PVE host {pve_host!r} (cluster ssl_verify=false)")
     try:
         pve_ws = await websockets.connect(
             pve_url,

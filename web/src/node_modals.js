@@ -721,13 +721,16 @@
                         const wsProto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
                         const mainPort = parseInt(window.location.port) || (window.location.protocol === 'https:' ? 443 : 80);
                         const sshPort = (window.__pegaproxReverseProxy === true) ? mainPort : (mainPort + 2);
+                        // NS 2026-06-05 (C-1): auth_ticket (cluster PVEAuthCookie) is
+                        // no longer passed through the browser — the WS server fetches
+                        // it server-side from the cluster context. Only the scoped
+                        // termproxy ticket travels here.
                         const params = new URLSearchParams({
                             token: wsToken,
                             ticket: termInfo.ticket,
                             port: String(termInfo.port),
                             host: termInfo.host,
                             user: termInfo.user || '',
-                            auth_ticket: termInfo.auth_ticket || '',
                         }).toString();
                         const wsUrl = `${wsProto}//${window.location.hostname}:${sshPort}/api/clusters/${clusterId}/vms/${vm.node}/${vm.type}/${vm.vmid}/termwebsocket?${params}`;
 

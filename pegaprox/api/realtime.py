@@ -209,6 +209,16 @@ def validate_ws_token_api():
                         'node_ips': node_ips,
                         'ssh_port': getattr(cfg, 'ssh_port', 22) or 22,
                     }
+                    # NS 2026-06-05 (C-1): hand the PVE session cookie to the WS
+                    # subprocess server-side (it used to come from the browser).
+                    # Mint fresh; None for token-only clusters. termproxy is the
+                    # only consumer — VNC/SSH ignore it.
+                    try:
+                        _tk = mgr.mint_console_auth_ticket()
+                        if _tk:
+                            cluster_context['pve_auth_ticket'] = _tk
+                    except Exception:
+                        pass
             except Exception as e:
                 logging.debug(f"[WS-TOKEN] cluster-context build soft-fail: {e}")
         except Exception as e:
