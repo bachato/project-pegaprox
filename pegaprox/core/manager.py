@@ -422,23 +422,53 @@ class PegaProxManager:
     
     def _create_session(self):
         """
-        Create a new requests session with auth - thread safe
-        
-        MK: Each request gets a fresh session to avoid threading issues
-        Tried session pooling but gevent + requests was causing deadlocks
-        
+        Return a per-manager keep-alive requests session (cached).
+
         NS: Added API token support Jan 2026 (GitHub Issue #5)
-        Token auth uses Authorization header, password auth uses cookies
+        Token auth uses Authorization header, password auth uses cookies.
+
+        NS 2026-06-05 (#528 akagoldsmith): this used to build a FRESH
+        requests.Session() on every call — MK's note said pooling caused
+        gevent+requests deadlocks. But a fresh session per call means a fresh
+        getaddrinfo + TCP + TLS handshake on EVERY API call. At 10-cluster /
+        35-node scale the broadcast loop did that ~every second per cluster and
+        saturated gevent's threaded DNS resolver pool — the hub then wedged in
+        the resolver's put() and the :5000 accept queue overflowed (py-spy
+        confirmed: hub stuck in getaddrinfo, ss showed Recv-Q over backlog).
+        Fix: cache ONE pooled session per manager and reuse it. The old deadlock
+        is avoided by pool_block=False (never wait on the pool lock — that was
+        the blocking path), one session per manager (not shared globally), and
+        the 15s default timeout below, so a hung node holds only its own
+        connection. Rebuilt only when auth material changes (ticket rotation).
         """
+        auth_key = (
+            getattr(self, '_api_token', None),
+            getattr(self, '_ticket', None),
+            getattr(self, '_csrf_token', None),
+            bool(self._ssl_verify),
+        )
+        cached = getattr(self, '_session_cache', None)
+        if cached is not None and getattr(self, '_session_auth_key', None) == auth_key:
+            return cached
+        # auth changed (or first build) — drop the old session's connections
+        if cached is not None:
+            try: cached.close()
+            except Exception: pass
+
         session = requests.Session()
+        # Keep-alive pool. pool_block=False => an excess concurrent request opens
+        # a throwaway connection instead of blocking on the pool lock (the old
+        # deadlock path). The hot broadcast path hits one host per cluster, so a
+        # small pool stays fully reused.
+        _pool_kw = dict(pool_connections=4, pool_maxsize=16, pool_block=False, max_retries=0)
         # NS: use system CA store when verifying - certifi bundle doesn't include custom CAs (#246)
         if self._ssl_verify:
             _ca = ssl.get_default_verify_paths()
             session.verify = _ca.cafile or _ca.openssl_cafile or True
+            session.mount('https://', HTTPAdapter(**_pool_kw))
         else:
             session.verify = False
-        if not self._ssl_verify:
-            session.mount('https://', _NoHostnameCheckAdapter())  # MK: fix for IP-based hosts
+            session.mount('https://', _NoHostnameCheckAdapter(**_pool_kw))  # MK: fix for IP-based hosts
 
         if getattr(self, '_api_token', None):
             # API Token auth - use Authorization header
@@ -466,6 +496,9 @@ class PegaProxManager:
                 kwargs['timeout'] = 15  # 15 s is plenty for any PVE API call
             return _original_request(method, url, **kwargs)
         session.request = _request_with_default_timeout
+
+        self._session_cache = session
+        self._session_auth_key = auth_key
         return session
     
     @staticmethod
