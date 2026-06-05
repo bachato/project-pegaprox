@@ -18,24 +18,31 @@ from pegaprox.globals import cluster_managers
 from pegaprox.core.db import get_db
 
 def load_metrics_history():
-    """Load historical metrics from SQLite database
-    
-    SQLite migration
+    """Load historical metrics from SQLite database.
+
+    NS 2026-06-05 (#528 scaling): this SELECTed up to 1000 snapshot rows and
+    json.loads'd each — multi-MB blobs at fleet scale — ON THE HUB, a multi-second
+    freeze per report (reports.py calls this up to 3× per report). Now the fetch
+    + parse run off-hub via run_heavy_read, with a short TTL cache so the repeated
+    calls within a report (and back-to-back reports) coalesce onto one query.
     """
     try:
-        db = get_db()
-        cursor = db.conn.cursor()
-        cursor.execute('SELECT * FROM metrics_history ORDER BY timestamp DESC LIMIT 1000')
-        
-        snapshots = []
-        for row in cursor.fetchall():
-            try:
-                data = json.loads(row['data'])
-                data['timestamp'] = row['timestamp']
-                snapshots.append(data)
-            except:
-                pass
-        
+        from pegaprox.core.dbcrypto import run_heavy_read
+
+        def _parse(rows):
+            out = []
+            for row in rows:
+                try:
+                    data = json.loads(row['data'])
+                    data['timestamp'] = row['timestamp']
+                    out.append(data)
+                except Exception:
+                    pass
+            return out
+
+        snapshots = run_heavy_read(
+            'SELECT timestamp, data FROM metrics_history ORDER BY timestamp DESC LIMIT 1000',
+            cache_key='mh_reports_1000', transform=_parse)
         return {'snapshots': snapshots, 'last_cleanup': None}
     except Exception as e:
         logging.error(f"Error loading metrics history from database: {e}")
