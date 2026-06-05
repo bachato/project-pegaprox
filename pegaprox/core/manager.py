@@ -79,9 +79,16 @@ except ImportError:
 # can't be resolved from audit_log. The get_tasks() audit-log LIKE fallback runs
 # on the hub every ~1s broadcast tick per unmatched task; system/automation tasks
 # (cron vzdump, replication, HA) never match, so without this they re-scan forever.
-# Bounded dict (cleared wholesale when full — simple + bounded).
+# Bounded dict {upid: monotonic_ts}, cleared wholesale when full.
+# N-3 (regression fix): entries are TTL'd, NOT permanent. The audit_log row for a
+# task is committed by the handler AFTER the PVE task is created, so the ~1s
+# broadcast scan can read a just-started task before its audit row lands → no
+# match → it used to be negcached FOREVER (permanent mis-attribution). TTL lets a
+# late-committing row be picked up on the next re-scan; a genuine system task just
+# re-scans every TTL (windowed, sub-ms).
 _TASK_USER_NEGCACHE = {}
 _TASK_USER_NEGCACHE_MAX = 5000
+_TASK_USER_NEGCACHE_TTL = 120.0
 
 def run_concurrent(tasks: list, timeout: float = 30.0) -> list:
     # MK 2026-05-31 — paired bugfix with utils/concurrent.py: gevent.pool.Pool's
@@ -932,6 +939,11 @@ class PegaProxManager:
                 self._ip_cache.clear()
             with self._disk_cache_lock:
                 self._disk_cache.clear()
+            # N-1 (regression fix): also drop the short node-status/tasks result
+            # caches so the post-reconnect "flip to online" push isn't served a
+            # ≤5s-old pre-disconnect snapshot (could show a node still offline).
+            self._node_status_cache = None
+            self._tasks_cache = {}
 
             # Build list of hosts to try: primary first, then fallbacks
             hosts_to_try = [self.config.host] + (self.config.fallback_hosts or [])
@@ -7200,8 +7212,11 @@ echo "AGENT_INSTALLED_OK"
                 'self_fence_nodes': self.ha_config.get('self_fence_nodes', []),
             }
     
-    def get_tasks(self, limit: int = 50) -> List[Dict]:
-        """get recent cluster tasks, newest first - MK"""
+    def get_tasks(self, limit: int = 50, force: bool = False) -> List[Dict]:
+        """get recent cluster tasks, newest first - MK
+
+        force=True bypasses the short result cache — used by push_immediate_update
+        after a VM action so the just-started task shows up sub-second (N-2)."""
         # Fail early if we're not connected to avoid hanging
         if not self.is_connected or not self.session:
             return []
@@ -7218,7 +7233,7 @@ echo "AGENT_INSTALLED_OK"
         _tcache = getattr(self, '_tasks_cache', None)
         if _tcache is None:
             _tcache = self._tasks_cache = {}
-        if _tt > 0:
+        if _tt > 0 and not force:
             _ent = _tcache.get(limit)
             if _ent and _ent[1] and (time.monotonic() - _ent[0]) < _tt:
                 return _ent[1]
@@ -7258,7 +7273,9 @@ echo "AGENT_INSTALLED_OK"
                     # rest we infer from audit_log by matching task type → known action,
                     # vmid in details, and a tight time window around the task starttime.
                     # Survives F5 because audit_log is persistent.
-                    if not pegaprox_user and (task_info.get('upid') or '') not in _TASK_USER_NEGCACHE:
+                    _neg_ent = _TASK_USER_NEGCACHE.get(task_info.get('upid') or '')
+                    _neg_fresh = _neg_ent is not None and (time.monotonic() - _neg_ent) < _TASK_USER_NEGCACHE_TTL
+                    if not pegaprox_user and not _neg_fresh:
                         try:
                             from pegaprox.core.db import get_db
                             _db = get_db()
@@ -7312,7 +7329,7 @@ echo "AGENT_INSTALLED_OK"
                                 # so we don't re-run this scan every broadcast tick.
                                 if len(_TASK_USER_NEGCACHE) >= _TASK_USER_NEGCACHE_MAX:
                                     _TASK_USER_NEGCACHE.clear()
-                                _TASK_USER_NEGCACHE[task_info['upid']] = True
+                                _TASK_USER_NEGCACHE[task_info['upid']] = time.monotonic()
                         except Exception:
                             pass
 

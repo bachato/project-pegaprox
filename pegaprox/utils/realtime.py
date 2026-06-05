@@ -72,8 +72,9 @@ def push_immediate_update(cluster_id: str, delay: float = 0.3):
             if resources:
                 broadcast_sse('resources', resources, cluster_id)
 
-            # Push tasks
-            tasks = manager.get_tasks(limit=50)
+            # Push tasks — force=True bypasses the 3s result cache so the action's
+            # just-started task shows up immediately (N-2), not on the next tick.
+            tasks = manager.get_tasks(limit=50, force=True)
             if tasks:
                 broadcast_sse('tasks', tasks, cluster_id)
 
@@ -287,8 +288,13 @@ def broadcast_sse(update_type: str, data: dict, cluster_id: str = None):
                     if q and should_send:
                         try:
                             q.put_nowait(message)
-                        except:
-                            pass  # Queue full
+                        except Exception:
+                            # R3 (regression scan): a slow client's queue is full, so
+                            # this frame is dropped — make it OBSERVABLE instead of
+                            # silent (its VM grid goes stale otherwise with no signal).
+                            n = client_info['dropped'] = client_info.get('dropped', 0) + 1
+                            if n == 1 or n % 100 == 0:
+                                logging.warning(f"[SSE] client {client_id} queue full — dropped {n} frames (slow consumer)")
                 except:
                     pass
     except Exception as e:
