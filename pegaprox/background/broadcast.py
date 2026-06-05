@@ -12,10 +12,41 @@ from datetime import datetime
 
 from pegaprox.globals import (
     cluster_managers, _broadcast_thread,
-    sse_clients, sse_tokens, sse_tokens_lock,
+    sse_clients, sse_clients_lock, sse_tokens, sse_tokens_lock,
+    ws_clients, ws_clients_lock,
     vmware_managers,
 )
 from pegaprox.utils.realtime import broadcast_sse
+
+
+def _watched_clusters():
+    """Cluster IDs at least one live SSE/WS client is subscribed to.
+
+    Returns None when any client is subscribed to ALL (clusters=None) — then we
+    poll everything. Otherwise returns the union of every client's subscription;
+    clusters in that set are being viewed, the rest are not.
+
+    NS 2026-06-05 (#528 scaling): the frontend already narrows each client's
+    subscription to the selected + expanded clusters, and broadcast_sse filters
+    per-client — so a cluster NO client subscribes to has its (expensive: per-node
+    fan-out + json serialize) poll done every loop for events that reach nobody.
+    Skipping those makes the broadcast cost scale with VIEWED clusters, not total
+    cluster count. Safe precisely because no client receives the skipped events.
+    """
+    watched = set()
+    with sse_clients_lock:
+        for c in list(sse_clients.values()):
+            sub = c.get('clusters')
+            if sub is None:
+                return None
+            watched.update(sub)
+    with ws_clients_lock:
+        for c in list(ws_clients.values()):
+            sub = c.get('clusters')
+            if sub is None:
+                return None
+            watched.update(sub)
+    return watched
 
 # NS 2026-06-05 (#528 scaling): per-cluster "broadcast greenlet in flight" flags.
 # The loop spawns one greenlet per cluster every ~1s; a slow-but-not-erroring
@@ -268,8 +299,15 @@ def broadcast_resources_loop():
 
             # NS: Run each cluster broadcast in its own thread with 8s max
             # Prevents one slow/timing-out cluster from blocking all SSE updates
+            # NS 2026-06-05 (#528 scaling): only poll clusters someone is actually
+            # viewing. None = a client has all-access subscription → poll all.
+            watched = _watched_clusters()
             threads = []
             for cluster_id, manager in list(cluster_managers.items()):
+                # nobody is subscribed to this cluster — its events would reach
+                # no client, so skip the per-node fan-out + serialize entirely
+                if watched is not None and cluster_id not in watched:
+                    continue
                 # skip if this cluster's previous broadcast greenlet is still
                 # running (slow cluster) — avoids piling up one per second (#528)
                 if _broadcast_inflight.get(cluster_id):
