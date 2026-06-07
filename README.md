@@ -75,6 +75,10 @@ The name **PegaProx** is inspired by *Pegasus*, the winged horse of Greek mythol
   <a href="https://uvensys.de/">
     <img src="images/sponsors/uvensys.png" alt="uvensys GmbH" width="160"/>
   </a>
+  &nbsp;&nbsp;
+  <a href="https://www.datimo.ch/">
+    <img src="images/sponsors/datimo.png" alt="Datimo" width="180"/>
+  </a>
 </p>
 
 ### 🥉 Bronze
