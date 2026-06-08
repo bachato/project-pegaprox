@@ -957,8 +957,18 @@ def main(debug_mode=False):
 
         SSL_DIR = DATA_DIR / "ssl"
 
-        cert_file = SSL_DIR / "cert.pem"
-        key_file = SSL_DIR / "key.pem"
+        # MK 2026-06-08 (#531): generate the self-signed cert into the persisted
+        # config/ssl dir (the same path the custom-cert check above uses + the one
+        # that survives a `docker compose pull`) AND create it first. On a fresh
+        # container the old /app/ssl target didn't exist, so generation failed with
+        # ENOENT, PegaProx fell back to plain HTTP, and a browser hitting it over
+        # HTTPS got a TLS-to-HTTP "connection error" — login was impossible.
+        cert_file = SSL_CERT_FILE
+        key_file = SSL_KEY_FILE
+        try:
+            os.makedirs(os.path.dirname(cert_file), exist_ok=True)
+        except Exception:
+            pass
 
         if os.path.exists(cert_file) and os.path.exists(key_file):
             ssl_context = (cert_file, key_file)
