@@ -858,9 +858,12 @@ def _run_v2p_migration(task):
                 rc_a2, out_a2, _ = _pve_node_exec(pve_mgr, task.target_node,
                     f"qm set {task.proxmox_vmid} --{disk_bus}{i} {vol_id} 2>&1", timeout=30)
                 if rc_a2 != 0:
-                    err = str(out_a2 or '').strip()[:200]
-                    task.log(f"  ✗ qm set --{disk_bus}{i} failed: {err}")
-                    task.set_phase('failed', f'qm set --{disk_bus}{i} {vol_id} → {err}')
+                    out_full = str(out_a2 or '').strip()
+                    # MK 2026-06-09 (#438 crcro): qm prints a "successfully created '<vol>'"
+                    # notice first, so [:200] showed that and cut the real error off the end.
+                    # Log the whole thing; surface the tail where qm puts the actual failure.
+                    task.log(f"  ✗ qm set --{disk_bus}{i} failed (rc={rc_a2}): {out_full}")
+                    task.set_phase('failed', f'qm set --{disk_bus}{i} → {out_full[-300:]}')
                     _cleanup_sshfs(pve_mgr, task.target_node, mnt_path)
                     return
                 task.log(f"  Disk {i} attached as {disk_bus}{i}")
@@ -1061,9 +1064,11 @@ def _run_v2p_migration(task):
                 attach_cmd = f"qm set {task.proxmox_vmid} --{disk_bus}{i} {vol_id} 2>&1"
                 rc_a, out_a, _ = _pve_node_exec(pve_mgr, task.target_node, attach_cmd, timeout=30)
                 if rc_a != 0:
-                    err = str(out_a or '').strip()[:200]
-                    task.log(f"  ✗ qm set --{disk_bus}{i} failed: {err}")
-                    task.set_phase('failed', f'qm set --{disk_bus}{i} {vol_id} → {err}')
+                    out_full = str(out_a or '').strip()
+                    # #438: log the full output, surface the tail — qm's "successfully
+                    # created" notice prints before the real error so a head-cut hid the cause.
+                    task.log(f"  ✗ qm set --{disk_bus}{i} failed (rc={rc_a}): {out_full}")
+                    task.set_phase('failed', f'qm set --{disk_bus}{i} → {out_full[-300:]}')
                     _cleanup_sshfs(pve_mgr, task.target_node, mnt_path)
                     return
                 task.log(f"  Disk {i} attached as {disk_bus}{i}")
@@ -1201,9 +1206,11 @@ def _run_v2p_migration(task):
             else:
                 # NS May 2026 (#222): used to just warn — silent failure left the
                 # disk orphaned in storage so users had to `qm rescan` after.
-                err = str(out_at or '').strip()[:200]
-                task.log(f"  ✗ qm set --{disk_bus}{i} failed: {err}")
-                task.set_phase('failed', f'qm set --{disk_bus}{i} {vol_id} → {err}')
+                out_full = str(out_at or '').strip()
+                # #438: full output to the log + tail to the phase (qm's success notice
+                # prints before the real error, so a head-cut buried it).
+                task.log(f"  ✗ qm set --{disk_bus}{i} failed (rc={rc_at}): {out_full}")
+                task.set_phase('failed', f'qm set --{disk_bus}{i} → {out_full[-300:]}')
                 _cleanup_sshfs(pve_mgr, task.target_node, mnt_path)
                 return
 
