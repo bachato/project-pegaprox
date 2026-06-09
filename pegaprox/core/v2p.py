@@ -531,7 +531,9 @@ def _run_v2p_migration(task):
         
         # Network: match VMware (vmxnet3, E1000, E1000e)
         detected_nic = hw.get('nic_type_pve', 'e1000')
-        net_driver = task.net_driver if task.net_driver in ('e1000', 'e1000e', 'virtio', 'vmxnet3') else detected_nic
+        _valid_nic = ('e1000', 'e1000e', 'virtio', 'vmxnet3')
+        nic_explicit = task.net_driver in _valid_nic   # user picked a specific model, not 'auto'
+        net_driver = task.net_driver if nic_explicit else detected_nic
         
         # PVE requires DNS-valid names - ESXi allows spaces/special chars (#129)
         raw_name = vm_data.get('name', f'v2p-{task.proxmox_vmid}')
@@ -594,7 +596,14 @@ def _run_v2p_migration(task):
         preserve_mac = getattr(task, 'preserve_mac', False)
         if selected_nics:
             for idx, nic in enumerate(selected_nics if isinstance(selected_nics, list) else [selected_nics]):
-                model = nic.get('pve_model', net_driver) if isinstance(nic, dict) else net_driver
+                # MK 2026-06-09 (#536 narukeh): an explicit Network Model pick (e.g. VirtIO)
+                # must win on every NIC. pve_model is the source-detected per-NIC type
+                # (vmxnet3/e1000) — only let it stand in for the 'auto/match-source' case,
+                # otherwise the selected model was silently overridden by the ESXi type.
+                if nic_explicit:
+                    model = net_driver
+                else:
+                    model = nic.get('pve_model', net_driver) if isinstance(nic, dict) else net_driver
                 nic_str = f'{model},bridge={task.network_bridge}'
                 if preserve_mac and isinstance(nic, dict) and nic.get('mac_address'):
                     nic_str += f',macaddr={nic["mac_address"]}'
