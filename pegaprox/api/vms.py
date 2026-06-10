@@ -6826,9 +6826,8 @@ def vnc_websocket_route(cluster_id, node, vm_type, vmid):
     users = load_users()
     user = users.get(auth_user, {})
     user_perms = get_user_permissions(user)
-    if 'vm.console' not in user_perms and auth_role != ROLE_ADMIN:
-        return jsonify({'error': 'Permission denied', 'code': 'INSUFFICIENT_PERMISSIONS'}), 403
-
+    # MK 2026-06-10 (#537/RBAC): coarse "global vm.console perm OR admin" pre-check dropped —
+    # the per-VM _console_authz gate below is authoritative and portal/custom-role aware.
     # H-1/H-2: cluster + per-VM gate (vm.console alone isn't enough)
     user['username'] = auth_user
     _ok, _why = _console_authz(user, cluster_id, vmid, vm_type)
@@ -7509,10 +7508,7 @@ def vnc_websocket_proxy(ws, cluster_id, node, vm_type, vmid):
         users = load_users()
         user = users.get(token_data['user'], {})
         user_perms = get_user_permissions(user)
-        if 'vm.console' not in user_perms and token_data['role'] != ROLE_ADMIN:
-            try: ws.send('Permission denied')
-            except: pass
-            return
+        # #537/RBAC: coarse "global vm.console OR admin" pre-check dropped — _console_authz below is authoritative.
         auth_user = token_data['user']
     elif session_id:
         session = validate_session(session_id)
@@ -7523,10 +7519,7 @@ def vnc_websocket_proxy(ws, cluster_id, node, vm_type, vmid):
         users = load_users()
         user = users.get(session['user'], {})
         user_perms = get_user_permissions(user)
-        if 'vm.console' not in user_perms and session['role'] != ROLE_ADMIN:
-            try: ws.send('Permission denied')
-            except: pass
-            return
+        # #537/RBAC: coarse pre-check dropped — _console_authz below is authoritative.
         auth_user = session['user']
     else:
         try: ws.send('Authentication required')
@@ -8558,7 +8551,9 @@ def node_shell_websocket_proxy(ws, cluster_id, node):
     users = load_users()
     user = users.get(session['user'], {})
     user_perms = get_user_permissions(user)
-    if 'node.shell' not in user_perms and session['role'] != ROLE_ADMIN:
+    # MK 2026-06-10 (RBAC): gate on the node.shell perm only — admin holds it via
+    # all-perms so the explicit admin bypass was redundant; a custom role with node.shell now works.
+    if 'node.shell' not in user_perms:
         logging.error(f"SHELL WS: User {session['user']} lacks node.shell permission")
         try:
             ws.send('{"status":"error","message":"Permission denied"}')

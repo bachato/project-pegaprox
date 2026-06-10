@@ -1185,9 +1185,10 @@ def get_cluster_creds_internal(cluster_id):
     # Check permissions - NS Feb 2026
     users_db = load_users()
     user_data = users_db.get(session['user'], {})
-    is_admin = user_data.get('role') == ROLE_ADMIN
+    # MK 2026-06-10 (RBAC): gate on node.shell only — admin holds it via all-perms, so the
+    # explicit admin bypass was redundant; a custom role with node.shell now works too.
     user_perms = get_user_permissions(user_data)
-    if not is_admin and 'node.shell' not in user_perms:
+    if 'node.shell' not in user_perms:
         logging.warning(f"[CLUSTER-CREDS] User {session['user']} lacks node.shell permission")
         return jsonify({'error': 'Permission denied'}), 403
     
@@ -1678,8 +1679,9 @@ def list_api_tokens():
     username = request.session['user']
     role = request.session.get('role', ROLE_VIEWER)
     
-    # MK: Admin can see all tokens if ?all=true
-    if role == ROLE_ADMIN and request.args.get('all') == 'true':
+    # MK 2026-06-10 (RBAC): the admin.api perm (not the admin role) sees all tokens — admin holds it via all-perms.
+    from pegaprox.utils.rbac import has_permission as _has_perm
+    if _has_perm(load_users().get(username, {}), 'admin.api') and request.args.get('all') == 'true':
         try:
             db = get_db()
             cursor = db.conn.cursor()
@@ -1751,8 +1753,9 @@ def revoke_api_token_endpoint(token_id):
     username = request.session['user']
     role = request.session.get('role', ROLE_VIEWER)
     
-    # LW: Admin can revoke any token
-    if role == ROLE_ADMIN:
+    # MK 2026-06-10 (RBAC): the admin.api perm can revoke any token (admin holds it via all-perms).
+    from pegaprox.utils.rbac import has_permission as _has_perm
+    if _has_perm(load_users().get(username, {}), 'admin.api'):
         try:
             db = get_db()
             cursor = db.conn.cursor()

@@ -46,7 +46,7 @@ def get_clusters():
 
     # #248: users without cluster.view can still see clusters where they have VM ACLs
     acl_cluster_ids = set()
-    if not has_cluster_view and user.get('role') != ROLE_ADMIN:
+    if not has_cluster_view:
         from pegaprox.utils.rbac import load_vm_acls
         all_acls = load_vm_acls()
         for cid, vm_acls in all_acls.items():
@@ -79,14 +79,14 @@ def get_clusters():
             if cluster_id not in acl_cluster_ids:
                 continue
         # without cluster.view, only show clusters with VM ACLs
-        if not has_cluster_view and user.get('role') != ROLE_ADMIN and cluster_id not in acl_cluster_ids:
+        if not has_cluster_view and cluster_id not in acl_cluster_ids:
             continue
 
         meta = cluster_meta.get(cluster_id, {})
         display_name = meta.get('display_name') or ''
 
         # ACL-only users get minimal info (no admin settings)
-        if not has_cluster_view and user.get('role') != ROLE_ADMIN:
+        if not has_cluster_view:
             clusters.append({
                 'id': cluster_id,
                 'name': mgr.config.name,
@@ -997,7 +997,10 @@ def get_cluster_resources(cluster_id):
     users = load_users()
     user = users.get(request.session['user'], {})
     user['username'] = request.session['user']
-    
+
+    # NOTE (RBAC 2026-06-10): intentional admin data-scoping fast-path, NOT a gate to
+    # swap for a permission — vm.view / cluster.view are held by viewer+user too, so a
+    # perm check here would leak ALL VMs past the per-VM ACL filter below. Stays role-scoped.
     if user.get('role') == ROLE_ADMIN:
         return jsonify(all_resources)
     
