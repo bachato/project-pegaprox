@@ -209,7 +209,7 @@ def get_one(cluster_id):
 
 
 @bp.route('/api/power/rates/<cluster_id>', methods=['PUT'])
-@require_auth(roles=[ROLE_ADMIN])
+@require_auth(perms=['cluster.config'])
 def upsert(cluster_id):
     body = request.get_json(silent=True) or {}
     try:
@@ -247,7 +247,7 @@ def upsert(cluster_id):
 
 
 @bp.route('/api/power/rates/<cluster_id>', methods=['DELETE'])
-@require_auth(roles=[ROLE_ADMIN])
+@require_auth(perms=['cluster.config'])
 def delete_rate(cluster_id):
     if cluster_id == '__default__':
         return jsonify({'error': 'cannot delete defaults'}), 400

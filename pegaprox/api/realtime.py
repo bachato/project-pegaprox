@@ -381,7 +381,7 @@ def update_sse_subscription():
 
 
 @bp.route('/api/settings/smtp/test', methods=['POST'])
-@require_auth(roles=[ROLE_ADMIN])
+@require_auth(perms=['admin.settings'])
 def test_smtp():
     """Send a test email to verify SMTP settings
 

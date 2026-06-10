@@ -111,6 +111,12 @@ PERMISSIONS = {
     'admin.audit': 'View audit logs',
     'admin.api': 'Manage API tokens',
 
+    # Security permissions (MK 2026-06-10: RBAC-ification of admin-only endpoints)
+    'security.lockout.view': 'View IP / user brute-force lockouts',
+    'security.lockout.manage': 'Clear IP / user lockouts and reset password expiry',
+    'security.settings.manage': 'Edit security settings (IP whitelist, CORS, key rotation, compliance)',
+    'update.manage': 'Run and configure the in-app updater',
+
     # PBS permissions
     'pbs.view': 'View PBS servers and datastores',
     'pbs.config': 'Modify PBS server settings',

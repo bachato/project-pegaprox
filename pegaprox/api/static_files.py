@@ -376,7 +376,7 @@ def check_pool_permission(cluster_id: str, vmid: int, vm_type: str, required_per
 
 
 @bp.route('/api/users/<username>/vm-access', methods=['GET'])
-@require_auth(roles=[ROLE_ADMIN])
+@require_auth(perms=['admin.users'])
 def get_user_vm_access(username):
     """Get all VMs a user has explicit access to"""
     users = load_users()
@@ -402,7 +402,7 @@ def get_user_vm_access(username):
 # ==================== PER-TENANT USER PERMISSIONS ====================
 
 @bp.route('/api/users/<username>/permissions', methods=['GET'])
-@require_auth(roles=[ROLE_ADMIN])
+@require_auth(perms=['admin.users'])
 def get_user_perms(username):
     """Get effective permissions for a user"""
     users = load_users()
@@ -429,7 +429,7 @@ def get_user_perms(username):
     })
 
 @bp.route('/api/users/<username>/permissions', methods=['PUT'])
-@require_auth(roles=[ROLE_ADMIN])
+@require_auth(perms=['admin.users'])
 def set_user_perms(username):
     """Set user-specific permissions (global or per-tenant)"""
     global users_db
@@ -488,7 +488,7 @@ def set_user_perms(username):
 
 
 @bp.route('/api/users/<username>/tenant-permissions/<tenant_id>', methods=['DELETE'])
-@require_auth(roles=[ROLE_ADMIN])
+@require_auth(perms=['admin.users'])
 def remove_user_tenant_perms(username, tenant_id):
     """Remove tenant-specific permissions for a user (revert to global)"""
     global users_db

@@ -511,7 +511,7 @@ def delete_alert(alert_id):
 # ─────────────────────────────────────────────────────────
 
 @bp.route('/api/alert-channels', methods=['GET'])
-@require_auth(roles=[ROLE_ADMIN])
+@require_auth(perms=['alert.manage'])
 def list_alert_channels():
     from pegaprox.api.helpers import load_server_settings
     channels = (load_server_settings() or {}).get('alert_webhooks') or []
@@ -531,7 +531,7 @@ def list_alert_channels():
 
 
 @bp.route('/api/alert-channels', methods=['POST'])
-@require_auth(roles=[ROLE_ADMIN])
+@require_auth(perms=['alert.manage'])
 def create_alert_channel():
     from pegaprox.api.helpers import load_server_settings, save_server_settings
     from pegaprox.utils.webhooks import new_channel
@@ -548,7 +548,7 @@ def create_alert_channel():
 
 
 @bp.route('/api/alert-channels/<cid>', methods=['PUT'])
-@require_auth(roles=[ROLE_ADMIN])
+@require_auth(perms=['alert.manage'])
 def update_alert_channel(cid):
     from pegaprox.api.helpers import load_server_settings, save_server_settings
     settings = load_server_settings()
@@ -575,7 +575,7 @@ def update_alert_channel(cid):
 
 
 @bp.route('/api/alert-channels/<cid>', methods=['DELETE'])
-@require_auth(roles=[ROLE_ADMIN])
+@require_auth(perms=['alert.manage'])
 def delete_alert_channel(cid):
     from pegaprox.api.helpers import load_server_settings, save_server_settings
     settings = load_server_settings()
@@ -590,7 +590,7 @@ def delete_alert_channel(cid):
 
 
 @bp.route('/api/alert-channels/<cid>/test', methods=['POST'])
-@require_auth(roles=[ROLE_ADMIN])
+@require_auth(perms=['alert.manage'])
 def test_alert_channel(cid):
     from pegaprox.api.helpers import load_server_settings
     from pegaprox.utils.webhooks import send_to_channel
@@ -625,7 +625,7 @@ def test_alert_channel(cid):
 # admins a way to see what the loop saw and force a re-check on demand.
 
 @bp.route('/api/alerts/diagnostics', methods=['GET'])
-@require_auth(roles=[ROLE_ADMIN])
+@require_auth(perms=['alert.manage'])
 def alerts_diagnostics():
     from pegaprox.api.helpers import load_server_settings
     from pegaprox.background import alerts as A
@@ -664,7 +664,7 @@ def alerts_diagnostics():
 
 
 @bp.route('/api/alerts/force-check', methods=['POST'])
-@require_auth(roles=[ROLE_ADMIN])
+@require_auth(perms=['alert.manage'])
 def alerts_force_check():
     """Run check_and_send_alerts() once, optionally clearing the cooldown
     map so an alert that already fired in this process can re-fire."""
