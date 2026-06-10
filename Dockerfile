@@ -8,7 +8,17 @@ LABEL org.label-schema.vcs-url="https://github.com/PegaProx/project-pegaprox"
 LABEL maintainer="support@pegaprox.com"
 
 # Install system dependencies
-RUN apt-get update && apt-get upgrade -y && apt-get install -y --no-install-recommends \
+# MK 2026-06-10 — Aikido flagged 6 critical + 12 high openssl CVEs in the
+# *published* image (CVE-2026-45447 use-after-free, CVE-2026-7383 mem-corruption,
+# CVE-2026-9076/45445/42764/34180 …) — all the same root cause: openssl/libssl3t64
+# stuck at 3.5.6-1~deb13u1 while Debian shipped the patched ~deb13u2. The base is
+# digest-pinned, so Docker kept this apt layer cached across builds and the
+# `upgrade -y` never re-ran → the stale lib kept getting republished. Bump
+# SECURITY_REFRESH (or build with --no-cache) to bust the cache so the security
+# upgrade actually re-runs and pulls the current patch level.
+ARG SECURITY_REFRESH=2026-06-10
+RUN echo "security refresh ${SECURITY_REFRESH}" \
+    && apt-get update && apt-get upgrade -y && apt-get install -y --no-install-recommends \
     gcc libffi-dev libssl-dev \
     openssh-client sshpass \
     && rm -rf /var/lib/apt/lists/*
