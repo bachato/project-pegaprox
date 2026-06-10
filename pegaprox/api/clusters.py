@@ -142,7 +142,7 @@ def get_clusters():
 
 
 @bp.route('/api/clusters', methods=['POST'])
-@require_auth(roles=[ROLE_ADMIN])
+@require_auth(perms=['cluster.add'])
 def add_cluster():
     """Add a new cluster"""
     data = request.json
@@ -202,7 +202,7 @@ def add_cluster():
 
 
 @bp.route('/api/clusters/<cluster_id>/config/export', methods=['GET'])
-@require_auth(roles=[ROLE_ADMIN])
+@require_auth(perms=['cluster.config'])
 def export_cluster_config(cluster_id):
     """Export cluster config WITHOUT secrets — for re-configure pre-fill (#256)"""
     if cluster_id not in cluster_managers:
@@ -230,7 +230,7 @@ def export_cluster_config(cluster_id):
 # the new /access/users/{user}/token/{id} POST in 9.2 regenerates the secret
 # in place. On pre-9.2 we fall back to delete+create + warn that ACLs reset.
 @bp.route('/api/clusters/<cluster_id>/api-token/rotate', methods=['POST'])
-@require_auth(roles=[ROLE_ADMIN])
+@require_auth(perms=['cluster.config'])
 def rotate_cluster_api_token(cluster_id):
     if cluster_id not in cluster_managers:
         return jsonify({'error': 'Cluster not found'}), 404
@@ -298,7 +298,7 @@ def rotate_cluster_api_token(cluster_id):
 
 
 @bp.route('/api/clusters/<cluster_id>/reconfigure', methods=['POST'])
-@require_auth(roles=[ROLE_ADMIN])
+@require_auth(perms=['cluster.config'])
 def reconfigure_cluster(cluster_id):
     """Re-configure cluster credentials. Requires re-authentication. (#256)
     Keeps same cluster_id so VM ACLs, replication jobs etc. stay intact.
@@ -2135,7 +2135,7 @@ def uninstall_self_fence_agent(cluster_id):
 
 
 @bp.route('/api/clusters/<cluster_id>/ha', methods=['PUT'])
-@require_auth(roles=[ROLE_ADMIN])
+@require_auth(perms=['ha.config'])
 def set_ha_status(cluster_id):
     """Enable or disable HA for a cluster (legacy endpoint)"""
     ok, err = check_cluster_access(cluster_id)

@@ -81,7 +81,7 @@ def get_pegaprox_version():
 
 # NS: Military Grade Encryption Status & Migration - Jan 2026
 @bp.route('/api/pegaprox/security/status', methods=['GET'])
-@require_auth(roles=[ROLE_ADMIN])
+@require_auth(perms=['security.settings.manage'])
 def get_security_status():
     """Get encryption and security status"""
     db = get_db()
@@ -164,7 +164,7 @@ def get_security_status():
 
 
 @bp.route('/api/pegaprox/security/migrate-all', methods=['POST'])
-@require_auth(roles=[ROLE_ADMIN])
+@require_auth(perms=['security.settings.manage'])
 def migrate_all_encryption():
     """Force migration of all data to latest encryption
     
@@ -230,7 +230,7 @@ def migrate_all_encryption():
 
 
 @bp.route('/api/pegaprox/check-update', methods=['GET'])
-@require_auth(roles=[ROLE_ADMIN])
+@require_auth(perms=['update.manage'])
 def check_pegaprox_update():
     """Check for PegaProx updates (mirror + GitHub fallback).
 
@@ -342,7 +342,7 @@ def check_pegaprox_update():
 
 
 @bp.route('/api/pegaprox/update', methods=['POST'])
-@require_auth(roles=[ROLE_ADMIN])
+@require_auth(perms=['update.manage'])
 def perform_pegaprox_update():
     """PegaProx auto-update from GitHub
 
@@ -831,7 +831,7 @@ def perform_pegaprox_update():
         return jsonify({'error': safe_error(e, 'Update failed')}), 500
 
 @bp.route('/api/pegaprox/update/rollback', methods=['POST'])
-@require_auth(roles=[ROLE_ADMIN])
+@require_auth(perms=['update.manage'])
 def rollback_pegaprox_update():
     """Rollback to a previous PegaProx version from backup
     
@@ -1088,7 +1088,7 @@ def serve_sw():
     return resp
 
 @bp.route('/api/settings/server', methods=['GET'])
-@require_auth(roles=[ROLE_ADMIN])
+@require_auth(perms=['admin.settings'])
 def get_server_settings():
     """Get server settings (admin only)"""
     settings = load_server_settings()
@@ -1138,7 +1138,7 @@ def get_password_policy():
     })
 
 @bp.route('/api/settings/server', methods=['POST'])
-@require_auth(roles=[ROLE_ADMIN])
+@require_auth(perms=['admin.settings'])
 def update_server_settings():
     """Update server settings (admin only)
     
@@ -1699,7 +1699,7 @@ def update_server_settings():
         return jsonify({'error': safe_error(e, 'Settings update failed')}), 500
 
 @bp.route('/api/settings/login-background', methods=['DELETE'])
-@require_auth(roles=[ROLE_ADMIN])
+@require_auth(perms=['admin.settings'])
 def delete_login_background():
     """Remove custom login background — clean both locations (config/branding +
     legacy images/) in case an old install still has the file in the
@@ -1714,7 +1714,7 @@ def delete_login_background():
     return jsonify({'success': True})
 
 @bp.route('/api/settings/server/restart', methods=['POST'])
-@require_auth(roles=[ROLE_ADMIN])
+@require_auth(perms=['admin.settings'])
 def restart_server():
     """Restart the PegaProx server (admin only)"""
     try:
@@ -1767,7 +1767,7 @@ def restart_server():
 
 # MK: Mar 2026 - ACME / Let's Encrypt endpoints (#96)
 @bp.route('/api/settings/acme/status', methods=['GET'])
-@require_auth(roles=[ROLE_ADMIN])
+@require_auth(perms=['node.certificate'])
 def get_acme_status():
     """Get ACME certificate status and settings"""
     try:
@@ -1806,7 +1806,7 @@ def get_acme_status():
 
 
 @bp.route('/api/settings/acme/request', methods=['POST'])
-@require_auth(roles=[ROLE_ADMIN])
+@require_auth(perms=['node.certificate'])
 def request_acme_certificate():
     """Request a new ACME certificate — supports Let's Encrypt and custom CAs"""
     try:
@@ -1895,7 +1895,7 @@ def request_acme_certificate():
 
 
 @bp.route('/api/settings/acme/dns/complete', methods=['POST'])
-@require_auth(roles=[ROLE_ADMIN])
+@require_auth(perms=['node.certificate'])
 def complete_acme_dns_challenge():
     """Complete a pending ACME DNS-01 certificate request."""
     try:
@@ -2655,7 +2655,7 @@ def check_ip_whitelist():
         }), 403
 
 @bp.route('/api/security/ip-whitelist', methods=['GET'])
-@require_auth(roles=[ROLE_ADMIN])
+@require_auth(perms=['security.settings.manage'])
 def get_ip_whitelist():
     """Get IP whitelist configuration (admin only)"""
     try:
@@ -2676,7 +2676,7 @@ def get_ip_whitelist():
         return jsonify({'error': safe_error(e, 'IP whitelist load failed')}), 500
 
 @bp.route('/api/security/ip-whitelist', methods=['POST'])
-@require_auth(roles=[ROLE_ADMIN])
+@require_auth(perms=['security.settings.manage'])
 def update_ip_whitelist():
     """Update IP whitelist configuration (admin only)
     
@@ -2752,7 +2752,7 @@ def update_ip_whitelist():
         return jsonify({'error': safe_error(e, 'IP whitelist update failed')}), 500
 
 @bp.route('/api/security/ip-whitelist/test', methods=['POST'])
-@require_auth(roles=[ROLE_ADMIN])
+@require_auth(perms=['security.settings.manage'])
 def test_ip_whitelist():
     """Test if an IP would be allowed (admin only)
     
@@ -2780,7 +2780,7 @@ def test_ip_whitelist():
 # ============================================
 
 @bp.route('/api/audit', methods=['GET'])
-@require_auth(roles=[ROLE_ADMIN])
+@require_auth(perms=['admin.audit'])
 def get_audit_log_api():
     """Get audit log entries (admin only). ?format=csv streams CSV for compliance export."""
     # Optional filters
@@ -2921,7 +2921,7 @@ def get_cluster_audit_log_api(cluster_id):
 
 
 @bp.route('/api/audit/integrity', methods=['GET'])
-@require_auth(roles=[ROLE_ADMIN])
+@require_auth(perms=['admin.audit'])
 def verify_audit_integrity():
     """Verify integrity of audit log using HMAC signatures (admin only)
     
@@ -2942,14 +2942,14 @@ def verify_audit_integrity():
     return jsonify(result)
 
 @bp.route('/api/security/key-info', methods=['GET'])
-@require_auth(roles=[ROLE_ADMIN])
+@require_auth(perms=['security.settings.manage'])
 def get_encryption_key_info():
     """get info about current encryption key (exists, created, algorithm, backups)"""
     database = get_db()
     return jsonify(database.get_key_info())
 
 @bp.route('/api/security/key-rotate', methods=['POST'])
-@require_auth(roles=[ROLE_ADMIN])
+@require_auth(perms=['security.settings.manage'])
 def rotate_encryption_key():
     """Rotate the encryption key (admin only)
     
@@ -2983,7 +2983,7 @@ def rotate_encryption_key():
         return jsonify(result), 500
 
 @bp.route('/api/security/compliance', methods=['GET'])
-@require_auth(roles=[ROLE_ADMIN])
+@require_auth(perms=['security.settings.manage'])
 def get_compliance_status():
     """Get security compliance status (admin only)
     
@@ -3052,7 +3052,7 @@ def get_compliance_status():
         return jsonify({'error': safe_error(e, 'Compliance check failed')}), 500
 
 @bp.route('/api/security/cors', methods=['GET'])
-@require_auth(roles=[ROLE_ADMIN])
+@require_auth(perms=['security.settings.manage'])
 def get_cors_origins():
     """Get configured CORS origins (admin only)"""
     env_origins = [o.strip() for o in _cors_origins_env.split(',') if o.strip()] if _cors_origins_env else []
@@ -3071,7 +3071,7 @@ def get_cors_origins():
     })
 
 @bp.route('/api/security/cors', methods=['POST'])
-@require_auth(roles=[ROLE_ADMIN])
+@require_auth(perms=['security.settings.manage'])
 def add_cors_origin():
     """Manually add a CORS origin (admin only)
 
@@ -3225,7 +3225,7 @@ def get_status():
 
 
 @bp.route('/api/support-bundle', methods=['GET'])
-@require_auth(roles=[ROLE_ADMIN])
+@require_auth(perms=['admin.settings'])
 def generate_support_bundle():
     """Generate a support bundle with logs and system info for troubleshooting
     
@@ -4357,7 +4357,7 @@ def start_rolling_update(cluster_id):
 
 
 @bp.route('/api/clusters/<cluster_id>/updates/rolling', methods=['DELETE'])
-@require_auth(roles=[ROLE_ADMIN])
+@require_auth(perms=['node.update'])
 def cancel_rolling_update(cluster_id):
     """Cancel a running rolling update"""
     if cluster_id not in cluster_managers:
@@ -4384,7 +4384,7 @@ def cancel_rolling_update(cluster_id):
 
 
 @bp.route('/api/clusters/<cluster_id>/updates/rolling/resume', methods=['POST'])
-@require_auth(roles=[ROLE_ADMIN])
+@require_auth(perms=['node.update'])
 def resume_rolling_update(cluster_id):
     if cluster_id not in cluster_managers:
         return jsonify({'error': 'Cluster not found'}), 404
@@ -4400,7 +4400,7 @@ def resume_rolling_update(cluster_id):
 
 
 @bp.route('/api/clusters/<cluster_id>/updates/rolling/clear', methods=['POST'])
-@require_auth(roles=[ROLE_ADMIN])
+@require_auth(perms=['node.update'])
 def clear_rolling_update_status(cluster_id):
     """Clear completed/cancelled rolling update status (dismiss notification)"""
     if cluster_id not in cluster_managers:
@@ -4838,7 +4838,7 @@ def get_timezones_api():
 # =====================================================
 
 @bp.route('/api/settings/ldap/test', methods=['POST'])
-@require_auth(roles=[ROLE_ADMIN])
+@require_auth(perms=['admin.settings'])
 def test_ldap():
     """Test LDAP connection and optionally test user authentication"""
     data = request.json or {}

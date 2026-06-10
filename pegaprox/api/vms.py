@@ -439,7 +439,7 @@ def get_datacenter_options(cluster_id):
 
 
 @bp.route('/api/clusters/<cluster_id>/datacenter/options', methods=['PUT'])
-@require_auth(roles=[ROLE_ADMIN])
+@require_auth(perms=['cluster.config'])
 def set_datacenter_options(cluster_id):
     """Update datacenter options"""
     ok, err = check_cluster_access(cluster_id)
