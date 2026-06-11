@@ -720,7 +720,13 @@
                         // Same server as /shellws — clean `websockets` lib, no flask-sock framing bug.
                         const wsProto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
                         const mainPort = parseInt(window.location.port) || (window.location.protocol === 'https:' ? 443 : 80);
-                        const sshPort = (window.__pegaproxReverseProxy === true) ? mainPort : (mainPort + 2);
+                        // MK 2026-06-11 (#539 markushergeth): this was gated on the
+                        // window.__pegaproxReverseProxy global, which isn't reliably set —
+                        // so behind a reverse proxy the term WS still went to main+2 (e.g.
+                        // :445) and Caddy/nginx couldn't route it. Key off reverseProxyEnabled
+                        // from the auth context like the VNC + node-shell paths already do.
+                        const sshPort = reverseProxyEnabled ? mainPort : (mainPort + 2);
+                        if (reverseProxyEnabled) console.log(`Using main port for Term (Reverse Proxy Enabled): ${sshPort}`);
                         // NS 2026-06-05 (C-1): auth_ticket (cluster PVEAuthCookie) is
                         // no longer passed through the browser — the WS server fetches
                         // it server-side from the cluster context. Only the scoped
