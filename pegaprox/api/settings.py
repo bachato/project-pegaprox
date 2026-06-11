@@ -1040,49 +1040,61 @@ def serve_favicon():
 # MK 2026-06-11 (Nico) — sponsor logos must ALWAYS render. A freshly-added
 # sponsor asset doesn't always reach an existing install (the per-file updater
 # missed it — that's how Expertize's sponsor3.png went missing on some boxes).
-# So make them redundant: if a sponsors/* file is absent locally, pull it once
-# from the update mirror, then GitHub, and cache it next to the others. Skipped
-# in air-gap mode (no egress there). Negative-cached so a genuinely-absent file
-# isn't re-fetched on every page load.
+# So make them redundant: if a sponsors/* file is absent locally, pull it from
+# the update mirror, then GitHub. We try to cache it to images/sponsors/ so it
+# self-heals — but if that folder isn't writable (read-only mount, or the app
+# dir owned by root while we run as a restricted user, common on bare-metal) we
+# keep the bytes in memory and serve them directly, so wrong permissions can't
+# break the logo. Skipped in air-gap mode (no egress). Negative-cached so a
+# genuinely-absent file isn't re-fetched on every page load.
 _SPONSOR_HEAL_SOURCES = (
     "https://updates.pegaprox.com/images/sponsors/{name}",
     "https://raw.githubusercontent.com/PegaProx/project-pegaprox/main/images/sponsors/{name}",
 )
-_sponsor_heal_misses = {}  # basename -> monotonic ts of last failed remote fetch
+_sponsor_heal_misses = {}  # name -> monotonic ts of last failed remote fetch
+_sponsor_mem_cache = {}    # name -> (bytes, content_type) — fallback when images/ isn't writable
 
-def _heal_missing_sponsor(filename):
-    """Fetch a missing sponsors/* asset from the mirror/GitHub and cache it under
-    images/sponsors/. Returns True once it's on disk. No-op in air-gap mode."""
+def _get_healed_sponsor(filename):
+    """Return (content, content_type) for a missing sponsors/* asset pulled from
+    the mirror then GitHub. Caches to images/sponsors/ when writable, otherwise
+    keeps it in memory so the logo still shows on read-only installs. Returns
+    (None, None) in air-gap mode, on a recent miss, or if it can't be fetched."""
     name = os.path.basename(filename)
     if not re.match(r'^sponsor[\w-]+\.(png|svg|jpg|jpeg|webp|gif)$', name, re.I):
-        return False
+        return None, None
+    if name in _sponsor_mem_cache:          # fetched before but couldn't write to disk
+        return _sponsor_mem_cache[name]
     try:
         if load_server_settings().get('air_gap_mode', False):
-            return False
+            return None, None
     except Exception:
         pass
     now = time.monotonic()
     if now - _sponsor_heal_misses.get(name, 0) < 600:
-        return False
-    dst_dir = os.path.join(IMAGES_DIR, 'sponsors')
-    try:
-        os.makedirs(dst_dir, exist_ok=True)
-        for tmpl in _SPONSOR_HEAL_SOURCES:
-            url = tmpl.format(name=name)
-            try:
-                r = requests.get(url, timeout=8)
-                if r.status_code == 200 and 0 < len(r.content) <= 5 * 1024 * 1024:
+        return None, None
+    for tmpl in _SPONSOR_HEAL_SOURCES:
+        url = tmpl.format(name=name)
+        try:
+            r = requests.get(url, timeout=8)
+            if r.status_code == 200 and 0 < len(r.content) <= 5 * 1024 * 1024:
+                ctype = r.headers.get('Content-Type') or ('image/svg+xml' if name.lower().endswith('.svg') else 'image/png')
+                try:
+                    dst_dir = os.path.join(IMAGES_DIR, 'sponsors')
+                    os.makedirs(dst_dir, exist_ok=True)
                     with open(os.path.join(dst_dir, name), 'wb') as fh:
                         fh.write(r.content)
-                    _sponsor_heal_misses.pop(name, None)
-                    logging.info(f"[sponsors] self-healed missing {name} via {url.split('/')[2]}")
-                    return True
-            except Exception as e:
-                logging.debug(f"[sponsors] heal fetch failed ({url}): {e}")
-    except Exception as e:
-        logging.debug(f"[sponsors] heal error for {name}: {e}")
+                    logging.info(f"[sponsors] self-healed {name} via {url.split('/')[2]} (cached to disk)")
+                except Exception as werr:
+                    # images/ not writable — keep it in memory so the logo still
+                    # renders; perms must not be able to break a sponsor logo.
+                    _sponsor_mem_cache[name] = (r.content, ctype)
+                    logging.warning(f"[sponsors] fetched {name} via {url.split('/')[2]} but images/ not writable ({werr}); serving from memory")
+                _sponsor_heal_misses.pop(name, None)
+                return r.content, ctype
+        except Exception as e:
+            logging.debug(f"[sponsors] heal fetch failed ({url}): {e}")
     _sponsor_heal_misses[name] = now
-    return False
+    return None, None
 
 @bp.route('/images/<path:filename>')
 def serve_images(filename):
@@ -1100,7 +1112,13 @@ def serve_images(filename):
             return send_from_directory(BRANDING_DIR, filename)
     # sponsor logos are redundant — self-heal a missing one from mirror/GitHub
     if filename.startswith('sponsors/') and not os.path.exists(os.path.join(IMAGES_DIR, filename)):
-        _heal_missing_sponsor(filename)
+        _content, _ctype = _get_healed_sponsor(filename)
+        # if the disk cache couldn't be written (read-only images/), serve the
+        # fetched bytes straight from memory so the logo still shows
+        if _content is not None and not os.path.exists(os.path.join(IMAGES_DIR, filename)):
+            resp = Response(_content, mimetype=_ctype)
+            resp.headers['Cache-Control'] = 'public, max-age=86400'
+            return resp
     return send_from_directory(IMAGES_DIR, filename)
 
 
