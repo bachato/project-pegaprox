@@ -1037,6 +1037,53 @@ def serve_favicon():
     # return empty response if no favicon (prevents 404 spam in logs)
     return '', 204
 
+# MK 2026-06-11 (Nico) — sponsor logos must ALWAYS render. A freshly-added
+# sponsor asset doesn't always reach an existing install (the per-file updater
+# missed it — that's how Expertize's sponsor3.png went missing on some boxes).
+# So make them redundant: if a sponsors/* file is absent locally, pull it once
+# from the update mirror, then GitHub, and cache it next to the others. Skipped
+# in air-gap mode (no egress there). Negative-cached so a genuinely-absent file
+# isn't re-fetched on every page load.
+_SPONSOR_HEAL_SOURCES = (
+    "https://updates.pegaprox.com/images/sponsors/{name}",
+    "https://raw.githubusercontent.com/PegaProx/project-pegaprox/main/images/sponsors/{name}",
+)
+_sponsor_heal_misses = {}  # basename -> monotonic ts of last failed remote fetch
+
+def _heal_missing_sponsor(filename):
+    """Fetch a missing sponsors/* asset from the mirror/GitHub and cache it under
+    images/sponsors/. Returns True once it's on disk. No-op in air-gap mode."""
+    name = os.path.basename(filename)
+    if not re.match(r'^sponsor[\w-]+\.(png|svg|jpg|jpeg|webp|gif)$', name, re.I):
+        return False
+    try:
+        if load_server_settings().get('air_gap_mode', False):
+            return False
+    except Exception:
+        pass
+    now = time.monotonic()
+    if now - _sponsor_heal_misses.get(name, 0) < 600:
+        return False
+    dst_dir = os.path.join(IMAGES_DIR, 'sponsors')
+    try:
+        os.makedirs(dst_dir, exist_ok=True)
+        for tmpl in _SPONSOR_HEAL_SOURCES:
+            url = tmpl.format(name=name)
+            try:
+                r = requests.get(url, timeout=8)
+                if r.status_code == 200 and 0 < len(r.content) <= 5 * 1024 * 1024:
+                    with open(os.path.join(dst_dir, name), 'wb') as fh:
+                        fh.write(r.content)
+                    _sponsor_heal_misses.pop(name, None)
+                    logging.info(f"[sponsors] self-healed missing {name} via {url.split('/')[2]}")
+                    return True
+            except Exception as e:
+                logging.debug(f"[sponsors] heal fetch failed ({url}): {e}")
+    except Exception as e:
+        logging.debug(f"[sponsors] heal error for {name}: {e}")
+    _sponsor_heal_misses[name] = now
+    return False
+
 @bp.route('/images/<path:filename>')
 def serve_images(filename):
     """Serve image files (pegaprox logo, sponsor logos, login background).
@@ -1051,6 +1098,9 @@ def serve_images(filename):
         branding_path = os.path.join(BRANDING_DIR, filename)
         if os.path.exists(branding_path):
             return send_from_directory(BRANDING_DIR, filename)
+    # sponsor logos are redundant — self-heal a missing one from mirror/GitHub
+    if filename.startswith('sponsors/') and not os.path.exists(os.path.join(IMAGES_DIR, filename)):
+        _heal_missing_sponsor(filename)
     return send_from_directory(IMAGES_DIR, filename)
 
 
