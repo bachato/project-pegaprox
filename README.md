@@ -61,7 +61,7 @@ The name **PegaProx** is inspired by *Pegasus*, the winged horse of Greek mythol
   </a>
   &nbsp;&nbsp;&nbsp;
   <a href="https://netzware.at/">
-    <img src="images/sponsors/netzware.png" alt="Netzware" width="200"/>
+    <img src="images/sponsors/netzware.png" alt="Netzware" width="440"/>
   </a>
 </p>
 
