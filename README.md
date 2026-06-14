@@ -59,6 +59,10 @@ The name **PegaProx** is inspired by *Pegasus*, the winged horse of Greek mythol
   <a href="https://expertize.nl/">
     <img src="images/sponsors/sponsor3.png" alt="Banner Oranje" width="200"/>
   </a>
+  &nbsp;&nbsp;&nbsp;
+  <a href="https://netzware.at/">
+    <img src="images/sponsors/netzware.png" alt="Netzware" width="200"/>
+  </a>
 </p>
 
 ### 🥇 Gold
