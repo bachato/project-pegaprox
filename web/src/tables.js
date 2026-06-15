@@ -1287,7 +1287,7 @@
         // NS: filtering + sorting uses useMemo below (lines 1320+)
         function ResourceTable({ resources, clusterId, clusters, sourceCluster, onVmAction, onOpenConsole, onOpenConfig, onMigrate, onBulkMigrate, onDelete, onClone, onForceStop, onCrossClusterMigrate, nodes, onOpenTags, highlightedVm, addToast, pendingVmAction, onPendingActionConsumed, onVmNavigate, backupStatus }) {
             const { t } = useTranslation();
-            const { getAuthHeaders } = useAuth();
+            const { getAuthHeaders, user } = useAuth();
             const { isCorporate } = useLayout(); // LW: Feb 2026 - corporate defaults to table view
             // NS Mar 2026 - per-VM sparkline history for table view
             const vmHistRef = useRef({});
@@ -1306,8 +1306,12 @@
             const [filter, setFilter] = useState('all');
             const [nodeFilter, setNodeFilter] = useState('all');
             const [tagFilter, setTagFilter] = useState('all');
-            const [sortBy, setSortBy] = useState('vmid');
-            const [sortDir, setSortDir] = useState('asc');
+            // NS #431: remember the table sort per user (localStorage, keyed by
+            // username so a shared browser keeps each operator's choice).
+            const _sortKey = `pegaprox-vmsort-${user?.username || '_'}`;
+            const _savedSort = (() => { try { return JSON.parse(localStorage.getItem(_sortKey) || '{}'); } catch (e) { return {}; } })();
+            const [sortBy, setSortBy] = useState(_savedSort.by || 'vmid');
+            const [sortDir, setSortDir] = useState(_savedSort.dir || 'asc');
             const [viewMode, setViewMode] = useState(isCorporate ? 'table' : 'cards'); // LW: corporate defaults to table
             const [actionLoading, setActionLoading] = useState({});
             const [selectedVms, setSelectedVms] = useState([]);
@@ -1407,6 +1411,18 @@
                 lxc: 'LXC'
             };
 
+            // NS #431: IP sorts by octet value, not as a string. Pull the IP from
+            // the lazy guest-agent cache (qemu) or off the resource (lxc); blanks last.
+            const getIp = (r) => {
+                const c = ipCache.current[r.vmid];
+                return (c && c !== 'loading') ? c : (r.ip || '');
+            };
+            const ipSortKey = (ip) => {
+                const m = String(ip || '').match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})/);
+                if (!m) return Number.MAX_SAFE_INTEGER;  // no IPv4 (empty / IPv6 / loading) → bottom
+                return (((+m[1] * 256) + +m[2]) * 256 + +m[3]) * 256 + +m[4];
+            };
+
             // LW: filter + sort in one useMemo for perf
             // MK: added tag/node/ip search, people kept complaining they couldnt find stuff
             const filteredResources = useMemo(() => {
@@ -1432,15 +1448,18 @@
                 
                 // sort
                 filtered.sort((a, b) => {
+                    const dir = sortDir === 'asc' ? 1 : -1;
+                    if (sortBy === 'ip') {  // NS #431: per-octet numeric, not lexical
+                        return (ipSortKey(getIp(a)) - ipSortKey(getIp(b))) * dir;
+                    }
                     const aVal = a[sortBy];
                     const bVal = b[sortBy];
-                    const dir = sortDir === 'asc' ? 1 : -1;
                     if (typeof aVal === 'number') return(aVal - bVal) * dir;
                     return String(aVal).localeCompare(String(bVal)) * dir;
                 });
-                
+
                 return filtered;
-            }, [resources, search, filter, nodeFilter, tagFilter, sortBy, sortDir]);
+            }, [resources, search, filter, nodeFilter, tagFilter, sortBy, sortDir, ipTick]);
             
             // Reset page when filters change - MK Jan 2026
             // NS: Also reset when cluster changes (via clusterId) to avoid showing empty page
@@ -1489,12 +1508,16 @@
             }, [paginatedResources]);
 
             const handleSort = (col) => {
+                let nextBy = col, nextDir = 'asc';
                 if (sortBy === col) {
-                    setSortDir(sortDir === 'asc' ? 'desc' : 'asc');
+                    nextDir = sortDir === 'asc' ? 'desc' : 'asc';
+                    setSortDir(nextDir);
                 } else {
                     setSortBy(col);
                     setSortDir('asc');  // reset to asc on new column
                 }
+                // NS #431: persist the choice per user
+                try { localStorage.setItem(_sortKey, JSON.stringify({ by: nextBy, dir: nextDir })); } catch (e) {}
             };
 
             // NS: 1073741824 = 1024^3 (GB), 1048576 = 1024^2 (MB)
@@ -2047,7 +2070,7 @@
                                             { key: 'name', label: t('name') },
                                             { key: 'type', label: t('type') },
                                             { key: 'node', label: 'Node' },
-                                            { key: 'ip', label: 'IP', noSort: true },
+                                            { key: 'ip', label: 'IP' },
                                             { key: 'cpu_percent', label: 'CPU' },
                                             { key: 'mem', label: 'RAM' },
                                             { key: 'disk', label: t('disk') },
