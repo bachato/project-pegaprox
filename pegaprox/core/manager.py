@@ -12706,12 +12706,14 @@ echo "AGENT_INSTALLED_OK"
         
         MK: q35 is recommended for modern systems (PCIe native)
         i440fx is the legacy fallback for older guests
-        Updated Jan 2026 to include all versions from Proxmox 8.x
+        Updated Jun 2026 — added QEMU 11 (pve-qemu-kvm 11.0) types, newest on top
         """
         return [
             {'value': '', 'label': 'Default'},
             # q35 versions (modern, PCIe native)
             {'value': 'q35', 'label': 'q35 (Latest)'},
+            {'value': 'pc-q35-11.0+pve1', 'label': 'q35 11.0+pve1'},
+            {'value': 'pc-q35-11.0', 'label': 'q35 11.0'},
             {'value': 'pc-q35-10.1', 'label': 'q35 10.1'},
             {'value': 'pc-q35-10.0+pve1', 'label': 'q35 10.0+pve1'},
             {'value': 'pc-q35-10.0', 'label': 'q35 10.0'},
@@ -12741,6 +12743,8 @@ echo "AGENT_INSTALLED_OK"
             {'value': 'pc-q35-2.10', 'label': 'q35 2.10'},
             # i440fx versions (legacy PCI)
             {'value': 'i440fx', 'label': 'i440fx (Latest)'},
+            {'value': 'pc-i440fx-11.0+pve1', 'label': 'i440fx 11.0+pve1'},
+            {'value': 'pc-i440fx-11.0', 'label': 'i440fx 11.0'},
             {'value': 'pc-i440fx-10.1', 'label': 'i440fx 10.1'},
             {'value': 'pc-i440fx-10.0+pve1', 'label': 'i440fx 10.0+pve1'},
             {'value': 'pc-i440fx-10.0', 'label': 'i440fx 10.0'},
@@ -15002,7 +15006,7 @@ echo DONE""",
         'audit_immutable': {
             'check': """grep -q '^-e 2' /etc/audit/rules.d/99-finalize.rules 2>/dev/null && echo OK || echo FAIL""",
             'apply': """cat > /etc/audit/rules.d/99-finalize.rules << 'IMEOF'
-# CIS 6.2.3.36 / STIG V-270832: Make audit configuration immutable
+# STIG V-270832 (UBTU-24) / CIS audit-config immutability: Make audit configuration immutable (-e 2)
 # This MUST be the last rule loaded - requires reboot to change
 -e 2
 IMEOF
@@ -15287,7 +15291,7 @@ echo DONE""",
             'apply': "echo 'INFORMATIONAL: configure disk encryption manually per BSI guidance'; echo DONE",
         },
         'vsnfd_audit_retention': {
-            'check': """RETENTION=$(grep -h '^MaxRetentionSec' /etc/systemd/journald.conf /etc/systemd/journald.conf.d/*.conf 2>/dev/null | tail -1 | awk -F= '{print $2}' | tr -d ' '); if [ -n "$RETENTION" ]; then case "$RETENTION" in *month|*M) NUM=${RETENTION%[mM]*}; [ "$NUM" -ge 6 ] && echo OK || echo FAIL ;; *year|*Y) echo OK ;; *) echo FAIL ;; esac; else echo FAIL; fi""",
+            'check': """RETENTION=$(grep -h '^MaxRetentionSec' /etc/systemd/journald.conf /etc/systemd/journald.conf.d/*.conf 2>/dev/null | tail -1 | awk -F= '{print $2}' | tr -d ' '); if [ -n "$RETENTION" ]; then case "$RETENTION" in *month|*M) NUM=${RETENTION%[mM]*}; [ "$NUM" -ge 6 ] && echo OK || echo FAIL ;; *year|*Y) echo OK ;; *week|*w) NUM=${RETENTION%[wW]*}; [ "$NUM" -ge 26 ] && echo OK || echo FAIL ;; *day|*d) NUM=${RETENTION%[dD]*}; [ "$NUM" -ge 180 ] && echo OK || echo FAIL ;; *[!0-9]*) echo FAIL ;; *) [ "$RETENTION" -ge 15552000 ] && echo OK || echo FAIL ;; esac; else echo FAIL; fi""",
             'verbose_check': """echo '--- journald retention configuration ---'; grep -h 'MaxRetentionSec\\|SystemMaxUse\\|Storage' /etc/systemd/journald.conf /etc/systemd/journald.conf.d/*.conf 2>/dev/null || echo '  (no MaxRetentionSec configured)'; echo '--- current journal size ---'; journalctl --disk-usage 2>/dev/null""",
             'apply': "echo 'INFORMATIONAL: set MaxRetentionSec=6month (or higher) in /etc/systemd/journald.conf manually'; echo DONE",
         },

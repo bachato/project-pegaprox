@@ -981,7 +981,7 @@
                     <div className="bg-proxmox-dark rounded-xl p-6 border border-proxmox-border">
                         <div className="flex items-center justify-between mb-4">
                             <h3 className="text-lg font-semibold text-white flex items-center gap-2">
-                                <Icons.Check /> {t('complianceStatus') || 'Compliance Status'} (HIPAA/ISO 27001)
+                                <Icons.Check /> {t('securitySelfCheck') || 'Security Self-Check'}
                             </h3>
                             {compliance && (
                                 <div className={`text-3xl font-bold ${getScoreColor(compliance.compliance_score)}`}>
@@ -990,6 +990,10 @@
                             )}
                         </div>
                         
+                        <p className="text-xs text-gray-500 mb-4">
+                            {t('securitySelfCheckDisclaimer') || 'Internal self-check across PegaProx security settings — not a formal HIPAA or ISO 27001 assessment, attestation, or certification.'}
+                        </p>
+
                         {compliance && (
                             <div className="grid grid-cols-2 md:grid-cols-4 gap-4 mb-4">
                                 {Object.entries(compliance.checks || {}).map(([key, value]) => (

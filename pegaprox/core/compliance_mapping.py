@@ -130,7 +130,7 @@ CMMC_L2_NIST_171 = {
     ],
     'mount_options': [
         {'ref': 'CM.L2-3.4.6', 'family': 'CM', 'title': 'Employ the principle of least functionality'},
-        {'ref': 'SC.L2-3.13.4', 'family': 'SC', 'title': 'Control information flow between connected systems'},
+        {'ref': 'SC.L2-3.13.4', 'family': 'SC', 'title': 'Prevent unauthorized and unintended information transfer via shared system resources'},
     ],
     'core_dumps': [
         {'ref': 'SC.L2-3.13.16', 'family': 'SC', 'title': 'Protect the confidentiality of CUI at rest'},
@@ -175,24 +175,24 @@ CMMC_L2_NIST_171 = {
     ],
     'sysctl_hardening': [
         {'ref': 'CM.L2-3.4.6', 'family': 'CM', 'title': 'Employ the principle of least functionality'},
-        {'ref': 'SC.L2-3.13.4', 'family': 'SC', 'title': 'Control information flow between connected systems'},
+        {'ref': 'SC.L2-3.13.4', 'family': 'SC', 'title': 'Prevent unauthorized and unintended information transfer via shared system resources'},
     ],
     'pkg_cleanup': [
-        {'ref': 'CM.L2-3.4.7', 'family': 'CM', 'title': 'Restrict, disable, prevent nonessential programs and services'},
+        {'ref': 'CM.L2-3.4.7', 'family': 'CM', 'title': 'Restrict, disable, prevent the use of nonessential programs, functions, ports, protocols and services'},
         {'ref': 'CM.L2-3.4.8', 'family': 'CM', 'title': 'Apply deny-by-exception policy to prevent unauthorized software'},
     ],
     'remove_legacy_svcs': [
-        {'ref': 'CM.L2-3.4.7', 'family': 'CM', 'title': 'Restrict, disable, prevent nonessential programs and services'},
+        {'ref': 'CM.L2-3.4.7', 'family': 'CM', 'title': 'Restrict, disable, prevent the use of nonessential programs, functions, ports, protocols and services'},
     ],
     'disable_services': [
-        {'ref': 'CM.L2-3.4.7', 'family': 'CM', 'title': 'Restrict, disable, prevent nonessential programs and services'},
+        {'ref': 'CM.L2-3.4.7', 'family': 'CM', 'title': 'Restrict, disable, prevent the use of nonessential programs, functions, ports, protocols and services'},
     ],
     'net_protocols': [
-        {'ref': 'CM.L2-3.4.7', 'family': 'CM', 'title': 'Restrict, disable, prevent nonessential programs and services'},
+        {'ref': 'CM.L2-3.4.7', 'family': 'CM', 'title': 'Restrict, disable, prevent the use of nonessential programs, functions, ports, protocols and services'},
         {'ref': 'SC.L2-3.13.6', 'family': 'SC', 'title': 'Deny network communications by default; allow by exception'},
     ],
     'restrict_compilers': [
-        {'ref': 'CM.L2-3.4.7', 'family': 'CM', 'title': 'Restrict, disable, prevent nonessential programs and services'},
+        {'ref': 'CM.L2-3.4.7', 'family': 'CM', 'title': 'Restrict, disable, prevent the use of nonessential programs, functions, ports, protocols and services'},
     ],
     'cron_hardening': [
         {'ref': 'AC.L2-3.1.5', 'family': 'AC', 'title': 'Employ the principle of least privilege'},
@@ -245,12 +245,10 @@ CMMC_L1 = {
     'apparmor': [
         {'ref': 'AC.L1-3.1.1', 'family': 'AC', 'title': 'Limit system access to authorized users'},
     ],
-    'audit_rules': [
-        {'ref': 'AU.L1-3.3.1', 'family': 'AU', 'title': 'Create and retain audit records'},
-    ],
-    'auditd_service': [
-        {'ref': 'AU.L1-3.3.1', 'family': 'AU', 'title': 'Create and retain audit records'},
-    ],
+    # NS: audit/accountability is NOT a CMMC Level 1 domain — L1 covers only
+    # AC / IA / MP / PE / SC / SI (17 practices from FAR 52.204-21). audit_rules
+    # and auditd_service map to AU.L2-3.3.1 at Level 2 (see CMMC_L2_NIST_171), so
+    # they're intentionally absent here.
     'mem_protection': [
         {'ref': 'SI.L1-3.14.1', 'family': 'SI', 'title': 'Identify, report, and correct system flaws'},
     ],
@@ -282,7 +280,7 @@ NIST_800_53 = {
         {'ref': 'AC-8', 'family': 'AC', 'title': 'System Use Notification'},
     ],
     'inactive_accounts': [
-        {'ref': 'AC-2(3)', 'family': 'AC', 'title': 'Account Management — Disable Inactive Accounts'},
+        {'ref': 'AC-2(3)', 'family': 'AC', 'title': 'Account Management — Disable Accounts'},
     ],
     'pw_quality': [
         {'ref': 'IA-5(1)', 'family': 'IA', 'title': 'Authenticator Management — Password-Based Authentication'},
@@ -407,85 +405,102 @@ NIST_800_53 = {
 # STIG IDs change between releases, so review against the deployed STIG baseline.
 DISA_STIG = {
     'pam_faillock': [
-        {'ref': 'RHEL-09-411040', 'family': 'AC', 'title': 'RHEL 9 must lock accounts after three unsuccessful logon attempts'},
+        {'ref': 'RHEL-09-411075', 'family': 'AC', 'title': 'RHEL 9 must automatically lock an account when three unsuccessful logon attempts occur during a 15-minute time period.'},
     ],
     'pw_quality': [
-        {'ref': 'RHEL-09-611055', 'family': 'IA', 'title': 'RHEL 9 must enforce password complexity'},
+        {'ref': 'RHEL-09-611045', 'family': 'IA', 'title': 'RHEL 9 must ensure the password complexity module is enabled in the system-auth file.'},
+        {'ref': 'RHEL-09-611040', 'family': 'IA', 'title': 'RHEL 9 must ensure the password complexity module is enabled in the password-auth file.'},
     ],
     'pw_history': [
-        {'ref': 'RHEL-09-611025', 'family': 'IA', 'title': 'RHEL 9 must prohibit password reuse for a minimum of five generations'},
+        {'ref': 'RHEL-09-611015', 'family': 'IA', 'title': 'RHEL 9 must be configured in the password-auth file to prohibit password reuse for a minimum of five generations.'},
+        {'ref': 'RHEL-09-611020', 'family': 'IA', 'title': 'RHEL 9 must be configured in the system-auth file to prohibit password reuse for a minimum of five generations.'},
     ],
     'pw_aging': [
-        {'ref': 'RHEL-09-611080', 'family': 'IA', 'title': 'RHEL 9 user passwords must have a minimum / maximum lifetime'},
+        {'ref': 'RHEL-09-411010', 'family': 'AC', 'title': 'RHEL 9 user account passwords for new users or password changes must have a 60-day maximum password lifetime restriction in /etc/login.defs.'},
+        {'ref': 'RHEL-09-611080', 'family': 'IA', 'title': 'RHEL 9 passwords must have a 24 hours minimum password lifetime restriction in /etc/shadow.'},
     ],
     'pw_hash_rounds': [
-        {'ref': 'RHEL-09-611155', 'family': 'IA', 'title': 'RHEL 9 must encrypt user-stored passwords using SHA-512 or yescrypt'},
+        {'ref': 'RHEL-09-611055', 'family': 'IA', 'title': 'RHEL 9 system-auth must be configured to use a sufficient number of hashing rounds'},
+        {'ref': 'RHEL-09-611050', 'family': 'IA', 'title': 'RHEL 9 password-auth must be configured to use a sufficient number of hashing rounds'},
     ],
     'ssh_crypto': [
-        {'ref': 'RHEL-09-255040', 'family': 'IA', 'title': 'RHEL 9 SSH server must be configured to use only FIPS-validated ciphers'},
-        {'ref': 'RHEL-09-255045', 'family': 'IA', 'title': 'RHEL 9 SSH server must use only approved MACs'},
-        {'ref': 'RHEL-09-255055', 'family': 'IA', 'title': 'RHEL 9 SSH server must use only approved KEX algorithms'},
+        {'ref': 'RHEL-09-255065', 'family': 'IA', 'title': 'The RHEL 9 SSH server must be configured to use only DOD-approved encryption ciphers employing FIPS 140-3 validated cryptographic hash algorithms to protect the confidentiality of SSH server connections.'},
+        {'ref': 'RHEL-09-255075', 'family': 'IA', 'title': 'The RHEL 9 SSH server must be configured to use only Message Authentication Codes (MACs) employing FIPS 140-3 validated cryptographic hash algorithms.'},
     ],
     'ssh_perms': [
-        {'ref': 'RHEL-09-255010', 'family': 'AC', 'title': 'RHEL 9 SSH config files must have correct permissions'},
+        {'ref': 'RHEL-09-255115', 'family': 'CM', 'title': 'RHEL 9 SSH server configuration file must have mode 0600 or less permissive'},
+        {'ref': 'RHEL-09-255110', 'family': 'CM', 'title': 'RHEL 9 SSH server configuration file must be owned by root'},
+        {'ref': 'RHEL-09-255105', 'family': 'CM', 'title': 'RHEL 9 SSH server configuration file must be group-owned by root'},
     ],
     'session_limit': [
-        {'ref': 'RHEL-09-412040', 'family': 'AC', 'title': 'RHEL 9 must terminate idle user sessions'},
+        {'ref': 'RHEL-09-412040', 'family': 'AC', 'title': 'RHEL 9 must limit the number of concurrent sessions to ten for all accounts and/or account types'},
     ],
     'shell_timeout': [
-        {'ref': 'RHEL-09-412035', 'family': 'AC', 'title': 'RHEL 9 must initiate a session lock for idle interactive users'},
+        {'ref': 'RHEL-09-412035', 'family': 'AC', 'title': 'RHEL 9 must automatically exit interactive command shell user sessions after 10 minutes of inactivity'},
     ],
     'login_banners': [
-        {'ref': 'RHEL-09-611010', 'family': 'AC', 'title': 'RHEL 9 must display the Standard Mandatory DoD Notice and Consent Banner before login'},
+        {'ref': 'RHEL-09-211020', 'family': 'AC', 'title': 'RHEL 9 must display the Standard Mandatory DOD Notice and Consent Banner before granting local or remote access to the system via a command line user logon.'},
     ],
     'inactive_accounts': [
-        {'ref': 'RHEL-09-411045', 'family': 'AC', 'title': 'RHEL 9 must disable account identifiers after 35 days of inactivity'},
+        {'ref': 'RHEL-09-411050', 'family': 'AC', 'title': 'RHEL 9 must disable account identifiers (individuals, groups, roles, and devices) after 35 days of inactivity.'},
     ],
     'audit_rules': [
-        {'ref': 'RHEL-09-654005', 'family': 'AU', 'title': 'RHEL 9 must generate audit records for all account creations, modifications, disabling, and termination events'},
+        {'ref': 'RHEL-09-654215', 'family': 'AU', 'title': 'RHEL 9 must generate audit records for all account creations, modifications, disabling, and termination events that affect /etc/sudoers.'},
+        {'ref': 'RHEL-09-654225', 'family': 'AU', 'title': 'RHEL 9 must generate audit records for all account creations, modifications, disabling, and termination events that affect /etc/group.'},
     ],
     'audit_boot': [
-        {'ref': 'RHEL-09-211010', 'family': 'AU', 'title': 'RHEL 9 must enable kernel audit at boot via audit=1'},
+        {'ref': 'RHEL-09-212055', 'family': 'AU', 'title': 'RHEL 9 must enable auditing of processes that start prior to the audit daemon.'},
     ],
     'auditd_service': [
-        {'ref': 'RHEL-09-651010', 'family': 'AU', 'title': 'RHEL 9 audit service must be running'},
+        {'ref': 'RHEL-09-653015', 'family': 'AU', 'title': 'RHEL 9 audit service must be enabled'},
     ],
     'audit_immutable': [
-        {'ref': 'RHEL-09-653030', 'family': 'AU', 'title': 'RHEL 9 audit system must take action when allocated audit-record storage is full'},
+        {'ref': 'RHEL-09-654275', 'family': 'AU', 'title': 'RHEL 9 audit system must protect auditing rules from unauthorized change.'},
+        {'ref': 'RHEL-09-653025', 'family': 'AU', 'title': 'RHEL 9 audit system must take appropriate action when the audit storage volume is full'},
     ],
     'aide_audit_protect': [
-        {'ref': 'RHEL-09-651025', 'family': 'AU', 'title': 'RHEL 9 must protect audit information from unauthorized access'},
+        {'ref': 'RHEL-09-651025', 'family': 'AU', 'title': 'RHEL 9 must use cryptographic mechanisms to protect the integrity of audit tools'},
+        {'ref': 'RHEL-09-232035', 'family': 'AU', 'title': 'RHEL 9 audit tools must have a mode of 0755 or less permissive'},
     ],
     'journald': [
-        {'ref': 'RHEL-09-652020', 'family': 'AU', 'title': 'RHEL 9 systemd-journald must be configured to compress and forward audit records'},
+        {'ref': 'RHEL-09-211040', 'family': 'AU', 'title': 'RHEL 9 systemd-journald service must be enabled'},
     ],
     'apparmor': [
-        {'ref': 'UBTU-22-411015', 'family': 'AC', 'title': 'Ubuntu must enable AppArmor'},
+        {'ref': 'UBTU-22-431015', 'family': 'AC', 'title': 'Ubuntu 22.04 LTS must be configured to use AppArmor'},
+        {'ref': 'RHEL-09-431010', 'family': 'AC', 'title': 'RHEL 9 must use a Linux Security Module configured to enforce limits on system services.'},
     ],
     'fs_modules': [
-        {'ref': 'RHEL-09-213010', 'family': 'CM', 'title': 'RHEL 9 must disable the kernel module loading where not required'},
+        {'ref': 'RHEL-09-231195', 'family': 'CM', 'title': 'RHEL 9 must disable mounting of cramfs'},
     ],
     'usb_storage': [
-        {'ref': 'RHEL-09-291010', 'family': 'MP', 'title': 'RHEL 9 must disable the USB mass storage kernel module'},
+        {'ref': 'RHEL-09-291010', 'family': 'MP', 'title': 'RHEL 9 must be configured to disable USB mass storage'},
     ],
     'core_dumps': [
-        {'ref': 'RHEL-09-213035', 'family': 'SC', 'title': 'RHEL 9 must disable storage of core dumps'},
+        {'ref': 'RHEL-09-213090', 'family': 'SC', 'title': 'RHEL 9 must disable storing core dumps'},
+        {'ref': 'RHEL-09-213100', 'family': 'SC', 'title': 'RHEL 9 must disable acquiring, saving, and processing core dumps'},
     ],
     'mount_options': [
-        {'ref': 'RHEL-09-231010', 'family': 'CM', 'title': 'RHEL 9 must mount /dev/shm with the noexec option'},
+        {'ref': 'RHEL-09-231115', 'family': 'CM', 'title': 'RHEL 9 must mount /dev/shm with the noexec option'},
+        {'ref': 'RHEL-09-231130', 'family': 'CM', 'title': 'RHEL 9 must mount /tmp with the noexec option'},
     ],
     'mem_protection': [
-        {'ref': 'RHEL-09-213020', 'family': 'SI', 'title': 'RHEL 9 must implement address space layout randomization'},
+        {'ref': 'RHEL-09-213070', 'family': 'SC', 'title': 'RHEL 9 must implement address space layout randomization (ASLR) to protect its memory from unauthorized code execution.'},
     ],
     'file_integrity': [
-        {'ref': 'RHEL-09-651015', 'family': 'SI', 'title': 'RHEL 9 must employ a deny-all, permit-by-exception policy and use AIDE'},
+        {'ref': 'RHEL-09-651010', 'family': 'SI', 'title': 'RHEL 9 must have the AIDE package installed'},
+        {'ref': 'RHEL-09-651015', 'family': 'SI', 'title': 'RHEL 9 must routinely check the baseline configuration for unauthorized changes and notify the system administrator when anomalies in the operation of any security functions are discovered.'},
     ],
     'sysctl_hardening': [
-        {'ref': 'RHEL-09-253010', 'family': 'SC', 'title': 'RHEL 9 must not respond to ICMPv4 redirect messages'},
+        {'ref': 'RHEL-09-253015', 'family': 'SC', 'title': 'RHEL 9 must ignore Internet Protocol version 4 (IPv4) Internet Control Message Protocol (ICMP) redirect messages.'},
+        {'ref': 'RHEL-09-253035', 'family': 'SC', 'title': 'RHEL 9 must use reverse path filtering on all IPv4 interfaces'},
+        {'ref': 'RHEL-09-253010', 'family': 'SC', 'title': 'RHEL 9 must be configured to use TCP syncookies'},
     ],
-    'pve_fail2ban': [
-        {'ref': 'RHEL-09-253035', 'family': 'SI', 'title': 'RHEL 9 must use a host-based intrusion detection tool'},
-    ],
+    # NS rebuild 2026-06-15 (RHEL 9 STIG V2R8, web-verified). Intentionally unmapped:
+    #  - pve_fail2ban: RHEL 9 STIG dropped the RHEL-7/8 host-based-IDS (SI-4) rule.
+    # Partial coverage (real ID, partial intent): journald 211040 = "service enabled" only
+    # (no STIG rule for compress/forward/persistent); fs_modules = cramfs (231195) only --
+    # freevxfs/squashfs/udf/etc. are CIS, not STIG. ssh_crypto omits KEX (no server-side
+    # KexAlgorithms STIG rule in V2R8; governed by the FIPS crypto-policy 671xxx range).
 }
 
 
@@ -622,144 +637,139 @@ ISO_27001 = {
 # BSI IT-Grundschutz Kompendium (subset — modules SYS, OPS, NET, DER, CON).
 BSI_GRUNDSCHUTZ = {
     'pam_faillock': [
-        {'ref': 'SYS.1.3.A6', 'family': 'SYS', 'title': 'Sperrung von Konten'},
+        {'ref': 'ORP.4.A23', 'family': 'ORP', 'title': 'Regelung für passwortverarbeitende Anwendungen und IT-Systeme'},
     ],
     'pw_quality': [
-        {'ref': 'ORP.4.A8', 'family': 'OPS', 'title': 'Regelung des Passwortgebrauchs'},
+        {'ref': 'ORP.4.A22', 'family': 'ORP', 'title': 'Regelung zur Passwortqualität'},
+        {'ref': 'ORP.4.A8', 'family': 'ORP', 'title': 'Regelung des Passwortgebrauchs'},
     ],
     'pw_aging': [
-        {'ref': 'ORP.4.A8', 'family': 'OPS', 'title': 'Regelung des Passwortgebrauchs'},
+        {'ref': 'ORP.4.A23', 'family': 'ORP', 'title': 'Regelung für passwortverarbeitende Anwendungen und IT-Systeme'},
     ],
     'pw_history': [
-        {'ref': 'ORP.4.A8', 'family': 'OPS', 'title': 'Regelung des Passwortgebrauchs'},
+        {'ref': 'ORP.4.A23', 'family': 'ORP', 'title': 'Regelung für passwortverarbeitende Anwendungen und IT-Systeme'},
+        {'ref': 'ORP.4.A8', 'family': 'ORP', 'title': 'Regelung des Passwortgebrauchs'},
     ],
     'pw_hash_rounds': [
-        {'ref': 'CON.1.A1', 'family': 'CON', 'title': 'Auswahl geeigneter kryptographischer Verfahren'},
+        {'ref': 'CON.1.A1', 'family': 'CON', 'title': 'Auswahl geeigneter kryptografischer Verfahren'},
     ],
     'ssh_crypto': [
-        {'ref': 'SYS.1.3.A14', 'family': 'SYS', 'title': 'Sichere Konfiguration eines SSH-Servers'},
-        {'ref': 'CON.1.A1', 'family': 'CON', 'title': 'Auswahl geeigneter kryptographischer Verfahren'},
+        {'ref': 'SYS.1.3.A8', 'family': 'SYS', 'title': 'Verschlüsselter Zugriff über Secure Shell'},
+        {'ref': 'CON.1.A1', 'family': 'CON', 'title': 'Auswahl geeigneter kryptografischer Verfahren'},
     ],
     'ssh_perms': [
-        {'ref': 'SYS.1.3.A14', 'family': 'SYS', 'title': 'Sichere Konfiguration eines SSH-Servers'},
+        {'ref': 'SYS.1.3.A8', 'family': 'SYS', 'title': 'Verschlüsselter Zugriff über Secure Shell'},
     ],
     'file_perms': [
-        {'ref': 'SYS.1.3.A8', 'family': 'SYS', 'title': 'Beschränkung der Rechte des Administrators'},
+        {'ref': 'SYS.1.3.A14', 'family': 'SYS', 'title': 'Verhinderung des Ausspähens von Informationen über das System und über Benutzende'},
+        {'ref': 'ORP.4.A7', 'family': 'ORP', 'title': 'Vergabe von Zugriffsrechten'},
     ],
     'default_umask': [
-        {'ref': 'SYS.1.3.A8', 'family': 'SYS', 'title': 'Beschränkung der Rechte des Administrators'},
+        {'ref': 'SYS.1.3.A14', 'family': 'SYS', 'title': 'Verhinderung des Ausspähens von Informationen über das System und über Benutzende'},
     ],
     'apparmor': [
-        {'ref': 'SYS.1.3.A8', 'family': 'SYS', 'title': 'Beschränkung der Rechte des Administrators'},
-        {'ref': 'SYS.1.3.A22', 'family': 'SYS', 'title': 'Verwendung von Mandatory Access Control'},
-    ],
-    'session_limit': [
-        {'ref': 'SYS.1.3.A19', 'family': 'SYS', 'title': 'Sicheres Login'},
-    ],
-    'shell_timeout': [
-        {'ref': 'SYS.1.3.A19', 'family': 'SYS', 'title': 'Sicheres Login'},
-    ],
-    'login_banners': [
-        {'ref': 'SYS.1.3.A19', 'family': 'SYS', 'title': 'Sicheres Login'},
+        {'ref': 'SYS.1.3.A10', 'family': 'SYS', 'title': 'Verhinderung der Ausbreitung bei der Ausnutzung von Schwachstellen'},
+        {'ref': 'SYS.1.3.A16', 'family': 'SYS', 'title': 'Zusätzliche Verhinderung der Ausbreitung bei der Ausnutzung von Schwachstellen'},
     ],
     'inactive_accounts': [
-        {'ref': 'ORP.4.A4', 'family': 'OPS', 'title': 'Aufgabenverteilung und Funktionstrennung'},
-    ],
-    'fs_modules': [
-        {'ref': 'SYS.1.3.A11', 'family': 'SYS', 'title': 'Deinstallation nicht benötigter Software'},
-    ],
-    'usb_storage': [
-        {'ref': 'SYS.4.5.A2', 'family': 'SYS', 'title': 'Schutz vor Schadsoftware durch Wechseldatenträger'},
-    ],
-    'mount_options': [
-        {'ref': 'SYS.1.3.A11', 'family': 'SYS', 'title': 'Deinstallation nicht benötigter Software'},
-    ],
-    'core_dumps': [
-        {'ref': 'CON.1.A2', 'family': 'CON', 'title': 'Datensicherung der kryptographischen Schlüssel'},
-    ],
-    'audit_rules': [
-        {'ref': 'OPS.1.1.5.A4', 'family': 'OPS', 'title': 'Konfiguration der Protokollierung'},
-        {'ref': 'DER.1.A2', 'family': 'DER', 'title': 'Festlegung relevanter Ereignistypen'},
-    ],
-    'audit_boot': [
-        {'ref': 'OPS.1.1.5.A4', 'family': 'OPS', 'title': 'Konfiguration der Protokollierung'},
-    ],
-    'auditd_service': [
-        {'ref': 'OPS.1.1.5.A1', 'family': 'OPS', 'title': 'Erstellung eines Sicherheitskonzepts für die Protokollierung'},
-    ],
-    'audit_immutable': [
-        {'ref': 'OPS.1.1.5.A6', 'family': 'OPS', 'title': 'Sicherung der Protokolldaten'},
-    ],
-    'aide_audit_protect': [
-        {'ref': 'OPS.1.1.5.A6', 'family': 'OPS', 'title': 'Sicherung der Protokolldaten'},
-        {'ref': 'DER.4.A4', 'family': 'DER', 'title': 'Integritätsprüfung'},
-    ],
-    'journald': [
-        {'ref': 'OPS.1.1.5.A4', 'family': 'OPS', 'title': 'Konfiguration der Protokollierung'},
-    ],
-    'process_acct': [
-        {'ref': 'OPS.1.1.5.A4', 'family': 'OPS', 'title': 'Konfiguration der Protokollierung'},
-    ],
-    'file_integrity': [
-        {'ref': 'DER.4.A4', 'family': 'DER', 'title': 'Integritätsprüfung'},
-    ],
-    'debsums': [
-        {'ref': 'DER.4.A4', 'family': 'DER', 'title': 'Integritätsprüfung'},
-    ],
-    'mem_protection': [
-        {'ref': 'SYS.1.3.A1', 'family': 'SYS', 'title': 'Planung des Servereinsatzes'},
-    ],
-    'sysctl_hardening': [
-        {'ref': 'NET.1.1.A1', 'family': 'NET', 'title': 'Sicherheitsrichtlinie zur Netzplanung'},
-        {'ref': 'SYS.1.3.A1', 'family': 'SYS', 'title': 'Planung des Servereinsatzes'},
-    ],
-    'pkg_cleanup': [
-        {'ref': 'SYS.1.3.A11', 'family': 'SYS', 'title': 'Deinstallation nicht benötigter Software'},
-    ],
-    'remove_legacy_svcs': [
-        {'ref': 'SYS.1.3.A11', 'family': 'SYS', 'title': 'Deinstallation nicht benötigter Software'},
-    ],
-    'disable_services': [
-        {'ref': 'SYS.1.3.A11', 'family': 'SYS', 'title': 'Deinstallation nicht benötigter Software'},
-    ],
-    'net_protocols': [
-        {'ref': 'NET.1.1.A1', 'family': 'NET', 'title': 'Sicherheitsrichtlinie zur Netzplanung'},
-    ],
-    'pve_fail2ban': [
-        {'ref': 'DER.1.A2', 'family': 'DER', 'title': 'Festlegung relevanter Ereignistypen'},
-    ],
-    'apt_show_versions': [
-        {'ref': 'OPS.1.1.3.A1', 'family': 'OPS', 'title': 'Planung des Patch- und Änderungsmanagements'},
-    ],
-    'cron_hardening': [
-        {'ref': 'SYS.1.3.A8', 'family': 'SYS', 'title': 'Beschränkung der Rechte des Administrators'},
-    ],
-    'pam_tmpdir': [
-        {'ref': 'SYS.1.3.A1', 'family': 'SYS', 'title': 'Planung des Servereinsatzes'},
-    ],
-    'restrict_compilers': [
-        {'ref': 'SYS.1.3.A11', 'family': 'SYS', 'title': 'Deinstallation nicht benötigter Software'},
-    ],
-    # VS-NfD-specific informational checks → BSI Grundschutz
-    'vsnfd_disk_encryption': [
-        {'ref': 'SYS.1.5.A4', 'family': 'SYS', 'title': 'Verschlüsselung der Festplatte'},
-        {'ref': 'CON.1.A1', 'family': 'CON', 'title': 'Auswahl geeigneter kryptographischer Verfahren'},
-    ],
-    'vsnfd_audit_retention': [
-        {'ref': 'OPS.1.1.5.A6', 'family': 'OPS', 'title': 'Sicherung der Protokolldaten'},
-    ],
-    'vsnfd_journald_size': [
-        {'ref': 'OPS.1.1.5.A4', 'family': 'OPS', 'title': 'Konfiguration der Protokollierung'},
-    ],
-    'vsnfd_secure_boot': [
-        {'ref': 'SYS.1.3.A1', 'family': 'SYS', 'title': 'Planung des Servereinsatzes'},
+        {'ref': 'ORP.4.A7', 'family': 'ORP', 'title': 'Vergabe von Zugriffsrechten'},
     ],
     'vsnfd_kernel_lockdown': [
-        {'ref': 'SYS.1.3.A8', 'family': 'SYS', 'title': 'Beschränkung der Rechte des Administrators'},
+        {'ref': 'SYS.1.3.A17', 'family': 'SYS', 'title': 'Zusätzlicher Schutz des Kernels'},
     ],
     'vsnfd_password_min_12': [
-        {'ref': 'ORP.4.A8', 'family': 'OPS', 'title': 'Regelung des Passwortgebrauchs'},
+        {'ref': 'ORP.4.A22', 'family': 'ORP', 'title': 'Regelung zur Passwortqualität'},
     ],
+    'fs_modules': [
+        {'ref': 'SYS.1.1.A6', 'family': 'SYS', 'title': 'Deaktivierung nicht benötigter Dienste'},
+    ],
+    'usb_storage': [
+        {'ref': 'SYS.1.3.A3', 'family': 'SYS', 'title': 'Kein automatisches Einbinden von Wechsellaufwerken'},
+        {'ref': 'SYS.1.1.A5', 'family': 'SYS', 'title': 'Schutz von Schnittstellen'},
+    ],
+    'mount_options': [
+        {'ref': 'SYS.1.1.A16', 'family': 'SYS', 'title': 'Sichere Installation und Grundkonfiguration von Servern'},
+    ],
+    'core_dumps': [
+        {'ref': 'SYS.1.3.A4', 'family': 'SYS', 'title': 'Schutz vor Ausnutzung von Schwachstellen in Anwendungen'},
+    ],
+    'audit_rules': [
+        {'ref': 'OPS.1.1.5.A3', 'family': 'OPS', 'title': 'Konfiguration der Protokollierung auf System- und Netzebene'},
+        {'ref': 'DER.1.A5', 'family': 'DER', 'title': 'Einsatz von mitgelieferten Systemfunktionen zur Detektion'},
+    ],
+    'audit_boot': [
+        {'ref': 'OPS.1.1.5.A3', 'family': 'OPS', 'title': 'Konfiguration der Protokollierung auf System- und Netzebene'},
+    ],
+    'auditd_service': [
+        {'ref': 'OPS.1.1.5.A1', 'family': 'OPS', 'title': 'Erstellung einer Sicherheitsrichtlinie für die Protokollierung'},
+        {'ref': 'OPS.1.1.5.A3', 'family': 'OPS', 'title': 'Konfiguration der Protokollierung auf System- und Netzebene'},
+    ],
+    'audit_immutable': [
+        {'ref': 'OPS.1.1.5.A10', 'family': 'OPS', 'title': 'Zugriffsschutz für Protokollierungsdaten'},
+    ],
+    'aide_audit_protect': [
+        {'ref': 'DER.1.A18', 'family': 'DER', 'title': 'Durchführung regelmäßiger Integritätskontrollen'},
+        {'ref': 'OPS.1.1.5.A10', 'family': 'OPS', 'title': 'Zugriffsschutz für Protokollierungsdaten'},
+    ],
+    'journald': [
+        {'ref': 'OPS.1.1.5.A3', 'family': 'OPS', 'title': 'Konfiguration der Protokollierung auf System- und Netzebene'},
+    ],
+    'process_acct': [
+        {'ref': 'OPS.1.1.5.A3', 'family': 'OPS', 'title': 'Konfiguration der Protokollierung auf System- und Netzebene'},
+    ],
+    'file_integrity': [
+        {'ref': 'DER.1.A18', 'family': 'DER', 'title': 'Durchführung regelmäßiger Integritätskontrollen'},
+        {'ref': 'SYS.1.1.A27', 'family': 'SYS', 'title': 'Hostbasierte Angriffserkennung'},
+    ],
+    'debsums': [
+        {'ref': 'DER.1.A18', 'family': 'DER', 'title': 'Durchführung regelmäßiger Integritätskontrollen'},
+    ],
+    'mem_protection': [
+        {'ref': 'SYS.1.3.A4', 'family': 'SYS', 'title': 'Schutz vor Ausnutzung von Schwachstellen in Anwendungen'},
+        {'ref': 'SYS.1.3.A17', 'family': 'SYS', 'title': 'Zusätzlicher Schutz des Kernels'},
+    ],
+    'sysctl_hardening': [
+        {'ref': 'SYS.1.3.A4', 'family': 'SYS', 'title': 'Schutz vor Ausnutzung von Schwachstellen in Anwendungen'},
+    ],
+    'net_protocols': [
+        {'ref': 'SYS.1.1.A6', 'family': 'SYS', 'title': 'Deaktivierung nicht benötigter Dienste'},
+    ],
+    'pkg_cleanup': [
+        {'ref': 'SYS.1.1.A6', 'family': 'SYS', 'title': 'Deaktivierung nicht benötigter Dienste'},
+    ],
+    'remove_legacy_svcs': [
+        {'ref': 'SYS.1.1.A6', 'family': 'SYS', 'title': 'Deaktivierung nicht benötigter Dienste'},
+    ],
+    'disable_services': [
+        {'ref': 'SYS.1.1.A6', 'family': 'SYS', 'title': 'Deaktivierung nicht benötigter Dienste'},
+    ],
+    'restrict_compilers': [
+        {'ref': 'SYS.1.3.A5', 'family': 'SYS', 'title': 'Sichere Installation von Software-Paketen'},
+    ],
+    'pve_fail2ban': [
+        {'ref': 'DER.1.A5', 'family': 'DER', 'title': 'Einsatz von mitgelieferten Systemfunktionen zur Detektion'},
+        {'ref': 'SYS.1.1.A27', 'family': 'SYS', 'title': 'Hostbasierte Angriffserkennung'},
+    ],
+    # VS-NfD-specific informational checks -> BSI Grundschutz
+    'vsnfd_disk_encryption': [
+        {'ref': 'SYS.1.1.A34', 'family': 'SYS', 'title': 'Festplattenverschlüsselung'},
+        {'ref': 'SYS.1.5.A28', 'family': 'SYS', 'title': 'Verschlüsselung von virtuellen IT-Systemen'},
+    ],
+    'vsnfd_audit_retention': [
+        {'ref': 'OPS.1.1.5.A8', 'family': 'OPS', 'title': 'Archivierung von Protokollierungsdaten'},
+    ],
+    'vsnfd_journald_size': [
+        {'ref': 'OPS.1.1.5.A3', 'family': 'OPS', 'title': 'Konfiguration der Protokollierung auf System- und Netzebene'},
+    ],
+    'vsnfd_secure_boot': [
+        {'ref': 'SYS.1.1.A36', 'family': 'SYS', 'title': 'Absicherung des Bootvorgangs'},
+    ],
+    # NS rebuild 2026-06-15 (BSI IT-Grundschutz, web-verified). Dropped the fabricated
+    # SYS.1.3.A19/A22 and the ENTFALLEN SYS.1.3.A1/A11; remapped DER.4.A4->DER.1.A18,
+    # SYS.1.5.A4->SYS.1.1.A34; fixed all ORP.4 family tags (were 'OPS'). Intentionally
+    # unmapped (no defensible Grundschutz server requirement): cron_hardening, session_limit,
+    # shell_timeout (idle-lock is client req SYS.2.1), login_banners (no banner req in GS),
+    # pam_tmpdir, apt_show_versions (patch-mgmt = OPS.1.1.3, A-number unconfirmed).
 }
 
 
@@ -987,6 +997,8 @@ REMEDIATION = {
 SEVERITY = {
     # High — direct exposure
     'pam_faillock':       'high',
+    'sshd_hardening':     'high',   # NS: root SSH login policy + MaxAuthTries (#500)
+    'pam_nullok_removal': 'high',   # NS: blocks empty-password PAM auth (#500)
     'ssh_crypto':         'high',
     'ssh_perms':          'high',
     'file_perms':         'high',
@@ -1071,7 +1083,7 @@ FRAMEWORK_META = {
         'revision':     'CMMC Model 2.0, March 2024',
         'source_url':   'https://dodcio.defense.gov/CMMC/',
         'control_count': 17,
-        'note':         'Basic safeguarding requirements for Federal Contract Information (FCI). 17 controls.',
+        'note':         'Basic safeguarding of Federal Contract Information (FCI) — the 15 FAR 52.204-21 requirements, expressed as 17 CMMC practices.',
     },
     'cmmc2': {
         'full_name':    'CMMC Level 2 / NIST SP 800-171',
@@ -1258,7 +1270,7 @@ def evaluate_posture(overall_pct, high_pct):
     if overall_pct is None:
         overall_pct = 0
     if high_pct is None:
-        high_pct = 0
+        high_pct = 100  # no high-severity controls in scope => gate vacuously satisfied (matches dashboard.js)
     for lvl in POSTURE_LEVELS:
         if overall_pct >= lvl['min_overall_pct'] and high_pct >= lvl['min_high_pct']:
             return lvl

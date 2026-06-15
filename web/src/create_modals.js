@@ -341,6 +341,24 @@
                 { value: 'none', label: 'None (headless)' },
             ];
 
+            // machine types — curated short list, newest on top. NS Jun 2026: bumped to QEMU 11.
+            // full historical list lives in backend get_machine_types(); an unknown current value
+            // gets injected into the select below so migrated VMs on e.g. pc-q35-5.1 still show
+            const machineOpts = [
+                { group: 'i440fx', value: 'i440fx', label: 'i440fx (Latest)' },
+                { group: 'i440fx', value: 'pc-i440fx-11.0+pve1', label: 'i440fx 11.0+pve1' },
+                { group: 'i440fx', value: 'pc-i440fx-10.1', label: 'i440fx 10.1' },
+                { group: 'i440fx', value: 'pc-i440fx-9.2+pve1', label: 'i440fx 9.2+pve1' },
+                { group: 'i440fx', value: 'pc-i440fx-8.2', label: 'i440fx 8.2' },
+                { group: 'i440fx', value: 'pc-i440fx-7.2', label: 'i440fx 7.2' },
+                { group: 'q35', value: 'q35', label: 'q35 (Latest)' },
+                { group: 'q35', value: 'pc-q35-11.0+pve1', label: 'q35 11.0+pve1' },
+                { group: 'q35', value: 'pc-q35-10.1', label: 'q35 10.1' },
+                { group: 'q35', value: 'pc-q35-9.2+pve1', label: 'q35 9.2+pve1' },
+                { group: 'q35', value: 'pc-q35-8.2', label: 'q35 8.2' },
+                { group: 'q35', value: 'pc-q35-7.2', label: 'q35 7.2' },
+            ];
+
             const scsiControllers = [
                 { value: 'virtio-scsi-pci', label: 'VirtIO SCSI' },
                 { value: 'virtio-scsi-single', label: 'VirtIO SCSI Single' },
@@ -1145,19 +1163,14 @@
                                             <label className="block text-sm text-gray-400 mb-1">{t('machineType')}</label>
                                             <select value={config.machine} onChange={e => setConfig({...config, machine: e.target.value})}
                                                 className="w-full px-3 py-2 bg-proxmox-dark border border-proxmox-border rounded-lg text-white">
+                                                {config.machine && !machineOpts.some(o => o.value === config.machine) && (
+                                                    <option value={config.machine}>{config.machine}</option>
+                                                )}
                                                 <optgroup label="i440fx (Standard)">
-                                                    <option value="i440fx">i440fx (Latest)</option>
-                                                    <option value="pc-i440fx-10.1">i440fx 10.1</option>
-                                                    <option value="pc-i440fx-9.2+pve1">i440fx 9.2+pve1</option>
-                                                    <option value="pc-i440fx-8.2">i440fx 8.2</option>
-                                                    <option value="pc-i440fx-7.2">i440fx 7.2</option>
+                                                    {machineOpts.filter(o => o.group === 'i440fx').map(o => <option key={o.value} value={o.value}>{o.label}</option>)}
                                                 </optgroup>
                                                 <optgroup label="q35 (Modern, PCIe)">
-                                                    <option value="q35">q35 (Latest)</option>
-                                                    <option value="pc-q35-10.1">q35 10.1</option>
-                                                    <option value="pc-q35-9.2+pve1">q35 9.2+pve1</option>
-                                                    <option value="pc-q35-8.2">q35 8.2</option>
-                                                    <option value="pc-q35-7.2">q35 7.2</option>
+                                                    {machineOpts.filter(o => o.group === 'q35').map(o => <option key={o.value} value={o.value}>{o.label}</option>)}
                                                 </optgroup>
                                             </select>
                                         </div>
