@@ -1043,20 +1043,43 @@ def _run_v2p_migration(task):
                 # --- freeze the base (VM keeps running) ---
                 task.log("Creating clone snapshot (freezes base VMDKs; VM stays up)...")
                 # quiesce=False on purpose — see the snapshot_zero note above (Tools can stall).
-                snap = vmware_mgr.create_snapshot(
-                    task.vm_id, '_pegaprox_clone_snap',
-                    'PegaProx vmkfstools clone - do not delete', memory=False, quiesce=False)
-                if 'error' in snap:
-                    task.set_phase('failed', f'vmkfstools_clone snapshot failed: {snap.get("error")}')
-                    _cleanup_sshfs(pve_mgr, task.target_node, mnt_path)
-                    return
-                time.sleep(3)
-                vsnaps = vmware_mgr.get_snapshots(task.vm_id).get('data', []) or []
-                if not any(s.get('name') == '_pegaprox_clone_snap' for s in vsnaps):
+                # MK Jun 2026 (edge test) — a busy or just-booted guest can make the
+                # CreateSnapshot_Task API call's internal wait time out ("did not appear
+                # within 60s") even though the snapshot actually lands a few seconds later.
+                # Don't hard-fail on the first timeout: poll for the snapshot to really
+                # appear, and retry the create once, before giving up.
+                def _clone_snap_present():
+                    try:
+                        return any(s.get('name') == '_pegaprox_clone_snap'
+                                   for s in (vmware_mgr.get_snapshots(task.vm_id).get('data', []) or []))
+                    except Exception:
+                        return False
+                snap_ok = False
+                for _attempt in range(2):
+                    snap = vmware_mgr.create_snapshot(
+                        task.vm_id, '_pegaprox_clone_snap',
+                        'PegaProx vmkfstools clone - do not delete', memory=False, quiesce=False)
+                    for _ in range(12):  # poll ~60s — task may finish after the call returns
+                        if _clone_snap_present():
+                            snap_ok = True; break
+                        time.sleep(5)
+                    if snap_ok:
+                        break
+                    _serr = snap.get('error') if isinstance(snap, dict) else snap
+                    task.log(f"  Snapshot not confirmed after attempt {_attempt + 1} ({_serr}) — "
+                             f"{'retrying' if _attempt == 0 else 'giving up'}")
+                    # drop any half-created clone snap before retrying (avoid duplicate names)
+                    try:
+                        for s in (vmware_mgr.get_snapshots(task.vm_id).get('data', []) or []):
+                            if s.get('name') == '_pegaprox_clone_snap':
+                                vmware_mgr.delete_snapshot(task.vm_id, str(s.get('snapshot') or s.get('id') or ''))
+                    except Exception:
+                        pass
+                if not snap_ok:
                     task.set_phase('failed',
-                        'Clone snapshot was reported created but is not present on ESXi. '
-                        'Likely VMware Tools unresponsive (reboot the source VM cleanly first) '
-                        'or ESXi rejected it.')
+                        'Clone snapshot could not be created/confirmed on ESXi after 2 attempts. '
+                        'The guest may be too busy (retry when it is idle) or VMware Tools is '
+                        'unresponsive (reboot the source VM cleanly first).')
                     _cleanup_sshfs(pve_mgr, task.target_node, mnt_path)
                     return
                 # register for the outer-except recovery (resumes source + drops the snapshot)
