@@ -1023,7 +1023,7 @@ def _run_v2p_migration(task):
                                      v2p_tmpdir=v2p_tmpdir)
             return
         
-        if task.transfer_mode == 'vmkfstools_clone':
+        if task.transfer_mode in ('vmkfstools_clone', 'auto'):
             # NS Jun 2026 — VDDK-free near-zero-downtime. We snapshot the running VM (freezes the
             # base, writes go to the delta), then vmkfstools-clone the *frozen base* ON the ESXi
             # host. vmkfstools is vmkernel-aware, so it reads the active-chain base extent that a
@@ -1031,7 +1031,14 @@ def _run_v2p_migration(task):
             # rides PegaProx's existing transfer + per-storage import path (CEPH/RBD krbd, LVM,
             # LVM-thin, dir/qcow2) verbatim — so this branch is just the clone front-end + cutover.
             # v1 = single snapshot + short cutover (no iterative CBT delta yet).
-            task.log("=== TRANSFER MODE: vmkfstools_clone (VDDK-free near-zero downtime) ===")
+            # NS Jun 2026 — this is now ALSO the implicit path for transfer_mode='auto' (Nico:
+            # auto should prefer the clone). For 'auto' we fall back to the legacy pre-sync flow
+            # below if the source can't be snapshotted/cloned — raised as _VmkFallback BEFORE any
+            # irreversible PVE-side work. An explicit 'vmkfstools_clone' request hard-fails instead.
+            _vmk_auto = (task.transfer_mode == 'auto')
+            class _VmkFallback(Exception):
+                pass
+            task.log(f"=== TRANSFER MODE: {'Auto -> vmkfstools_clone' if _vmk_auto else 'vmkfstools_clone'} (VDDK-free near-zero downtime) ===")
             clone_bases = []  # basenames to rm on every exit path
 
             def _vc_cleanup_clones():
@@ -1076,6 +1083,12 @@ def _run_v2p_migration(task):
                     except Exception:
                         pass
                 if not snap_ok:
+                    if _vmk_auto:
+                        # auto: clone path isn't viable (can't snapshot) — hand back to the
+                        # legacy pre-sync/live-mirror flow. Leave the SSHFS mount in place (the
+                        # fallback reuses it); nothing irreversible has happened yet.
+                        task.log("  Clone snapshot unavailable — falling back to auto pre-sync")
+                        raise _VmkFallback()
                     task.set_phase('failed',
                         'Clone snapshot could not be created/confirmed on ESXi after 2 attempts. '
                         'The guest may be too busy (retry when it is idle) or VMware Tools is '
@@ -1110,9 +1123,19 @@ def _run_v2p_migration(task):
                     cdesc, cflat = _esxi_vmkfstools_clone(
                         esxi_host, esxi_user, esxi_pass, datastore, vm_dir, desc_file, cb, task=task)
                     if not cdesc:
-                        task.set_phase('failed', f'vmkfstools clone failed for disk {i} ({desc_file})')
                         _vc_cleanup_clones()
                         _esxi_rm_clone(esxi_host, esxi_user, esxi_pass, datastore, vm_dir, cb)
+                        if _vmk_auto and i == 0:
+                            # disk 0 clone failed and nothing has been transferred/attached yet —
+                            # safe to fall back. Drop the snapshot we took, hand to legacy flow.
+                            task.log("  Clone failed on disk 0 — falling back to auto pre-sync")
+                            try:
+                                for s in (vmware_mgr.get_snapshots(task.vm_id).get('data', []) or []):
+                                    if s.get('name') == '_pegaprox_clone_snap':
+                                        vmware_mgr.delete_snapshot(task.vm_id, str(s.get('snapshot') or s.get('id') or ''))
+                            except Exception: pass
+                            raise _VmkFallback()
+                        task.set_phase('failed', f'vmkfstools clone failed for disk {i} ({desc_file})')
                         _cleanup_sshfs(pve_mgr, task.target_node, mnt_path)
                         return
                     clone_bases.append(cb)
@@ -1227,6 +1250,10 @@ def _run_v2p_migration(task):
                 task.log(f"COMPLETED (vmkfstools_clone, downtime ~{actual_downtime:.1f}s): "
                          f"{task.vm_name} -> VMID {task.proxmox_vmid}")
                 return
+            except _VmkFallback:
+                # auto-mode: clone path bailed before any irreversible work — drop through to
+                # the legacy auto pre-sync/live-mirror flow below (do NOT return).
+                pass
             except Exception as _vce:
                 task.set_phase('failed', f'vmkfstools_clone exception: {_vce}')
                 _vc_cleanup_clones()
