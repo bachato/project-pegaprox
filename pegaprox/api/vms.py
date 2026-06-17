@@ -989,10 +989,16 @@ def upload_to_datastore(cluster_id, storage_name):
             # footprint becomes constant in the file size — a 50 GB ISO
             # uses the same RAM as a 5 MB one.
             from requests_toolbelt.multipart.encoder import MultipartEncoder
-            encoder = MultipartEncoder(fields={
-                'filename': (filename, fh, 'application/octet-stream'),
-                'content': content_type,
-            })
+            # MK 2026-06-17 — field ORDER matters here: Proxmox's upload parser needs the
+            # `content` param to arrive BEFORE the file part, otherwise it rejects the whole
+            # request with "content: property is missing and it is not optional". The #525
+            # switch to MultipartEncoder passed a dict with the file field first, which flipped
+            # the order vs the old files=/data= path (data fields came first there) and
+            # regressed *every* ISO/template upload. Use an ordered list, content first.
+            encoder = MultipartEncoder(fields=[
+                ('content', content_type),
+                ('filename', (filename, fh, 'application/octet-stream')),
+            ])
             # NS: use _api_post for auto-reconnect tracking, 1h timeout for large ISOs
             response = manager._api_post(
                 upload_url,
