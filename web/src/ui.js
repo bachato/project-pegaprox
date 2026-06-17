@@ -787,7 +787,8 @@
                 1: 'https://socialfurr.com',
                 2: 'https://www.netwolk.ch',
                 3: 'https://expertize.nl/',  // Banner Oranje - Platinum
-                4: null,
+                4: 'https://netzware.at/',  // Netzware - Platinum
+
                 5: null,
                 6: null,
                 7: null,
