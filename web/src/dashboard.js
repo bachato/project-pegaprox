@@ -13487,7 +13487,7 @@
                                     )}
 
                                     {/* language switcher + settings */}
-                                    <LanguageSwitcher />
+                                    {!isCorporate && <LanguageSwitcher />}
 
                                     {/* MK May 2026 — push notifications bell */}
                                     {!isCorporate && (

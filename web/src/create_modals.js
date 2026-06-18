@@ -3024,6 +3024,22 @@
                                         </div>
                                     </div>
                                     
+                                    {/* NS Jun 2026 — language moved from corporate header into profile prefs */}
+                                    {isCorporate && (
+                                        <div className="pt-4 border-t border-proxmox-border">
+                                            <div className="flex items-center justify-between">
+                                                <div className="flex items-center gap-3">
+                                                    <Icons.Globe className="w-5 h-5 text-gray-400" />
+                                                    <div>
+                                                        <p className="text-sm font-medium text-white">{t('languagePreference')}</p>
+                                                        <p className="text-xs text-gray-500">{t('languagePreferenceDesc')}</p>
+                                                    </div>
+                                                </div>
+                                                <LanguageSwitcher />
+                                            </div>
+                                        </div>
+                                    )}
+
                                     {/* NS: 24h/12h time format toggle (#215) */}
                                     <div className="pt-4 border-t border-proxmox-border">
                                         <div className="flex items-center justify-between">

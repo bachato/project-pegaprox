@@ -22,6 +22,7 @@
             const [showAddStorage, setShowAddStorage] = useState(false);
             const [subscriptions, setSubscriptions] = useState([]);
             const [subscriptionsLoading, setSubscriptionsLoading] = useState(false);
+            const [subscriptionsExporting, setSubscriptionsExporting] = useState(false);
             const [subscriptionKeys, setSubscriptionKeys] = useState({});
             const [subscriptionBusy, setSubscriptionBusy] = useState({});
             
@@ -552,6 +553,48 @@
 
             const setSubscriptionBusyForNode = (node, busy) => {
                 setSubscriptionBusy(prev => ({ ...prev, [node]: busy }));
+            };
+
+            const exportSubscriptionsCsv = async () => {
+                setSubscriptionsExporting(true);
+                try {
+                    const res = await authFetch(`${API_URL}/clusters/${clusterId}/datacenter/subscriptions`);
+                    if (!res?.ok) {
+                        const err = await res?.json().catch(() => ({}));
+                        addToast(err?.error || 'Failed to export subscriptions', 'error');
+                        return;
+                    }
+
+                    const data = await res.json();
+                    const rows = Array.isArray(data) ? data : [];
+                    if (!rows.length) {
+                        addToast('No subscription data available', 'info');
+                        return;
+                    }
+
+                    setSubscriptions(rows);
+                    const clusterName = dcStatus?.cluster?.name || clusterId || '';
+                    const columns = [
+                        { key: 'id', label: 'id', map: () => '' },
+                        { key: 'valid_server_id', label: 'valid_server_id', map: r => r.serverid || '' },
+                        { key: 'socket', label: 'socket', map: r => r.sockets ?? '' },
+                        { key: 'hostname', label: 'hostname', map: r => r.node || r.hostname || '' },
+                        { key: 'clustername', label: 'clustername', map: () => clusterName },
+                        { key: 'expiration_date', label: 'expiration_date', map: r => r.nextduedate || '' },
+                        { key: 'registration_date', label: 'registration_date', map: r => r.regdate || '' },
+                        { key: 'partner/id', label: 'partner/id', map: () => '' },
+                        { key: 'sale_subscription/id', label: 'sale_subscription/id', map: () => '' },
+                        { key: 'sale_order/id', label: 'sale_order/id', map: () => '' },
+                    ];
+                    const filename = `pegaprox-${clusterName || 'cluster'}-subscriptions-${new Date().toISOString().slice(0, 10)}.csv`;
+                    window.PegaProxDownloadCsv?.(filename, rows, columns);
+                    addToast(`Exported ${rows.length} subscription rows`, 'success');
+                } catch (e) {
+                    console.error('Error exporting subscriptions:', e);
+                    addToast('Failed to export subscriptions', 'error');
+                } finally {
+                    setSubscriptionsExporting(false);
+                }
             };
 
             const saveSubscriptionKey = async (node) => {
@@ -6477,13 +6520,24 @@
                                             <Icons.FileKey />
                                             {t('subscriptions') || 'Subscriptions'}
                                         </h3>
-                                        <button
-                                            onClick={loadSubscriptions}
-                                            className="flex items-center gap-2 px-3 py-1.5 bg-proxmox-dark hover:bg-proxmox-border rounded-lg text-sm transition-colors"
-                                        >
-                                            <Icons.RefreshCw className={`w-4 h-4 ${subscriptionsLoading ? 'animate-spin' : ''}`} />
-                                            {t('refresh') || 'Refresh'}
-                                        </button>
+                                        <div className="flex items-center gap-2">
+                                            <button
+                                                onClick={exportSubscriptionsCsv}
+                                                disabled={subscriptionsExporting}
+                                                className="flex items-center gap-2 px-3 py-1.5 bg-proxmox-dark hover:bg-proxmox-border disabled:opacity-50 rounded-lg text-sm transition-colors"
+                                                title={t('exportCsv') || 'Export CSV'}
+                                            >
+                                                <Icons.Download className="w-4 h-4" />
+                                                {subscriptionsExporting ? (t('exporting') || 'Exporting...') : (t('export') || 'Export')}
+                                            </button>
+                                            <button
+                                                onClick={loadSubscriptions}
+                                                className="flex items-center gap-2 px-3 py-1.5 bg-proxmox-dark hover:bg-proxmox-border rounded-lg text-sm transition-colors"
+                                            >
+                                                <Icons.RefreshCw className={`w-4 h-4 ${subscriptionsLoading ? 'animate-spin' : ''}`} />
+                                                {t('refresh') || 'Refresh'}
+                                            </button>
+                                        </div>
                                     </div>
                                     <div className="overflow-x-auto">
                                         <table className="w-full">

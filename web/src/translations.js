@@ -277,6 +277,8 @@
                 lastLogin: 'Letzte Anmeldung',
                 never: 'Nie',
                 profile: 'Profil',
+                languagePreference: 'Sprache',
+                languagePreferenceDesc: 'Sprache für Oberfläche und Menüs',
 
                 // PegaProx Settings
                 pegaproxSettings: 'PegaProx Einstellungen',
@@ -4468,6 +4470,8 @@
                 lastLogin: 'Last Login',
                 never: 'Never',
                 profile: 'Profile',
+                languagePreference: 'Language',
+                languagePreferenceDesc: 'Language for the interface and menus',
 
                 // PegaProx Settings
                 pegaproxSettings: 'PegaProx Settings',
