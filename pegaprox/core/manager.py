@@ -2205,7 +2205,7 @@ class PegaProxManager:
             self.logger.info(f"[AFFINITY] Completed {migrations} affinity enforcement migration(s)")
         return migrations
 
-    def find_migration_candidate(self, source_node: str, target_node: str, exclude_vmids: list = None, include_containers: bool = None) -> Optional[Dict]:
+    def find_migration_candidate(self, source_node: str, target_node: str, exclude_vmids: list = None, include_containers: bool = None, node_status: dict = None) -> Optional[Dict]:
         """
         Find the best VM to migrate from source to target node.
         
@@ -2436,6 +2436,17 @@ class PegaProxManager:
                 continue
             if cpu_compat.get('warning'):
                 self.logger.warning(f"[CPU] {candidate.get('name', 'unnamed')}: {cpu_compat['warning']}")
+
+            # MK Jun 2026 — overprovisioning gate: don't pick a target that can't fit the
+            # VM's RAM. Only enforced when the caller hands us node_status (balancer +
+            # recommendation planner do); other callers keep the old behaviour.
+            if node_status and target_node in node_status:
+                tn = node_status[target_node]
+                free_mem = (tn.get('mem_total') or 0) - (tn.get('mem_used') or 0)
+                vm_mem = candidate.get('mem', 0) or 0
+                if free_mem > 0 and vm_mem > free_mem:
+                    self.logger.info(f"Skipping {candidate.get('name', 'unnamed')} (VMID {candidate.get('vmid')}) - target {target_node} can't fit it ({self._format_bytes(free_mem)} free < {self._format_bytes(vm_mem)} needed)")
+                    continue
 
             selected = candidate
             break
@@ -14006,7 +14017,7 @@ echo "AGENT_INSTALLED_OK"
                     break
                 
                 # MK: Find migration candidate, excluding already migrated VMs
-                vm = self.find_migration_candidate(source_node, target_node, exclude_vmids=already_migrated_vmids)
+                vm = self.find_migration_candidate(source_node, target_node, exclude_vmids=already_migrated_vmids, node_status=node_status)
                 
                 if vm:
                     vmid = vm.get('vmid')
@@ -14076,7 +14087,80 @@ echo "AGENT_INSTALLED_OK"
 
         except Exception as e:
             self.logger.error(f"Error in balance check: {e}")
-    
+
+    def compute_balance_plan(self, max_recs=None):
+        """Dry-run the balancer: return the migrations it WOULD recommend, each with
+        an improvement estimate + priority, WITHOUT executing anything. Reuses the
+        same scoring + candidate engine as run_balance_check; simulates each move so
+        a multi-step plan doesn't keep recommending the same source.
+        NS Jun 2026 — backs the Load Balancing recommendation queue."""
+        node_status = self.get_node_status()
+        if not node_status:
+            return []
+        config_excluded = getattr(self.config, 'excluded_nodes', []) or []
+        active = sum(1 for n, d in node_status.items()
+                     if d.get('status') == 'online' and not d.get('maintenance_mode') and n not in config_excluded)
+        if max_recs is None:
+            max_recs = 3 if active >= 7 else (2 if active >= 4 else 1)
+        threshold = self.config.migration_threshold + (getattr(self.config, 'migration_tolerance', 10) or 0)
+        sim = {n: dict(d) for n, d in node_status.items()}  # mutable copy of scores
+        recs, picked = [], []
+        for _ in range(max_recs):
+            needs, source, target = self.check_balance_needed(sim)
+            if not needs:
+                break
+            gap = sim[source]['score'] - sim[target]['score']
+            vm = self.find_migration_candidate(source, target, exclude_vmids=picked, node_status=sim)
+            if not vm:
+                break
+            src_total = sim[source].get('mem_total') or 0
+            vm_mem = vm.get('mem', 0) or 0
+            load = round((vm_mem / src_total * 100) if src_total else 0, 1)  # mem-share ~ score points shifted
+            recs.append({
+                'vmid': vm.get('vmid'), 'vm_type': vm.get('type', 'qemu'), 'vm_name': vm.get('name', '') or str(vm.get('vmid')),
+                'source_node': source, 'target_node': target,
+                'score_gap': round(gap, 1),
+                'improvement': round(min(gap, load * 2), 1),
+                'priority': 'high' if gap > threshold * 1.5 else 'medium',
+                'reason': f"{source} score {sim[source]['score']:.0f} vs {target} {sim[target]['score']:.0f} (gap {gap:.0f} > {threshold:.0f})",
+                '_vm': vm,
+            })
+            picked.append(vm.get('vmid'))
+            sim[source]['score'] = round(sim[source]['score'] - load, 2)  # simulate the move
+            sim[target]['score'] = round(sim[target]['score'] + load, 2)
+        return recs
+
+    def _run_balance_recommendations(self, mode):
+        """manual / partial balance modes: compute recommendations and persist them
+        as a pending queue instead of migrating blindly. 'partial' auto-executes only
+        the high-improvement ones; the rest wait for operator approval."""
+        try:
+            recs = self.compute_balance_plan()
+        except Exception as e:
+            self.logger.error(f"[BAL] recommendation compute failed: {e}")
+            return
+        executed = set()
+        if mode == 'partial' and recs and not self.config.dry_run:
+            thr = getattr(self.config, 'partial_auto_threshold', 25) or 25
+            for r in recs:
+                if r['improvement'] >= thr:
+                    try:
+                        if self.migrate_vm(r['_vm'], r['target_node']):
+                            self._vm_migration_cooldown[r['vmid']] = time.time()
+                            executed.add(r['vmid'])
+                            self.logger.info(f"[BAL] partial-auto migrated VMID {r['vmid']} (improvement {r['improvement']} >= {thr})")
+                    except Exception as me:
+                        self.logger.warning(f"[BAL] partial-auto migrate of {r['vmid']} failed: {me}")
+        try:
+            from pegaprox.core.db import get_db
+            get_db().replace_balance_recommendations(self.id, [
+                {k: v for k, v in r.items() if k != '_vm'} | {'status': 'executed' if r['vmid'] in executed else 'pending'}
+                for r in recs
+            ])
+        except Exception as e:
+            self.logger.error(f"[BAL] persisting recommendations failed: {e}")
+        self.logger.info(f"[BAL] mode={mode}: {len(recs)} recommendation(s), {len(executed)} auto-executed")
+
     def daemon_loop(self):
         """Main daemon loop"""
         self.logger.info(f"PegaProx daemon started for cluster: {self.config.name}")
@@ -14095,8 +14179,15 @@ echo "AGENT_INSTALLED_OK"
                         self.logger.info("Reconnected successfully")
                     else:
                         self.logger.error("Reconnect failed, will retry next cycle")
-                
-                self.run_balance_check()
+
+                # NS Jun 2026 — balance_mode gates how the periodic check acts.
+                # unset/'auto' = legacy (run_balance_check, auto_migrate-gated);
+                # 'manual'/'partial' = build a reviewable recommendation queue.
+                _bmode = (getattr(self.config, 'balance_mode', '') or 'auto').strip().lower()
+                if _bmode in ('manual', 'partial'):
+                    self._run_balance_recommendations(_bmode)
+                else:
+                    self.run_balance_check()
             else:
                 # LW: Even when disabled, still verify connection for UI status
                 # Just less frequently - only every 5th cycle

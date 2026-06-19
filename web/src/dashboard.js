@@ -2,6 +2,100 @@
         // PegaProx - Dashboard & App
         // TaskBar, Dashboard, App component, ReactDOM.render
         // ═══════════════════════════════════════════════
+
+        // NS Jun 2026 — Load Balancing recommendation queue (manual/partial modes).
+        // Self-fetching panel: balancing mode selector + the pending-migration queue
+        // with approve / approve-all / dismiss / recompute. The balancer's engine
+        // generates these; nothing moves until an operator approves (or partial-auto).
+        function LbRecommendations({ clusterId, connected, mode, partialThreshold, isCorporate, addToast, onModeChange, onThresholdChange }) {
+            const { t } = useTranslation();
+            const [recs, setRecs] = useState([]);
+            const [busy, setBusy] = useState(false);
+            const load = React.useCallback(() => {
+                if (!clusterId) return;
+                authFetch(`${API_URL}/clusters/${clusterId}/balance/recommendations`)
+                    .then(r => (r && r.ok ? r.json() : null))
+                    .then(d => { if (d && Array.isArray(d.recommendations)) setRecs(d.recommendations); })
+                    .catch(() => {});
+            }, [clusterId]);
+            useEffect(() => { load(); }, [load]);
+            const pending = recs.filter(r => r.status === 'pending');
+            const post = async (path, okMsg) => {
+                setBusy(true);
+                try {
+                    const r = await authFetch(`${API_URL}${path}`, { method: 'POST' });
+                    const d = r ? await r.json().catch(() => ({})) : {};
+                    if (r && r.ok) { if (addToast) addToast(okMsg, 'success'); }
+                    else if (addToast) addToast((d && d.error) || (t('failed') || 'Failed'), 'error');
+                } catch (e) { if (addToast) addToast(t('failed') || 'Failed', 'error'); }
+                setBusy(false);
+                setTimeout(load, 700);
+            };
+            const prioColor = p => p === 'high' ? '#e0563f' : (p === 'medium' ? '#d9a441' : '#728b9a');
+            const modes = [['auto', t('lbModeAuto') || 'Automatic'], ['manual', t('lbModeManual') || 'Manual'], ['partial', t('lbModePartial') || 'Partial']];
+            const box = isCorporate ? 'border border-proxmox-border p-4 space-y-3' : 'bg-proxmox-card border border-proxmox-border rounded-xl p-5 space-y-3';
+            return (
+                <div className={box}>
+                    <div className="flex items-center justify-between">
+                        <h3 className={isCorporate ? 'font-semibold text-sm' : 'font-semibold'}>{t('lbRecommendations') || 'Load Balancing Recommendations'}</h3>
+                        <button onClick={() => post(`/clusters/${clusterId}/balance/recommendations/recompute`, t('lbRecsComputed') || 'Recommendations computed')}
+                            disabled={busy || !connected}
+                            className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded-lg bg-proxmox-orange/20 text-proxmox-orange hover:bg-proxmox-orange/30 disabled:opacity-40 transition-colors">
+                            <Icons.RefreshCw className="w-3.5 h-3.5" />{t('lbRecompute') || 'Recompute'}
+                        </button>
+                    </div>
+                    <div>
+                        <div className="text-xs text-gray-400 mb-1.5">{t('lbMode') || 'Balancing mode'}</div>
+                        <div className="flex gap-2">
+                            {modes.map(([id, label]) => (
+                                <button key={id} onClick={() => onModeChange && onModeChange(id)}
+                                    className={`px-3 py-1.5 text-xs rounded-lg border transition-colors ${mode === id ? 'bg-proxmox-orange/20 text-proxmox-orange border-proxmox-orange/40' : 'border-proxmox-border text-gray-400 hover:text-gray-200'}`}>
+                                    {label}
+                                </button>
+                            ))}
+                        </div>
+                        <div className="text-xs text-gray-500 mt-1.5">{t('lbModeDesc') || 'Auto migrates immediately; Manual queues recommendations for approval; Partial auto-runs only high-improvement moves.'}</div>
+                    </div>
+                    {pending.length === 0 ? (
+                        <div className="text-xs text-gray-500 py-3 text-center">{t('lbNoRecs') || 'No pending recommendations — cluster looks balanced.'}</div>
+                    ) : (
+                        <div className="space-y-2">
+                            <div className="flex items-center justify-between">
+                                <span className="text-xs text-gray-400">{pending.length} {t('lbPending') || 'pending'}</span>
+                                <button onClick={() => post(`/clusters/${clusterId}/balance/recommendations/approve-all`, t('lbApprovedAll') || 'All recommendations approved')}
+                                    disabled={busy || !connected}
+                                    className="text-xs px-2.5 py-1 rounded-lg bg-green-500/15 text-green-400 hover:bg-green-500/25 disabled:opacity-40">
+                                    {t('lbApproveAll') || 'Approve all'}
+                                </button>
+                            </div>
+                            {pending.map(r => (
+                                <div key={r.id} className="flex items-center justify-between gap-2 p-2.5 rounded-lg border border-proxmox-border bg-black/10">
+                                    <div className="min-w-0">
+                                        <div className="text-sm truncate">{r.vm_name || ('VMID ' + r.vmid)} <span className="text-gray-500">#{r.vmid}</span></div>
+                                        <div className="text-xs text-gray-400">{r.source_node} → {r.target_node} · <span style={{color: prioColor(r.priority)}}>{t('lbImprovement') || 'improvement'} {r.improvement}</span></div>
+                                    </div>
+                                    <div className="flex gap-1.5 shrink-0">
+                                        <button onClick={() => post(`/clusters/${clusterId}/balance/recommendations/${r.id}/approve`, t('lbApproved') || 'Migration approved')}
+                                            disabled={busy || !connected}
+                                            className="px-2.5 py-1 text-xs rounded-lg bg-green-500/15 text-green-400 hover:bg-green-500/25 disabled:opacity-40">{t('lbApprove') || 'Approve'}</button>
+                                        <button onClick={() => post(`/clusters/${clusterId}/balance/recommendations/${r.id}/dismiss`, t('lbDismissed') || 'Dismissed')}
+                                            disabled={busy}
+                                            className="px-2.5 py-1 text-xs rounded-lg border border-proxmox-border text-gray-400 hover:text-gray-200 disabled:opacity-40">{t('lbDismiss') || 'Dismiss'}</button>
+                                    </div>
+                                </div>
+                            ))}
+                        </div>
+                    )}
+                    {mode === 'partial' && (
+                        <div className="pt-1">
+                            <Slider label={t('lbPartialThreshold') || 'Partial auto-run threshold'} description={t('lbPartialThresholdDesc') || 'Auto-execute recommendations with improvement at or above this; queue the rest for approval.'}
+                                value={partialThreshold || 25} onChange={v => onThresholdChange && onThresholdChange(v)} min={5} max={100} />
+                        </div>
+                    )}
+                </div>
+            );
+        }
+
         // Task Bar Component with Task Viewer
         function TaskBar({ tasks, onClear, onClose, onCancel, onRefresh, clusterId, autoExpandEnabled = true }) {
             const { t } = useTranslation();
@@ -17527,6 +17621,20 @@
                                                             onChange={v => updateConfig('dry_run', v)}
                                                             label={t('dryRun')}
                                                         />
+
+                                                        {/* NS Jun 2026 — balancing mode + recommendation queue */}
+                                                        <div className="pt-3 border-t border-gray-700/50">
+                                                            <LbRecommendations
+                                                                clusterId={selectedCluster.id}
+                                                                connected={selectedCluster.connected}
+                                                                mode={selectedCluster.balance_mode || 'auto'}
+                                                                partialThreshold={selectedCluster.partial_auto_threshold}
+                                                                isCorporate={isCorporate}
+                                                                addToast={addToast}
+                                                                onModeChange={v => updateConfig('balance_mode', v)}
+                                                                onThresholdChange={v => updateConfig('partial_auto_threshold', v)}
+                                                            />
+                                                        </div>
                                                         
                                                         {/* Container Balancing */}
                                                         <div className="pt-3 border-t border-gray-700/50">

@@ -118,6 +118,8 @@ def get_clusters():
                 'migration_tolerance': getattr(mgr.config, 'migration_tolerance', 10),
                 'check_interval': mgr.config.check_interval,
                 'auto_migrate': mgr.config.auto_migrate,
+                'balance_mode': getattr(mgr.config, 'balance_mode', 'auto'),
+                'partial_auto_threshold': getattr(mgr.config, 'partial_auto_threshold', 25),
                 'balance_containers': getattr(mgr.config, 'balance_containers', False),
                 'balance_local_disks': getattr(mgr.config, 'balance_local_disks', False),
                 'dry_run': mgr.config.dry_run,
@@ -222,6 +224,8 @@ def export_cluster_config(cluster_id):
         'migration_tolerance': getattr(c, 'migration_tolerance', 10),
         'check_interval': c.check_interval,
         'auto_migrate': c.auto_migrate,
+        'balance_mode': getattr(c, 'balance_mode', 'auto'),
+        'partial_auto_threshold': getattr(c, 'partial_auto_threshold', 25),
         'balance_containers': getattr(c, 'balance_containers', False),
         'balance_local_disks': getattr(c, 'balance_local_disks', False),
         'dry_run': c.dry_run,
@@ -1046,6 +1050,7 @@ def get_cluster_resources(cluster_id):
 ALLOWED_CONFIG_FIELDS = {
     'name', 'host', 'user', 'ssl_verification', 'migration_threshold', 'migration_tolerance',
     'check_interval', 'auto_migrate', 'balance_containers', 'balance_local_disks',
+    'balance_mode', 'partial_auto_threshold',
     'dry_run', 'enabled', 'ha_enabled', 'fallback_hosts', 'ssh_user', 'ssh_port',
     'ha_settings', 'excluded_nodes',
     'predictive_balancing', 'predictive_threshold',
@@ -2426,3 +2431,144 @@ def trigger_balance_now(cluster_id):
     log_audit(usr, 'balance.manual', f"Manual balance check triggered for {mgr.config.name}", cluster=mgr.config.name)
 
     return jsonify({'message': 'Balance check started'})
+
+
+# ── NS Jun 2026 — Load Balancing recommendation queue (manual / partial modes) ──
+def _find_vm_for_rec(mgr, rec):
+    try:
+        for vm in (mgr.get_vm_resources() or []):
+            if str(vm.get('vmid')) == str(rec.get('vmid')) and vm.get('type') in ('qemu', 'lxc'):
+                return vm
+    except Exception:
+        pass
+    return None
+
+
+def _execute_recommendation_async(mgr, rec_id):
+    import time, logging
+    from pegaprox.core.db import get_db
+    db = get_db()
+    rec = db.get_balance_recommendation(rec_id)
+    if not rec:
+        return
+    vm = _find_vm_for_rec(mgr, rec)
+    if not vm:
+        db.update_balance_recommendation(rec_id, 'failed')
+        return
+    # stale rec — the VM already left the source (moved/HA); treat as done, don't re-move
+    if vm.get('node') == rec.get('target_node'):
+        db.update_balance_recommendation(rec_id, 'executed')
+        return
+    try:
+        ok = mgr.migrate_vm(vm, rec.get('target_node'))
+        db.update_balance_recommendation(rec_id, 'executed' if ok else 'failed')
+        if ok:
+            mgr._vm_migration_cooldown[vm.get('vmid')] = time.time()
+    except Exception as e:
+        logging.warning(f"[BAL] recommendation {rec_id} migration failed: {e}")
+        db.update_balance_recommendation(rec_id, 'failed')
+
+
+@bp.route('/api/clusters/<cluster_id>/balance/recommendations', methods=['GET'])
+@require_auth()
+def list_balance_recommendations(cluster_id):
+    ok, err = check_cluster_access(cluster_id)
+    if not ok: return err
+    mgr = cluster_managers.get(cluster_id)
+    if not mgr:
+        return jsonify({'error': 'Cluster not found'}), 404
+    from pegaprox.core.db import get_db
+    return jsonify({
+        'mode': getattr(mgr.config, 'balance_mode', 'auto'),
+        'partial_auto_threshold': getattr(mgr.config, 'partial_auto_threshold', 25),
+        'recommendations': get_db().get_balance_recommendations(cluster_id),
+    })
+
+
+@bp.route('/api/clusters/<cluster_id>/balance/recommendations/recompute', methods=['POST'])
+@require_auth(perms=['cluster.config'])
+def recompute_balance_recommendations(cluster_id):
+    ok, err = check_cluster_access(cluster_id)
+    if not ok: return err
+    mgr = cluster_managers.get(cluster_id)
+    if not mgr:
+        return jsonify({'error': 'Cluster not found'}), 404
+    if not mgr.is_connected:
+        return jsonify({'error': 'Cluster not connected'}), 503
+    try:
+        recs = mgr.compute_balance_plan()
+        from pegaprox.core.db import get_db
+        get_db().replace_balance_recommendations(cluster_id, [
+            {k: v for k, v in r.items() if k != '_vm'} | {'status': 'pending'} for r in recs
+        ])
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+    usr = getattr(request, 'session', {}).get('user', 'system')
+    log_audit(usr, 'balance.plan', f"Computed {len(recs)} load-balancing recommendation(s) for {mgr.config.name}", cluster=mgr.config.name)
+    return jsonify({'success': True, 'count': len(recs)})
+
+
+@bp.route('/api/clusters/<cluster_id>/balance/recommendations/<rec_id>/approve', methods=['POST'])
+@require_auth(perms=['cluster.config'])
+def approve_balance_recommendation(cluster_id, rec_id):
+    ok, err = check_cluster_access(cluster_id)
+    if not ok: return err
+    mgr = cluster_managers.get(cluster_id)
+    if not mgr:
+        return jsonify({'error': 'Cluster not found'}), 404
+    if not mgr.is_connected:
+        return jsonify({'error': 'Cluster not connected'}), 503
+    from pegaprox.core.db import get_db
+    db = get_db()
+    rec = db.get_balance_recommendation(rec_id)
+    if not rec or rec.get('cluster_id') != cluster_id:
+        return jsonify({'error': 'Recommendation not found'}), 404
+    if rec.get('status') != 'pending':
+        return jsonify({'error': 'Recommendation is not pending'}), 409
+    usr = getattr(request, 'session', {}).get('user', 'system')
+    db.update_balance_recommendation(rec_id, 'approved', usr)
+    import gevent
+    gevent.spawn(_execute_recommendation_async, mgr, rec_id)
+    log_audit(usr, 'balance.approve', f"Approved migration VMID {rec.get('vmid')} {rec.get('source_node')}->{rec.get('target_node')}", cluster=mgr.config.name)
+    return jsonify({'success': True})
+
+
+@bp.route('/api/clusters/<cluster_id>/balance/recommendations/approve-all', methods=['POST'])
+@require_auth(perms=['cluster.config'])
+def approve_all_balance_recommendations(cluster_id):
+    ok, err = check_cluster_access(cluster_id)
+    if not ok: return err
+    mgr = cluster_managers.get(cluster_id)
+    if not mgr:
+        return jsonify({'error': 'Cluster not found'}), 404
+    if not mgr.is_connected:
+        return jsonify({'error': 'Cluster not connected'}), 503
+    from pegaprox.core.db import get_db
+    db = get_db()
+    usr = getattr(request, 'session', {}).get('user', 'system')
+    import gevent
+    n = 0
+    for rec in db.get_balance_recommendations(cluster_id, status='pending'):
+        db.update_balance_recommendation(rec['id'], 'approved', usr)
+        gevent.spawn(_execute_recommendation_async, mgr, rec['id'])
+        n += 1
+    if n:
+        log_audit(usr, 'balance.approve', f"Approved all {n} load-balancing recommendation(s) for {mgr.config.name}", cluster=mgr.config.name)
+    return jsonify({'success': True, 'count': n})
+
+
+@bp.route('/api/clusters/<cluster_id>/balance/recommendations/<rec_id>/dismiss', methods=['POST'])
+@require_auth(perms=['cluster.config'])
+def dismiss_balance_recommendation(cluster_id, rec_id):
+    ok, err = check_cluster_access(cluster_id)
+    if not ok: return err
+    mgr = cluster_managers.get(cluster_id)
+    if not mgr:
+        return jsonify({'error': 'Cluster not found'}), 404
+    from pegaprox.core.db import get_db
+    db = get_db()
+    rec = db.get_balance_recommendation(rec_id)
+    if not rec or rec.get('cluster_id') != cluster_id:
+        return jsonify({'error': 'Recommendation not found'}), 404
+    db.update_balance_recommendation(rec_id, 'dismissed', getattr(request, 'session', {}).get('user', 'system'))
+    return jsonify({'success': True})

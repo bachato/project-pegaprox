@@ -1240,6 +1240,32 @@ class PegaProxDB:
         except Exception:
             pass
 
+        # NS Jun 2026 — load-balancing recommendation queue (manual/partial modes)
+        try:
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS balance_recommendations (
+                    id TEXT PRIMARY KEY,
+                    cluster_id TEXT NOT NULL,
+                    vmid INTEGER NOT NULL,
+                    vm_type TEXT DEFAULT 'qemu',
+                    vm_name TEXT DEFAULT '',
+                    source_node TEXT NOT NULL,
+                    target_node TEXT NOT NULL,
+                    score_gap REAL DEFAULT 0,
+                    improvement REAL DEFAULT 0,
+                    priority TEXT DEFAULT 'medium',
+                    reason TEXT DEFAULT '',
+                    status TEXT DEFAULT 'pending',
+                    created_at TEXT,
+                    decided_at TEXT,
+                    decided_by TEXT DEFAULT ''
+                )
+            ''')
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_balrec_cluster_status ON balance_recommendations(cluster_id, status)")
+            logging.info("Ensured balance_recommendations table exists")
+        except Exception as e:
+            logging.error(f"Error creating balance_recommendations table: {e}")
+
         # NS: Feb 2026 - Space-efficient LVM COW snapshots managed by PegaProx
         try:
             cursor.execute('''
@@ -4190,6 +4216,53 @@ class PegaProxDB:
             'UPDATE efficient_snapshots SET status = ?, error_message = ?, updated_at = ? WHERE id = ?',
             (status, error_message, now, snap_id)
         )
+        self.conn.commit()
+
+    # ── Load-balancing recommendation queue (NS Jun 2026) ──
+    def replace_balance_recommendations(self, cluster_id: str, recs: list):
+        """Swap this cluster's PENDING recs for a fresh set (a new plan supersedes the
+        old pending one). Keeps already-executed/dismissed rows for short history."""
+        cursor = self.conn.cursor()
+        now = datetime.now().isoformat()
+        cursor.execute("DELETE FROM balance_recommendations WHERE cluster_id = ? AND status = 'pending'", (cluster_id,))
+        for r in (recs or []):
+            cursor.execute(
+                '''INSERT INTO balance_recommendations
+                   (id, cluster_id, vmid, vm_type, vm_name, source_node, target_node,
+                    score_gap, improvement, priority, reason, status, created_at)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)''',
+                (str(uuid.uuid4())[:12], cluster_id, r.get('vmid'), r.get('vm_type', 'qemu'),
+                 r.get('vm_name', ''), r.get('source_node'), r.get('target_node'),
+                 r.get('score_gap', 0), r.get('improvement', 0), r.get('priority', 'medium'),
+                 r.get('reason', ''), r.get('status', 'pending'), now)
+            )
+        # prune decided rows older than 7 days so history doesn't grow forever
+        cursor.execute("DELETE FROM balance_recommendations WHERE status != 'pending' AND created_at < ?",
+                       ((datetime.now() - timedelta(days=7)).isoformat(),))
+        self.conn.commit()
+
+    def get_balance_recommendations(self, cluster_id: str, status: str = None) -> list:
+        cursor = self.conn.cursor()
+        cursor.row_factory = dbcrypto.Row
+        if status:
+            cursor.execute('SELECT * FROM balance_recommendations WHERE cluster_id = ? AND status = ? ORDER BY improvement DESC, created_at DESC',
+                           (cluster_id, status))
+        else:
+            cursor.execute('SELECT * FROM balance_recommendations WHERE cluster_id = ? ORDER BY status = "pending" DESC, created_at DESC',
+                           (cluster_id,))
+        return [dict(row) for row in cursor.fetchall()]
+
+    def get_balance_recommendation(self, rec_id: str) -> dict:
+        cursor = self.conn.cursor()
+        cursor.row_factory = dbcrypto.Row
+        cursor.execute('SELECT * FROM balance_recommendations WHERE id = ?', (rec_id,))
+        row = cursor.fetchone()
+        return dict(row) if row else None
+
+    def update_balance_recommendation(self, rec_id: str, status: str, decided_by: str = ''):
+        cursor = self.conn.cursor()
+        cursor.execute('UPDATE balance_recommendations SET status = ?, decided_at = ?, decided_by = ? WHERE id = ?',
+                       (status, datetime.now().isoformat(), decided_by, rec_id))
         self.conn.commit()
 
     def update_efficient_snapshot_disks(self, snap_id: str, disks: list, total_snap_alloc_gb: float = None):
