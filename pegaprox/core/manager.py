@@ -2205,7 +2205,7 @@ class PegaProxManager:
             self.logger.info(f"[AFFINITY] Completed {migrations} affinity enforcement migration(s)")
         return migrations
 
-    def find_migration_candidate(self, source_node: str, target_node: str, exclude_vmids: list = None, include_containers: bool = None) -> Optional[Dict]:
+    def find_migration_candidate(self, source_node: str, target_node: str, exclude_vmids: list = None, include_containers: bool = None, node_status: dict = None) -> Optional[Dict]:
         """
         Find the best VM to migrate from source to target node.
         
@@ -2436,6 +2436,18 @@ class PegaProxManager:
                 continue
             if cpu_compat.get('warning'):
                 self.logger.warning(f"[CPU] {candidate.get('name', 'unnamed')}: {cpu_compat['warning']}")
+
+            # MK Jun 2026 — overprovisioning gate: don't pick a target that can't fit the
+            # VM's RAM. Only enforced when the caller passes node_status (the balancer
+            # does); other callers keep the old behaviour. No existing balance var
+            # hard-checks target capacity, so this closes a real over-commit hole.
+            if node_status and target_node in node_status:
+                tn = node_status[target_node]
+                free_mem = (tn.get('mem_total') or 0) - (tn.get('mem_used') or 0)
+                vm_mem = candidate.get('mem', 0) or 0
+                if free_mem > 0 and vm_mem > free_mem:
+                    self.logger.info(f"Skipping {candidate.get('name', 'unnamed')} (VMID {candidate.get('vmid')}) - target {target_node} can't fit it ({self._format_bytes(free_mem)} free < {self._format_bytes(vm_mem)} needed)")
+                    continue
 
             selected = candidate
             break
@@ -14006,7 +14018,7 @@ echo "AGENT_INSTALLED_OK"
                     break
                 
                 # MK: Find migration candidate, excluding already migrated VMs
-                vm = self.find_migration_candidate(source_node, target_node, exclude_vmids=already_migrated_vmids)
+                vm = self.find_migration_candidate(source_node, target_node, exclude_vmids=already_migrated_vmids, node_status=node_status)
                 
                 if vm:
                     vmid = vm.get('vmid')
