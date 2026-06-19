@@ -93,12 +93,6 @@ class PegaProxConfig:
         self.auto_migrate = cluster_data.get('auto_migrate', False)
         self.balance_containers = cluster_data.get('balance_containers', False)
         self.balance_local_disks = cluster_data.get('balance_local_disks', False)
-        # NS Jun 2026 — load-balancing mode: 'auto' (legacy, auto_migrate-gated),
-        # 'manual' (recommendation queue only) or 'partial' (auto-run only the
-        # high-improvement recs, queue the rest). partial_auto_threshold = improvement
-        # cutoff (score points) for partial auto-execution.
-        self.balance_mode = cluster_data.get('balance_mode', 'auto')
-        self.partial_auto_threshold = cluster_data.get('partial_auto_threshold', 25)
         self.dry_run = cluster_data.get('dry_run', False)
         self.enabled = cluster_data.get('enabled', True)
         self.ha_enabled = cluster_data.get('ha_enabled', False)
