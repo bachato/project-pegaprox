@@ -256,8 +256,8 @@ def get_user_permissions(user: dict, tenant_id: str = None) -> list:
         extra = tp.get('extra', [])
         denied = tp.get('denied', [])
     else:
-        # use global user settings
-        role = user.get('role', ROLE_VIEWER)
+        # use global user settings — effective_role wins when set (API-token scoping)
+        role = user.get('effective_role', user.get('role', ROLE_VIEWER))
         extra = user.get('permissions', [])
         denied = user.get('denied_permissions', [])
     
@@ -282,7 +282,7 @@ def has_permission(user: dict, permission: str, tenant_id: str = None) -> bool:
     if not user:
         return False
     # admin always has access (safety net) - unless checking tenant-specific
-    if user.get('role') == ROLE_ADMIN and not tenant_id:
+    if user.get('effective_role', user.get('role')) == ROLE_ADMIN and not tenant_id:
         return True
     return permission in get_user_permissions(user, tenant_id)
 
@@ -749,9 +749,11 @@ def user_can_access_vm(user: dict, cluster_id: str, vmid: int, permission: str =
     LW: Changed inherit_role=True to mean "full VM access" instead of "use role perms"
     This is more intuitive - adding someone to a VM ACL should grant them access to that VM
     """
-    if user.get('role') == ROLE_ADMIN:
+    # MK: effective_role (token-scoped) wins over the stored role so an admin-owned
+    # restricted token doesn't get the admin VM bypass below
+    if user.get('effective_role', user.get('role')) == ROLE_ADMIN:
         return True
-    
+
     username = user.get('username', '')
     acls = get_vm_acls()
     
@@ -845,9 +847,9 @@ def get_user_vms(user: dict, cluster_id: str) -> list:
     
     Returns None if user can access all VMs (admin or no restrictions)
     """
-    if user.get('role') == ROLE_ADMIN:
+    if user.get('effective_role', user.get('role')) == ROLE_ADMIN:
         return None
-    
+
     username = user.get('username', '')
     acls = get_vm_acls()
     cluster_acls = acls.get(cluster_id, {})

@@ -309,6 +309,21 @@ def load_users(readonly: bool = False) -> dict:
     return {}
 
 
+def build_authz_user(username: str, session: dict) -> dict:
+    # MK: user dict for object-level checks (user_can_access_vm & co). For API tokens the
+    # stored account role would let an admin-owned 'viewer' token short-circuit those checks,
+    # so carry the token's role here, floored to the owner's current role like require_auth
+    # does so it can't outrank its owner.
+    users = load_users()
+    user = users.get(username, {})
+    user['username'] = username
+    if session.get('api_token'):
+        _h = {ROLE_ADMIN: 3, ROLE_USER: 2, ROLE_VIEWER: 1}
+        eff = min(_h.get(session.get('role'), 1), _h.get(user.get('role'), 1))
+        user['effective_role'] = next((r for r, lvl in _h.items() if lvl == eff), ROLE_VIEWER)
+    return user
+
+
 def is_initialized() -> bool:
     """True if first-run setup has been completed.
 

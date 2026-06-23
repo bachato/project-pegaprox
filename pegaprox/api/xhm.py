@@ -8,7 +8,7 @@ import uuid
 from flask import Blueprint, jsonify, request
 
 from pegaprox.globals import cluster_managers, _xhm_migrations
-from pegaprox.utils.auth import require_auth, load_users
+from pegaprox.utils.auth import require_auth, load_users, build_authz_user
 from pegaprox.utils.audit import log_audit
 from pegaprox.utils.rbac import user_can_access_vm
 from pegaprox.api.helpers import check_cluster_access
@@ -47,9 +47,7 @@ def xhm_plan():
         return err
 
     # Authorization: check source VM access
-    users = load_users()
-    user = users.get(request.session['user'], {})
-    user['username'] = request.session['user']
+    user = build_authz_user(request.session['user'], request.session)
     try:
         vmid_int = int(source_vmid)
     except (ValueError, TypeError):
@@ -119,9 +117,7 @@ def xhm_start():
         return err
 
     # Authorization: check source VM access
-    users = load_users()
-    user = users.get(request.session['user'], {})
-    user['username'] = request.session['user']
+    user = build_authz_user(request.session['user'], request.session)
     try:
         vmid_int = int(data['source_vmid'])
     except (ValueError, TypeError):
