@@ -411,27 +411,22 @@ def _run_v2p_migration(task):
         task.log(f"VM files found at {vm_path}")
         
         # Find descriptor .vmdk files (NOT -flat, NOT -delta, NOT -ctk, NOT -000NNN)
-        # Descriptor = small text file referencing the flat file
+        # Descriptor = small text file referencing the flat file.
+        # NS Jun 2026 — list FULL paths one-per-line and split only on '/', never on
+        # whitespace. VMware disk names routinely contain spaces ("VM Name - Win11.vmdk");
+        # the old `ls -la | awk`-style split chopped that down to the last word ("Win11.vmdk")
+        # so vmkfstools/qm got a path that doesn't exist ("DiskLib cannot find disk source").
+        # The grep exclusions already isolate the descriptor from its -flat/-delta/-ctk/-snap
+        # extents, so no separate size filter is needed.
         rc, out, err = _ssh_exec(esxi_host, esxi_user, esxi_pass,
-            f"ls -la {shlex.quote(vm_path + '/')} | grep '.vmdk' | grep -v flat | grep -v delta | grep -v ctk | grep -v '\\-0000'",
+            f"ls -1 {shlex.quote(vm_path + '/')}*.vmdk 2>/dev/null | grep -v flat | grep -v delta | grep -v ctk | grep -v '\\-0000'",
             timeout=15)
         descriptor_files = []
         for line in out.strip().split('\n'):
-            parts = line.strip().split()
-            if parts and parts[-1].endswith('.vmdk'):
-                fname = parts[-1]
-                fsize = int(parts[4]) if len(parts) > 4 and parts[4].isdigit() else 0
-                if fsize < 65536:  # Descriptor files are tiny (<64KB)
-                    descriptor_files.append(fname)
-        
-        if not descriptor_files:
-            rc, out, _ = _ssh_exec(esxi_host, esxi_user, esxi_pass,
-                f"ls {shlex.quote(vm_path + '/')}*.vmdk 2>/dev/null | grep -v flat | grep -v delta | grep -v ctk | grep -v '\\-0000'",
-                timeout=15)
-            for f in out.strip().split('\n'):
-                if f.strip().endswith('.vmdk'):
-                    descriptor_files.append(f.strip().split('/')[-1])
-        
+            p = line.strip()
+            if p.endswith('.vmdk'):
+                descriptor_files.append(p.rsplit('/', 1)[-1])  # basename, space-safe
+
         task.log(f"Found {len(descriptor_files)} descriptor file(s): {descriptor_files}")
         if not descriptor_files:
             task.set_phase('failed', f'No VMDK descriptor files found in {vm_path}'); return
