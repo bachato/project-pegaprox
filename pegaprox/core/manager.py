@@ -11181,14 +11181,20 @@ echo "AGENT_INSTALLED_OK"
                     current_config = self.get_vm_config(node, vmid, vm_type)
                     if current_config.get('success'):
                         config = current_config.get('config', {})
-                        # Parse and validate boot order
-                        order_str = boot_val.split('order=')[1].split(';')[0] if 'order=' in boot_val else ''
+                        # MK: two bugs lived here (#580). (1) `.split(';')[0]` kept only the FIRST
+                        # device, so reordering silently dropped the rest. (2) device existence was
+                        # checked against the *structured* config — but the real device keys (scsi0,
+                        # ide2, net0…) live in config['raw'], so every device looked invalid, boot got
+                        # del'd, and PVE got an empty body → "no options specified". Parse the whole
+                        # order and validate against raw.
+                        raw = config.get('raw', config)
+                        order_str = boot_val.split('order=', 1)[1] if 'order=' in boot_val else ''
                         if order_str:
                             devices = [d.strip() for d in order_str.split(';') if d.strip()]
                             valid_devices = []
                             for dev in devices:
-                                # Check if device exists in config
-                                if dev in config or dev == 'net0':  # net0 is always valid
+                                # disks/cdroms/nets are all keys in the raw PVE config
+                                if dev in raw or re.match(r'^net\d+$', dev):
                                     valid_devices.append(dev)
                                 else:
                                     self.logger.warning(f"Boot order device '{dev}' not found in VM config, removing")
