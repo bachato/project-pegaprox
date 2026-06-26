@@ -1312,14 +1312,19 @@ def verify_password_api():
 
     data = request.get_json() or {}
     password = data.get('password', '')
-    if not password:
-        return jsonify({'error': 'Password required'}), 400
 
     username = request.session['user']
     users = load_users()
     user = users.get(username, {})
 
     auth_source = user.get('auth_source', 'local')
+    # MK Jun 2026 (#587): OIDC/Entra admins have no local password — they re-auth via the
+    # ladder below (WebAuthn / TOTP / session fallback). The old unconditional
+    # "Password required" 400 fired before we even knew the auth source, so the
+    # Re-Configure Cluster flow just hung for SSO admins. Only require it for local/ldap.
+    if not password and auth_source in ('local', 'ldap'):
+        return jsonify({'error': 'Password required'}), 400
+
     if auth_source == 'local':
         if not user.get('password_hash') or not verify_password(password, user.get('password_salt', ''), user['password_hash']):
             return jsonify({'error': 'Invalid password'}), 401
