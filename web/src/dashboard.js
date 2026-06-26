@@ -363,7 +363,11 @@
                                             ) : filteredTasks.map((task, idx) => {
                                                 if (!task) return null;
                                                 const isRunning = task.status === 'running';
-                                                const isFailed = task.status === 'failed' || task.status === 'error';
+                                                // NS: a finished PVE task is 'stopped' with the real result in exitstatus
+                                                // ('OK' = success, anything else = failure). #590: failed backups came back
+                                                // as 'stopped' + a non-OK exitstatus and slipped through to the green bucket.
+                                                const _ex = task.exitstatus || '';
+                                                const isFailed = task.status === 'failed' || task.status === 'error' || (!isRunning && _ex && _ex !== 'OK');
                                                 
                                                 return (
                                                     <tr 
@@ -14823,7 +14827,7 @@
                                                                     <div>
                                                                         {recent.map((task, i) => (
                                                                             <div key={task.upid || i} className="corp-tasks-item">
-                                                                                <span className="corp-tasks-status" style={{background: statusColor(task.status || task.exitstatus)}}></span>
+                                                                                <span className="corp-tasks-status" style={{background: statusColor((task.status !== 'running' && task.exitstatus && task.exitstatus !== 'OK') ? 'failed' : (task.status || task.exitstatus))}}></span>
                                                                                 <span className="corp-tasks-desc">{task.type || task.worker_type || '?'}{task.id ? ` ${task.id}` : ''}</span>
                                                                                 <span className="corp-tasks-node">{task.node || ''}</span>
                                                                                 <span className="corp-tasks-time">{relTime(task.starttime || task.pstart)}</span>
