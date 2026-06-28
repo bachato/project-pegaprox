@@ -3085,23 +3085,34 @@
             const isQemu = vm.type === 'qemu';
             
             // Local authFetch helper
+            // #594: target-cluster lookups hang if the destination cluster is slow/unreachable.
+            // honour options.timeout (ms) so the migrate dialog fails fast instead of spinning. -LW
             const authFetch = async (url, options = {}) => {
+                const { timeout, ...rest } = options;
+                let ctrl, timer;
+                if (timeout) {
+                    ctrl = new AbortController();
+                    timer = setTimeout(() => ctrl.abort(), timeout);
+                }
                 try {
                     const response = await fetch(url, {
-                        ...options,
+                        ...rest,
                         credentials: 'include',
+                        signal: ctrl ? ctrl.signal : rest.signal,
                         headers: {
-                            ...options.headers,
+                            ...rest.headers,
                             ...getAuthHeaders()
                         }
                     });
                     return response;
                 } catch (err) {
-                    console.error('Auth fetch error:', err);
+                    if (err.name !== 'AbortError') console.error('Auth fetch error:', err);
                     return null;
+                } finally {
+                    if (timer) clearTimeout(timer);
                 }
             };
-            
+
             // Check for CD/DVD and boot order issues
             // NS: Now uses SSE events for live updates
             useEffect(() => {
@@ -3264,7 +3275,7 @@
             const loadTargetNodes = async () => {
                 setLoadingNodes(true);
                 try {
-                    const nodesRes = await authFetch(`${API_URL}/clusters/${targetCluster}/nodes`);
+                    const nodesRes = await authFetch(`${API_URL}/clusters/${targetCluster}/nodes`, { timeout: 12000 });
                     if(nodesRes && nodesRes.ok) {
                         const nodes = await nodesRes.json();
                         setTargetNodes(nodes);
@@ -3284,7 +3295,7 @@
                 setLoadingResources(true);
                 try {
                     // Get storage list for selected node
-                    const storageRes = await authFetch(`${API_URL}/clusters/${targetCluster}/nodes/${targetNode}/storage`);
+                    const storageRes = await authFetch(`${API_URL}/clusters/${targetCluster}/nodes/${targetNode}/storage`, { timeout: 12000 });
                     if(storageRes && storageRes.ok) {
                         const storages = await storageRes.json();
                         setTargetStorages(storages);
@@ -3303,7 +3314,7 @@
                     }
 
                     // Get network list for selected node (including SDN VNets)
-                    const networkRes = await authFetch(`${API_URL}/clusters/${targetCluster}/nodes/${targetNode}/networks`);
+                    const networkRes = await authFetch(`${API_URL}/clusters/${targetCluster}/nodes/${targetNode}/networks`, { timeout: 12000 });
                     if(networkRes && networkRes.ok) {
                         const networks = await networkRes.json();
                         // NS May 2026 (#385): exclude OVS access ports — their ovs_bridge

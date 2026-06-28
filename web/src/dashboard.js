@@ -2,6 +2,12 @@
         // PegaProx - Dashboard & App
         // TaskBar, Dashboard, App component, ReactDOM.render
         // ═══════════════════════════════════════════════
+
+        // NS #594 — cap the per-request wait on background/overview reads so a single slow
+        // or unreachable cluster can't wedge the whole UI. Long ops (uploads, migrations,
+        // backups) deliberately don't pass a timeout and are therefore unaffected.
+        const POLL_TIMEOUT_MS = 12000;
+
         // Task Bar Component with Task Viewer
         function TaskBar({ tasks, onClear, onClose, onCancel, onRefresh, clusterId, autoExpandEnabled = true }) {
             const { t } = useTranslation();
@@ -125,12 +131,16 @@
                 setTaskLogLoading(true);
                 setTaskLog('');
 
+                // #594: this is a raw fetch (no authFetch in scope here) — give it its own
+                // abort so a slow node doesn't leave the log spinner hanging forever.
+                const ctrl = new AbortController();
+                const timer = setTimeout(() => ctrl.abort(), POLL_TIMEOUT_MS);
                 try {
                     const response = await fetch(
                         `${API_URL}/clusters/${clusterId}/nodes/${task.node}/tasks/${encodeURIComponent(task.upid)}/log`,
-                        { headers: getAuthHeaders() }
+                        { headers: getAuthHeaders(), signal: ctrl.signal }
                     );
-                    
+
                     if (response.ok) {
                         const data = await response.json();
                         setTaskLog(data.log || t('noOutput'));
@@ -140,6 +150,7 @@
                 } catch (err) {
                     setTaskLog(t('errorLoadingLog'));
                 } finally {
+                    clearTimeout(timer);
                     setTaskLogLoading(false);
                 }
             };
@@ -6826,7 +6837,7 @@
                 if (!planDetail || srSubTab !== 'mappings') return;
                 const loadClusterResources = async (clusterId, setBridges, setStorages) => {
                     try {
-                        const nr = await authFetch(`${API_URL}/clusters/${clusterId}/nodes`);
+                        const nr = await authFetch(`${API_URL}/clusters/${clusterId}/nodes`, { timeout: POLL_TIMEOUT_MS });
                         if (!nr || !nr.ok) return;
                         const nodes = await nr.json();
                         const online = (nodes.data || nodes || []).find(n => n.status === 'online');
@@ -6836,7 +6847,7 @@
                         // the old filter only caught "type=bridge" or vmbr* names, so OVSBridge + SDN
                         // vnets were invisible even when actually configured on the node.
                         const collected = [];
-                        const br = await authFetch(`${API_URL}/clusters/${clusterId}/nodes/${nodeName}/networks`);
+                        const br = await authFetch(`${API_URL}/clusters/${clusterId}/nodes/${nodeName}/networks`, { timeout: POLL_TIMEOUT_MS });
                         if (br && br.ok) {
                             const d = await br.json();
                             const items = (d.data || d || []).filter(n => {
@@ -6853,7 +6864,7 @@
                         }
                         // SDN vnets live on a separate endpoint and don't show up under /nodes/.../network
                         try {
-                            const sd = await authFetch(`${API_URL}/clusters/${clusterId}/datacenter/sdn`);
+                            const sd = await authFetch(`${API_URL}/clusters/${clusterId}/datacenter/sdn`, { timeout: POLL_TIMEOUT_MS });
                             if (sd && sd.ok) {
                                 const sdnData = await sd.json();
                                 (sdnData.vnets || []).forEach(v => {
@@ -6866,7 +6877,7 @@
                         } catch(_) { /* sdn endpoint optional */ }
                         setBridges(collected);
                         // storages
-                        const st = await authFetch(`${API_URL}/clusters/${clusterId}/nodes/${nodeName}/storage`);
+                        const st = await authFetch(`${API_URL}/clusters/${clusterId}/nodes/${nodeName}/storage`, { timeout: POLL_TIMEOUT_MS });
                         if (st && st.ok) { const d = await st.json(); setStorages(d.data || d || []); }
                     } catch(e) {}
                 };
@@ -8181,15 +8192,23 @@
                 setDebsecanInstalling(false);
             }, [selectedCluster?.id]);
             
-            // Auth fetch helper - simple version without timeout abort
-            // TODO: add retry logic? - LW
+            // Auth fetch helper. Pass opts.timeout (ms) on background/overview reads to abort a
+            // hung request — see POLL_TIMEOUT_MS / #594. No timeout by default so long ops
+            // (uploads, migrations) keep running. -LW
             // TODO: maybe use axios instead? -ns
             const authFetch = async (url, opts = {}) => {
+                const { timeout, ...rest } = opts;
+                let ctrl, timer;
+                if (timeout) {
+                    ctrl = new AbortController();
+                    timer = setTimeout(() => ctrl.abort(), timeout);
+                }
                 try {
                     const res = await fetch(url, {
-                        ...opts,
+                        ...rest,
                         credentials: 'include',
-                        headers: { ...opts.headers, ...getAuthHeaders() }
+                        signal: ctrl ? ctrl.signal : rest.signal,
+                        headers: { ...rest.headers, ...getAuthHeaders() }
                     });
                     // #144: detect session loss early — don't auto-logout on auth/check or SSE
                     if (res.status === 401 && !url.includes('/auth/') && !url.includes('/sse')) {
@@ -8198,8 +8217,11 @@
                     setConnectionError(null);
                     return res;
                 } catch (err) {
-                    console.error('authFetch err:', err);
+                    // an aborted poll is a soft-fail — callers already treat null as "skip this round"
+                    if (err.name !== 'AbortError') console.error('authFetch err:', err);
                     return null;
+                } finally {
+                    if (timer) clearTimeout(timer);
                 }
             };
             
@@ -9388,7 +9410,7 @@
                         }
                     });
 
-                    const response = await authFetch(`${API_URL}/syslog/events?${params.toString()}`);
+                    const response = await authFetch(`${API_URL}/syslog/events?${params.toString()}`, { timeout: POLL_TIMEOUT_MS });
                     if (response && response.ok) {
                         const data = await response.json();
                         setLogEvents(Array.isArray(data.items) ? data.items : []);
@@ -11581,8 +11603,10 @@
                 if (selectedVMware && vmwareActiveTab === 'tasks') {
                     fetchVmwareEvents();
                     fetchVmwareMigrations();
-                    // SSE handles real-time updates; polling is just a fallback
-                    const pollInterval = wsConnected ? 30000 : 5000;
+                    // SSE handles real-time updates; polling is just a fallback.
+                    // NS #594: used to drop to 5s when SSE was down — i.e. it polled FASTER
+                    // exactly while requests were already hanging. Keep the fallback at 30s.
+                    const pollInterval = 30000;
                     const intv = setInterval(() => fetchVmwareMigrations(), pollInterval);
                     return () => clearInterval(intv);
                 }
@@ -11591,8 +11615,9 @@
             React.useEffect(() => {
                 if (vmwareSelectedMigration) {
                     fetchMigrationDetail(vmwareSelectedMigration);
-                    // SSE streams logs in real-time; poll less aggressively as fallback
-                    const pollInterval = wsConnected ? 15000 : 3000;
+                    // SSE streams logs in real-time; poll as a fallback only.
+                    // #594: don't speed up to 3s when SSE is down — that stormed a slow backend.
+                    const pollInterval = 15000;
                     const intv = setInterval(() => fetchMigrationDetail(vmwareSelectedMigration), pollInterval);
                     return () => clearInterval(intv);
                 }
@@ -11676,13 +11701,15 @@
             useEffect(() => {
                 if (!sidebarXHM) return;
                 fetchXhmMigrations();
-                const intv = setInterval(fetchXhmMigrations, wsConnected ? 30000 : 5000);
+                // #594: was wsConnected?30000:5000 — don't poll faster when SSE is down
+                const intv = setInterval(fetchXhmMigrations, 30000);
                 return () => clearInterval(intv);
             }, [sidebarXHM, wsConnected]);
             useEffect(() => {
                 if (!xhmSelectedMigration) return;
                 fetchXhmDetail(xhmSelectedMigration);
-                const intv = setInterval(() => fetchXhmDetail(xhmSelectedMigration), wsConnected ? 30000 : 5000);
+                // #594: keep the fallback poll at 30s even when SSE drops
+                const intv = setInterval(() => fetchXhmDetail(xhmSelectedMigration), 30000);
                 return () => clearInterval(intv);
             }, [xhmSelectedMigration, wsConnected]);
 
@@ -11829,15 +11856,25 @@
                         const connectedClusters = data.filter(c => c.connected);
                         const allGuests = [];
                         
-                        for (const cluster of connectedClusters) {
-                            // NS May 2026 — skip clusters that recently 503'd until cooldown
+                        // NS #594 — this used to be a serial await-loop: one slow cluster
+                        // stalled every cluster behind it and made the whole overview lag.
+                        // Run the clusters concurrently (each still does its two reads in order).
+                        await Promise.allSettled(connectedClusters.map(async (cluster) => {
+                            // NS May 2026 — skip clusters that recently 503'd/timed out until cooldown
                             const failState = clusterFailureRef.current[cluster.id];
                             if (failState && failState.skip_until > Date.now()) {
-                                continue;
+                                return;
                             }
+                            // backoff — cooldown grows with consecutive fails (5s,10s,20s,40s,80s,160s)
+                            const bumpBackoff = () => {
+                                const f = clusterFailureRef.current[cluster.id] || { fails: 0 };
+                                f.fails = Math.min(f.fails + 1, 6);
+                                f.skip_until = Date.now() + (5000 * Math.pow(2, f.fails - 1));
+                                clusterFailureRef.current[cluster.id] = f;
+                            };
                             try {
                                 // datacenter status
-                                const statusResp = await authFetch(`${API_URL}/clusters/${cluster.id}/datacenter/status`);
+                                const statusResp = await authFetch(`${API_URL}/clusters/${cluster.id}/datacenter/status`, { timeout: POLL_TIMEOUT_MS });
                                 if (statusResp && statusResp.ok) {
                                     const statusData = await statusResp.json();
                                     setAllClusterMetrics(prev => ({
@@ -11849,17 +11886,14 @@
                                     }));
                                     // success — clear failure state
                                     delete clusterFailureRef.current[cluster.id];
-                                } else if (statusResp && (statusResp.status === 503 || statusResp.status === 504 || statusResp.status === 502)) {
-                                    // backoff — cooldown grows with consecutive fails
-                                    const f = clusterFailureRef.current[cluster.id] || { fails: 0 };
-                                    f.fails = Math.min(f.fails + 1, 6);
-                                    // 5s, 10s, 20s, 40s, 80s, 160s
-                                    f.skip_until = Date.now() + (5000 * Math.pow(2, f.fails - 1));
-                                    clusterFailureRef.current[cluster.id] = f;
+                                } else if (!statusResp || statusResp.status === 503 || statusResp.status === 504 || statusResp.status === 502) {
+                                    // #594: a null here means the request aborted (timeout) or the network
+                                    // failed — treat a slow cluster the same as a 5xx and back it off.
+                                    bumpBackoff();
                                 }
-                                
+
                                 // get vms/cts for the top guests table + topology
-                                const resourcesResp = await authFetch(`${API_URL}/clusters/${cluster.id}/resources`);
+                                const resourcesResp = await authFetch(`${API_URL}/clusters/${cluster.id}/resources`, { timeout: POLL_TIMEOUT_MS });
                                 if (resourcesResp && resourcesResp.ok) {
                                     const resources = await resourcesResp.json();
                                     // NS: save all resources per cluster for topology view
@@ -11875,7 +11909,7 @@
                             } catch (e) {
                                 console.log(`Failed to fetch data for cluster ${cluster.id}:`, e);
                             }
-                        }
+                        }));
                         
                         // sort by combined cpu+ram usage
                         const runningGuests = allGuests.filter(g => g.status === 'running');
@@ -11905,7 +11939,7 @@
 
             const fetchClusterMetrics = async (clusterId) => {
                 try {
-                    const response = await authFetch(`${API_URL}/clusters/${clusterId}/metrics`);
+                    const response = await authFetch(`${API_URL}/clusters/${clusterId}/metrics`, { timeout: POLL_TIMEOUT_MS });
                     if (response && response.ok) {
                         const data = await response.json();
                         
@@ -11955,7 +11989,7 @@
             // NS May 2026 — backup status fetcher; called in parallel with resources
             const fetchVmsBackupStatus = async (clusterId) => {
                 try {
-                    const r = await authFetch(`${API_URL}/clusters/${clusterId}/vms-backup-status`);
+                    const r = await authFetch(`${API_URL}/clusters/${clusterId}/vms-backup-status`, { timeout: POLL_TIMEOUT_MS });
                     if (r && r.ok) {
                         const arr = await r.json();
                         const map = {};
@@ -11970,7 +12004,7 @@
                 // fire backup-status fetch in parallel — independent of /resources
                 fetchVmsBackupStatus(clusterId);
                 try {
-                    const response = await authFetch(`${API_URL}/clusters/${clusterId}/resources`);
+                    const response = await authFetch(`${API_URL}/clusters/${clusterId}/resources`, { timeout: POLL_TIMEOUT_MS });
                     if (response && response.ok) {
                         const data = await response.json();
                         setSidebarClusterData(prev => ({ ...prev, [clusterId]: { ...(prev[clusterId] || {}), resources: data } }));
@@ -12022,12 +12056,13 @@
                 // NS: Mar 2026 - track loading so we can show a spinner in the tree
                 setLoadingSidebarClusters(prev => ({...prev, [clusterId]: true}));
                 try {
+                    // #594: timeout each so expanding a slow cluster in the sidebar can't hang
                     const [metricsRes, resourcesRes, poolsRes, datastoresRes, networksRes] = await Promise.all([
-                        authFetch(`${API_URL}/clusters/${clusterId}/metrics`),
-                        authFetch(`${API_URL}/clusters/${clusterId}/resources`),
-                        authFetch(`${API_URL}/clusters/${clusterId}/pools`),
-                        authFetch(`${API_URL}/clusters/${clusterId}/datastores`),
-                        authFetch(`${API_URL}/clusters/${clusterId}/networks`)
+                        authFetch(`${API_URL}/clusters/${clusterId}/metrics`, { timeout: POLL_TIMEOUT_MS }),
+                        authFetch(`${API_URL}/clusters/${clusterId}/resources`, { timeout: POLL_TIMEOUT_MS }),
+                        authFetch(`${API_URL}/clusters/${clusterId}/pools`, { timeout: POLL_TIMEOUT_MS }),
+                        authFetch(`${API_URL}/clusters/${clusterId}/datastores`, { timeout: POLL_TIMEOUT_MS }),
+                        authFetch(`${API_URL}/clusters/${clusterId}/networks`, { timeout: POLL_TIMEOUT_MS })
                     ]);
                     const metrics = metricsRes && metricsRes.ok ? await metricsRes.json() : {};
                     const resources = resourcesRes && resourcesRes.ok ? await resourcesRes.json() : [];
@@ -12042,7 +12077,7 @@
             // NS: Mar 2026 - fetch pools for the active cluster (pool view)
             const fetchClusterPools = async (clusterId) => {
                 try {
-                    const res = await authFetch(`${API_URL}/clusters/${clusterId}/pools`);
+                    const res = await authFetch(`${API_URL}/clusters/${clusterId}/pools`, { timeout: POLL_TIMEOUT_MS });
                     if (res && res.ok) {
                         const poolData = await res.json();
                         setSidebarClusterData(prev => ({ ...prev, [clusterId]: { ...(prev[clusterId] || {}), pools: poolData } }));
@@ -12054,7 +12089,7 @@
 
             const fetchClusterDatastores = async (clusterId) => {
                 try {
-                    const res = await authFetch(`${API_URL}/clusters/${clusterId}/datastores`);
+                    const res = await authFetch(`${API_URL}/clusters/${clusterId}/datastores`, { timeout: POLL_TIMEOUT_MS });
                     if (res && res.ok) {
                         const dsData = await res.json();
                         setSidebarClusterData(prev => ({ ...prev, [clusterId]: { ...(prev[clusterId] || {}), datastores: dsData } }));
