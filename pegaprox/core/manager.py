@@ -8249,9 +8249,12 @@ echo "AGENT_INSTALLED_OK"
         
         # check already updating
         with self.update_lock:
-            if node_name in self.nodes_updating:
-                return self.nodes_updating[node_name]
-            
+            existing = self.nodes_updating.get(node_name)
+            # MK #592: a finished task can still sit here (cleared on a grace timer or by the
+            # UI's DELETE) — don't let a completed/failed one block a fresh update of the node.
+            if existing and existing.status not in ('completed', 'failed'):
+                return existing
+
             task = UpdateTask(node_name, reboot)
             self.nodes_updating[node_name] = task
         
@@ -8491,7 +8494,34 @@ echo "AGENT_INSTALLED_OK"
                     ssh.close()
                 except:
                     pass
-    
+            # MK #592: the UI auto-dismiss (DELETE /update) only fires from a mounted node
+            # card — from the sidebar alone nothing clears a finished task, so the "(Updating)"
+            # badge stuck until a service restart. Clear it server-side after a grace period.
+            if task.status in ('completed', 'failed'):
+                self._schedule_update_clear(node_name, task)
+
+    def _schedule_update_clear(self, node_name: str, task) -> None:
+        # mirror the UI banner timing (#183): 30s after success, 2min after a failure so the
+        # completed/failed confirmation is still visible, then drop the stale entry.
+        grace = 30 if task.status == 'completed' else 120
+        def _clear():
+            with self.update_lock:
+                cur = self.nodes_updating.get(node_name)
+                # only if it's still THIS finished task — a new run must not be wiped
+                if cur is task and cur.status in ('completed', 'failed'):
+                    del self.nodes_updating[node_name]
+                    self.logger.info(f"[SYNC] cleared finished update state for {node_name}")
+        try:
+            if GEVENT_PATCHED:
+                import gevent
+                gevent.spawn_later(grace, _clear)
+            else:
+                t = threading.Timer(grace, _clear)
+                t.daemon = True
+                t.start()
+        except Exception as e:
+            self.logger.debug(f"[SYNC] couldn't schedule update-state clear for {node_name}: {e}")
+
     def get_update_status(self, node_name: str) -> Optional[Dict]:
         
         with self.update_lock:
