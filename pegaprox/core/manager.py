@@ -14445,13 +14445,19 @@ echo DONE""",
 echo DONE""",
         },
         'journald': {
-            'check': """[ -f /etc/systemd/journald.conf.d/99-cis-hardening.conf ] && echo OK || echo FAIL""",
+            'check': """grep -q '^SystemMaxUse' /etc/systemd/journald.conf.d/99-cis-hardening.conf 2>/dev/null && echo OK || echo FAIL""",
+            'verbose_check': """grep -hE '^(Storage|SystemMaxUse|SystemKeepFree)' /etc/systemd/journald.conf.d/99-cis-hardening.conf 2>/dev/null || echo '  (no pegaprox journald config)' ; echo '--- current journal usage ---' ; journalctl --disk-usage 2>/dev/null""",
             'apply': """mkdir -p /etc/systemd/journald.conf.d
 cat > /etc/systemd/journald.conf.d/99-cis-hardening.conf << 'JDEOF'
 [Journal]
 Storage=persistent
 Compress=yes
 ForwardToSyslog=no
+# MK #595 — cap journald so a hardened node (auditd/acct = chatty) can't fill
+# /var/log. systemd's default is 10% of the fs, up to 4G — unbounded for us.
+# Lower this on hosts that back /var/log with a small log2ram/zram.
+SystemMaxUse=512M
+SystemKeepFree=64M
 JDEOF
 systemctl restart systemd-journald
 echo DONE""",
@@ -14831,9 +14837,27 @@ aideinit 2>/dev/null &
 echo DONE""",
         },
         'process_acct': {
-            'check': """command -v lastcomm >/dev/null 2>&1 && echo OK || echo FAIL""",
+            'check': """command -v lastcomm >/dev/null 2>&1 && [ -f /etc/logrotate.d/pegaprox-acct ] && echo OK || echo FAIL""",
+            'verbose_check': """command -v lastcomm >/dev/null 2>&1 && echo 'acct: installed' || echo 'acct: missing' ; ls -lh /var/log/account/pacct 2>/dev/null || echo '  (no pacct yet)' ; [ -f /etc/logrotate.d/pegaprox-acct ] && echo 'pacct rotation: configured' || echo 'pacct rotation: NOT configured'""",
             'apply': """apt-get install -y acct >/dev/null 2>&1
 systemctl enable acct 2>/dev/null; systemctl start acct 2>/dev/null
+# MK #595 — bound process accounting. /var/log/account/pacct is a live binary file the
+# kernel writes to, so we can't copytruncate it; rotate by renaming + re-pointing accton
+# at a fresh file in postrotate. size-triggered so a busy host can't fill /var/log.
+mkdir -p /etc/logrotate.d
+cat > /etc/logrotate.d/pegaprox-acct << 'LREOF'
+/var/log/account/pacct {
+    missingok
+    notifempty
+    size 50M
+    rotate 7
+    compress
+    delaycompress
+    postrotate
+        [ -x /usr/sbin/accton ] && /usr/sbin/accton /var/log/account/pacct >/dev/null 2>&1 || true
+    endscript
+}
+LREOF
 echo DONE""",
         },
         'sysstat': {
@@ -15155,10 +15179,25 @@ sysctl --system >/dev/null 2>&1
 echo DONE""",
         },
         'auditd_service': {
-            'check': """systemctl is-active auditd 2>/dev/null | grep -q active && echo OK || echo FAIL""",
-            'verbose_check': """systemctl is-active auditd 2>/dev/null || echo 'not active' ; if command -v auditctl >/dev/null 2>&1 ; then auditctl -s 2>/dev/null | grep -E 'enabled|pid|rate' | head -5 ; auditctl -l 2>/dev/null | wc -l | awk '{print \"active rules: \"$1}' ; fi""",
+            'check': """systemctl is-active auditd 2>/dev/null | grep -q active && grep -qE '^max_log_file_action *= *ROTATE' /etc/audit/auditd.conf 2>/dev/null && echo OK || echo FAIL""",
+            'verbose_check': """systemctl is-active auditd 2>/dev/null || echo 'not active' ; grep -hE '^(max_log_file|num_logs|max_log_file_action) ' /etc/audit/auditd.conf 2>/dev/null || echo '  (no log bounds set)' ; if command -v auditctl >/dev/null 2>&1 ; then auditctl -s 2>/dev/null | grep -E 'enabled|pid|rate' | head -5 ; auditctl -l 2>/dev/null | wc -l | awk '{print \"active rules: \"$1}' ; fi""",
             'apply': """apt-get install -y auditd audispd-plugins >/dev/null 2>&1
+# MK #595 — bound auditd's own log growth so audit.log can't sprawl on /var/log.
+# ~50MB x 10 = 500MB ceiling, then rotate. idempotent: replace-or-append each key.
+if [ -f /etc/audit/auditd.conf ]; then
+  for kv in "max_log_file = 50" "num_logs = 10" "max_log_file_action = ROTATE"; do
+    key=$(echo "$kv" | cut -d' ' -f1)
+    if grep -qE "^#? *${key} *=" /etc/audit/auditd.conf; then
+      sed -i -E "s|^#? *${key} *=.*|${kv}|" /etc/audit/auditd.conf
+    else
+      echo "$kv" >> /etc/audit/auditd.conf
+    fi
+  done
+fi
 systemctl enable --now auditd 2>/dev/null
+# reload config (HUP) if running; fall back to restart. service auditd reload is the
+# supported path on Debian where systemctl restart auditd is masked.
+service auditd reload 2>/dev/null || systemctl kill -s HUP auditd 2>/dev/null || systemctl restart auditd 2>/dev/null || true
 echo DONE""",
         },
         # MK Apr 2026 — fail2ban for sshd + Proxmox Web-UI login failures.
