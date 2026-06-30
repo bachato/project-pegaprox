@@ -2955,6 +2955,7 @@
             const newPolicy = () => setEditing({
                 name: '', target_type: 'tag', target_value: '',
                 schedule: 'daily', schedule_at: '03:00',
+                schedule_cron: '0 3 * * *', schedule_day: 1, run_once_at: '', prune_only: false,
                 retention_count: 7, retention_days: 0,
                 include_ram: false, enabled: true, notes: '',
             });
@@ -2979,6 +2980,10 @@
                             target_value: editing.target_value.trim(),
                             schedule: editing.schedule,
                             schedule_at: editing.schedule_at,
+                            schedule_cron: editing.schedule_cron || '',
+                            schedule_day: parseInt(editing.schedule_day) || 1,
+                            run_once_at: editing.run_once_at || '',
+                            prune_only: !!editing.prune_only,
                             retention_count: parseInt(editing.retention_count) || 0,
                             retention_days: parseInt(editing.retention_days) || 0,
                             include_ram: !!editing.include_ram,
@@ -3162,9 +3167,12 @@
                                                 <option value="hourly">{t('snapSchedHourly') || 'hourly'}</option>
                                                 <option value="daily">{t('snapSchedDaily') || 'daily'}</option>
                                                 <option value="weekly">{t('snapSchedWeekly') || 'weekly (Sun)'}</option>
+                                                <option value="monthly">{t('snapSchedMonthly') || 'monthly'}</option>
+                                                <option value="once">{t('snapSchedOnce') || 'once'}</option>
+                                                <option value="cron">{t('snapSchedCron') || 'cron'}</option>
                                             </select>
                                         </div>
-                                        {editing.schedule !== 'hourly' && (
+                                        {(editing.schedule === 'daily' || editing.schedule === 'weekly' || editing.schedule === 'monthly') && (
                                             <div>
                                                 <label className="text-xs text-gray-400 block mb-1">{t('snapAt') || 'At (HH:MM)'}</label>
                                                 <input type="text" value={editing.schedule_at || '03:00'}
@@ -3173,7 +3181,33 @@
                                                     className="w-full px-3 py-1.5 bg-proxmox-dark border border-proxmox-border rounded text-sm text-white font-mono" />
                                             </div>
                                         )}
+                                        {editing.schedule === 'monthly' && (
+                                            <div>
+                                                <label className="text-xs text-gray-400 block mb-1">{t('snapDayOfMonth') || 'Day of month (1–31)'}</label>
+                                                <input type="number" min="1" max="31" value={editing.schedule_day || 1}
+                                                    onChange={e => setEditing({...editing, schedule_day: e.target.value})}
+                                                    className="w-full px-3 py-1.5 bg-proxmox-dark border border-proxmox-border rounded text-sm text-white" />
+                                            </div>
+                                        )}
                                     </div>
+                                    {editing.schedule === 'cron' && (
+                                        <div>
+                                            <label className="text-xs text-gray-400 block mb-1">{t('snapCronExpr') || 'Cron expression (min hour dom month dow)'}</label>
+                                            <input type="text" value={editing.schedule_cron || ''}
+                                                onChange={e => setEditing({...editing, schedule_cron: e.target.value})}
+                                                placeholder="0 3 * * *"
+                                                className="w-full px-3 py-1.5 bg-proxmox-dark border border-proxmox-border rounded text-sm text-white font-mono" />
+                                            <p className="text-[11px] text-gray-500 mt-1">{t('snapCronHint') || 'e.g. "0 3 * * *" daily 03:00 · "*/15 * * * *" every 15 min · "0 2 * * 1-5" weekdays 02:00'}</p>
+                                        </div>
+                                    )}
+                                    {editing.schedule === 'once' && (
+                                        <div>
+                                            <label className="text-xs text-gray-400 block mb-1">{t('snapRunOnceAt') || 'Run once at'}</label>
+                                            <input type="datetime-local" value={editing.run_once_at || ''}
+                                                onChange={e => setEditing({...editing, run_once_at: e.target.value})}
+                                                className="w-full px-3 py-1.5 bg-proxmox-dark border border-proxmox-border rounded text-sm text-white" />
+                                        </div>
+                                    )}
                                     <div className="grid grid-cols-2 gap-2">
                                         <div>
                                             <label className="text-xs text-gray-400 block mb-1">{t('snapKeepCount') || 'Keep last N'}</label>
@@ -3192,6 +3226,11 @@
                                         <input type="checkbox" checked={!!editing.include_ram}
                                             onChange={e => setEditing({...editing, include_ram: e.target.checked})} />
                                         {t('snapIncludeRam') || 'Include RAM (qemu only — slower, but consistent)'}
+                                    </label>
+                                    <label className="flex items-center gap-2 text-sm text-gray-300">
+                                        <input type="checkbox" checked={!!editing.prune_only}
+                                            onChange={e => setEditing({...editing, prune_only: e.target.checked})} />
+                                        {t('snapPruneOnly') || "Prune only — don't create snapshots, just delete old ones per retention"}
                                     </label>
                                     <label className="flex items-center gap-2 text-sm text-gray-300">
                                         <input type="checkbox" checked={!!editing.enabled}
