@@ -12,6 +12,7 @@ from pegaprox.core.db import get_db
 from pegaprox.globals import cluster_managers
 from pegaprox.utils.audit import log_audit
 from pegaprox.utils.realtime import broadcast_sse
+from pegaprox.utils.sanitization import sanitize_log_message as _sl  # MK #338693885 (Aikido CWE-117): plan name is request-body-controlled → strip CR/LF before any log/audit/SSE line
 
 logger = logging.getLogger('pegaprox.site_recovery')
 
@@ -354,7 +355,7 @@ def execute_failover(plan_id, failover_type='planned'):
     results = {}
     failed = False
 
-    logger.info(f"[SR] Starting {failover_type} failover for plan '{plan['name']}' ({len(vms)} VMs, {len(boot_groups)} boot groups)")
+    logger.info(f"[SR] Starting {failover_type} failover for plan '{_sl(plan['name'])}' ({len(vms)} VMs, {len(boot_groups)} boot groups)")
     _broadcast_progress(plan_id, f"Starting {failover_type} failover...", 0)
 
     # pre-webhook
@@ -382,7 +383,7 @@ def execute_failover(plan_id, failover_type='planned'):
     preflight_errors = [i for i in preflight_issues if i.get('severity') == 'error']
     if preflight_errors:
         msg = '; '.join(i['msg'] for i in preflight_errors[:3])
-        logger.error(f"[SR] Pre-flight failed for plan '{plan['name']}': {msg}")
+        logger.error(f"[SR] Pre-flight failed for plan '{_sl(plan['name'])}': {msg}")
         _broadcast_progress(plan_id, f"Pre-flight failed: {msg}", 100)
         _complete_event(event_id, 'failed', {'preflight_issues': preflight_issues, 'aborted': 'before any VM moved'})
         db = get_db()
@@ -446,9 +447,9 @@ def execute_failover(plan_id, failover_type='planned'):
     _broadcast_progress(plan_id, f"Failover {final_status}", 100)
 
     log_audit('system', f'site_recovery.{failover_type}_complete',
-              f"Plan '{plan['name']}' {failover_type} {final_status}: {completed}/{total_vms} VMs")
+              f"Plan '{_sl(plan['name'])}' {failover_type} {final_status}: {completed}/{total_vms} VMs")
 
-    logger.info(f"[SR] Failover {final_status} for '{plan['name']}': {sum(1 for r in results.values() if r['success'])}/{total_vms} succeeded")
+    logger.info(f"[SR] Failover {final_status} for '{_sl(plan['name'])}': {sum(1 for r in results.values() if r['success'])}/{total_vms} succeeded")
 
 
 def execute_test_failover(plan_id):
@@ -464,7 +465,7 @@ def execute_test_failover(plan_id):
     results = {}
     test_vmids = []
 
-    logger.info(f"[SR] Test failover for '{plan['name']}' ({len(vms)} VMs)")
+    logger.info(f"[SR] Test failover for '{_sl(plan['name'])}' ({len(vms)} VMs)")
     _broadcast_progress(plan_id, "Starting test failover...", 0)
 
     # MK May 2026 (#413) — guard against tgt_mgr=None so the loop body
@@ -473,7 +474,7 @@ def execute_test_failover(plan_id):
         for vm in vms:
             results[str(vm['vmid'])] = {'success': False,
                                         'error': f"Target cluster '{plan['target_cluster']}' not connected / not configured in PegaProx"}
-        logger.error(f"[SR] Test failover: target cluster '{plan['target_cluster']}' unreachable; aborting plan '{plan['name']}'")
+        logger.error(f"[SR] Test failover: target cluster '{plan['target_cluster']}' unreachable; aborting plan '{_sl(plan['name'])}'")
 
     for i, vm in enumerate(vms):
         if tgt_mgr is None:
@@ -573,8 +574,8 @@ def execute_test_failover(plan_id):
 
     ok = sum(1 for r in results.values() if r.get('success'))
     log_audit('system', 'site_recovery.test_complete',
-              f"Test failover for '{plan['name']}': {ok}/{len(vms)} VMs cloned")
-    logger.info(f"[SR] Test failover complete for '{plan['name']}': {len(test_vmids)} clones created")
+              f"Test failover for '{_sl(plan['name'])}': {ok}/{len(vms)} VMs cloned")
+    logger.info(f"[SR] Test failover complete for '{_sl(plan['name'])}': {len(test_vmids)} clones created")
 
 
 def cleanup_test(plan_id):
@@ -647,7 +648,7 @@ def cleanup_test(plan_id):
                (datetime.utcnow().isoformat(), plan_id))
 
     log_audit('system', 'site_recovery.test_cleanup_complete',
-              f"Cleaned up {len(test_vmids)} test VMs for plan '{plan['name']}'")
+              f"Cleaned up {len(test_vmids)} test VMs for plan '{_sl(plan['name'])}'")
     _broadcast_progress(plan_id, "Test cleanup complete", 100)
 
 
@@ -686,7 +687,7 @@ def _heartbeat_check():
         # source unreachable
         if plan_id not in _last_fail_times:
             _last_fail_times[plan_id] = now
-            logger.warning(f"[SR] Heartbeat: source '{plan['source_cluster']}' unreachable for plan '{plan['name']}'")
+            logger.warning(f"[SR] Heartbeat: source '{plan['source_cluster']}' unreachable for plan '{_sl(plan['name'])}'")
             continue
 
         elapsed = now - _last_fail_times[plan_id]
@@ -715,14 +716,14 @@ def _heartbeat_check():
                     blockers.append(f"VM {vm['vmid']}: last replication status={repl['last_status'] or 'never ran'}")
 
             if blockers:
-                logger.error(f"[SR] BLOCKING auto-failover for '{plan['name']}' — replication unhealthy: {'; '.join(blockers[:5])}")
+                logger.error(f"[SR] BLOCKING auto-failover for '{_sl(plan['name'])}' — replication unhealthy: {'; '.join(blockers[:5])}")
                 log_audit('system', 'site_recovery.auto_failover_blocked',
-                          f"Auto-failover BLOCKED for '{plan['name']}': {'; '.join(blockers[:5])}")
+                          f"Auto-failover BLOCKED for '{_sl(plan['name'])}': {'; '.join(blockers[:5])}")
                 _last_fail_times.pop(plan_id, None)
                 _cooldowns[plan_id] = now + 600  # shorter cooldown — admin may fix replication
                 continue
 
-            logger.error(f"[SR] AUTO-FAILOVER triggered for '{plan['name']}' after {int(elapsed)}s")
+            logger.error(f"[SR] AUTO-FAILOVER triggered for '{_sl(plan['name'])}' after {int(elapsed)}s")
             _last_fail_times.pop(plan_id, None)
             _cooldowns[plan_id] = now + 3600  # 1h cooldown
 
@@ -738,13 +739,13 @@ def _heartbeat_check():
                 )
                 db.conn.commit()
                 if cur.rowcount != 1:
-                    logger.info(f"[SR] Auto-failover for '{plan['name']}' skipped — status changed concurrently")
+                    logger.info(f"[SR] Auto-failover for '{_sl(plan['name'])}' skipped — status changed concurrently")
                     continue
                 # NS: use crash-safe wrapper so a greenlet crash sets status to 'failed'
                 from pegaprox.api.site_recovery import _safe_spawn_failover
                 _safe_spawn_failover(execute_failover, plan_id, 'emergency')
                 log_audit('system', 'site_recovery.auto_failover',
-                          f"Auto-failover triggered for '{plan['name']}' - source unreachable for {int(elapsed)}s")
+                          f"Auto-failover triggered for '{_sl(plan['name'])}' - source unreachable for {int(elapsed)}s")
             except Exception as e:
                 logger.error(f"[SR] Auto-failover spawn failed: {e}")
 
